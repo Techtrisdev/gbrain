@@ -1,5 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'fs';
+import { isSensitiveConfigKey, redactConfigValue } from '../src/commands/config.ts';
 
 // redactUrl is not exported, so we test it by reading the source and
 // reimplementing the regex to verify the pattern, then test via CLI
@@ -59,5 +60,50 @@ describe('config source correctness', () => {
 
   test('redactUrl uses the correct regex pattern', () => {
     expect(configSource).toContain('postgresql:\\/\\/');
+  });
+});
+
+describe('isSensitiveConfigKey (v0.36.x #892 regression)', () => {
+  test('matches common sensitive key shapes', () => {
+    expect(isSensitiveConfigKey('openai_api_key')).toBe(true);
+    expect(isSensitiveConfigKey('anthropic_api_key')).toBe(true);
+    expect(isSensitiveConfigKey('voyage_api_key')).toBe(true);
+    expect(isSensitiveConfigKey('admin_token')).toBe(true);
+    expect(isSensitiveConfigKey('database.password')).toBe(true);
+    expect(isSensitiveConfigKey('CLIENT_SECRET')).toBe(true);
+    expect(isSensitiveConfigKey('auth')).toBe(true);
+    expect(isSensitiveConfigKey('passwd')).toBe(true);
+  });
+
+  test('does NOT false-positive on lookalike substrings', () => {
+    // Pre-fix `.includes('key')` would have matched 'monkey' and 'parsekey'.
+    expect(isSensitiveConfigKey('monkey_id')).toBe(false);
+    expect(isSensitiveConfigKey('parsekeyword')).toBe(false);
+    expect(isSensitiveConfigKey('tokenize')).toBe(false);
+    expect(isSensitiveConfigKey('autocomplete')).toBe(false);
+  });
+
+  test('non-sensitive keys pass through', () => {
+    expect(isSensitiveConfigKey('search.mode')).toBe(false);
+    expect(isSensitiveConfigKey('sync.repo_path')).toBe(false);
+    expect(isSensitiveConfigKey('embedding_model')).toBe(false);
+  });
+});
+
+describe('redactConfigValue (v0.36.x #892 — set output regression)', () => {
+  test('redacts sensitive keys to ***', () => {
+    expect(redactConfigValue('openai_api_key', 'sk-test-123')).toBe('***');
+    expect(redactConfigValue('admin_token', 'eyJhbGciOiJIUzI1NiJ9')).toBe('***');
+  });
+
+  test('redacts postgresql URL passwords regardless of key', () => {
+    expect(redactConfigValue('database_url', 'postgresql://u:secret@h:5432/d'))
+      .toBe('postgresql://u:***@h:5432/d');
+  });
+
+  test('non-sensitive values pass through unchanged', () => {
+    expect(redactConfigValue('search.mode', 'balanced')).toBe('balanced');
+    expect(redactConfigValue('embedding_model', 'voyage:voyage-3-large'))
+      .toBe('voyage:voyage-3-large');
   });
 });

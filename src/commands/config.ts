@@ -9,6 +9,24 @@ function redactUrl(url: string): string {
   );
 }
 
+// v0.36.x #892: sensitive config-key allowlist. The `show` path used a
+// loose `.includes('key')` check that also redacts (works); the `set` path
+// previously printed the raw value to stderr, leaking API keys via shell
+// history + scrollback. This helper is the single source of truth so the
+// two surfaces can't drift again. Match on word-segments to avoid
+// false-positives (e.g. `monkey` doesn't match `key`).
+export function isSensitiveConfigKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  // Word-boundary matches: foo_key, foo.key, key_foo, key, api_key, ...
+  return /(^|[._-])(key|secret|token|password|pwd|passwd|auth)([._-]|$)/.test(lower);
+}
+
+export function redactConfigValue(key: string, value: string): string {
+  if (value.includes('postgresql://')) return redactUrl(value);
+  if (isSensitiveConfigKey(key)) return '***';
+  return value;
+}
+
 export async function runConfig(engine: BrainEngine, args: string[]) {
   const action = args[0];
 
@@ -20,11 +38,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     }
     console.log('GBrain config:');
     for (const [k, v] of Object.entries(config)) {
-      const display = typeof v === 'string' && v.includes('postgresql://')
-        ? redactUrl(v)
-        : typeof v === 'string' && (k.includes('key') || k.includes('secret'))
-          ? '***'
-          : v;
+      const display = typeof v === 'string' ? redactConfigValue(k, v) : v;
       console.log(`  ${k}: ${display}`);
     }
     return;
@@ -85,7 +99,10 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
     }
   } else if (action === 'set' && key && value) {
     await engine.setConfig(key, value);
-    console.log(`Set ${key} = ${value}`);
+    // v0.36.x #892: redact sensitive values in confirmation output. API
+    // keys / tokens / passwords are commonly set from terminals with
+    // scrollback; echoing the raw value to stderr leaks the secret.
+    console.log(`Set ${key} = ${redactConfigValue(key, value)}`);
   } else {
     console.error('Usage: gbrain config [show|get|set|unset] <key> [value]');
     console.error('       gbrain config unset --pattern <prefix>');
