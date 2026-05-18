@@ -479,17 +479,13 @@ describe('v0.32.4 — sync_freshness check', () => {
   test('exact 72h boundary → warn (>72h strict; 72h source NOT yet fail)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     // Exactly 72h. Strict `>` on fail threshold means 72h-stale is still in
-    // the warn window. (Tested boundary semantics.) Pin `now` via the
-    // test-seam parameter so CI scheduler jitter can't push `ageMs` past
-    // the strict threshold between Date.now() at agoMs() construction
-    // time and Date.now() inside the check.
-    const t0 = Date.now();
-    const result = await checkSyncFreshness(
-      makeStubEngine([
-        { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: new Date(t0 - 72 * 60 * 60 * 1000) },
-      ]),
-      { now: t0 },
-    );
+    // the warn window. The `nowMs` injection pins both clock reads to the
+    // same instant — without it, drift between `agoMs` and `Date.now()` in
+    // the check pushes ageMs above the threshold and flips the boundary.
+    const nowMs = Date.now();
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: new Date(nowMs - 72 * 60 * 60 * 1000) },
+    ]), { nowMs });
     expect(result.status).toBe('warn');
     expect(result.message).toContain('72h ago');
   });
@@ -506,14 +502,12 @@ describe('v0.32.4 — sync_freshness check', () => {
   test('exact 24h boundary → ok (>24h strict)', async () => {
     const { checkSyncFreshness } = await import('../src/commands/doctor.ts');
     // Exactly 24h. Strict `>` on warn threshold means 24h-stale is still ok.
-    // Pin `now` to avoid the same CI scheduler jitter as the 72h boundary case.
-    const t0 = Date.now();
-    const result = await checkSyncFreshness(
-      makeStubEngine([
-        { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: new Date(t0 - 24 * 60 * 60 * 1000) },
-      ]),
-      { now: t0 },
-    );
+    // Same `nowMs` pinning as the 72h boundary test above — both clock reads
+    // must hit the same instant or μs-scale drift flips the boundary.
+    const nowMs = Date.now();
+    const result = await checkSyncFreshness(makeStubEngine([
+      { id: 'wiki', name: '', local_path: '/tmp/wiki', last_sync_at: new Date(nowMs - 24 * 60 * 60 * 1000) },
+    ]), { nowMs });
     expect(result.status).toBe('ok');
     expect(result.message).toContain('synced recently');
   });
