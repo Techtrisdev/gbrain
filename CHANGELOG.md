@@ -2,6 +2,95 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.36.3.0] - 2026-05-18
+
+**Search now routes through any embedding column you've populated, not just OpenAI 1536. Voyage and ZeroEntropy columns become first-class search targets in one config flip.**
+
+Until this release, gbrain hardcoded `embedding` (OpenAI 1536) as the only column hybrid search could read from. If you'd backfilled `embedding_voyage` (1024d) or `embedding_zeroentropy` (halfvec 2560d) on the side, the index was paid for but unusable. Now `gbrain config set search_embedding_column embedding_voyage` flips your whole brain to Voyage in a single line. The query op also takes `embedding_column` per-call for A/B benchmarking. Adversarial reviews on both the planning and shipping paths caught fifteen real bugs that aren't shipping today — config-plane drift, cosine-rescore corruption when the descriptor's space doesn't match the cache, prototype-pollution via `constructor` as a column key, validation bypass on the descriptor passthrough, and a doctor false-warn on fresh brains.
+
+The numbers that matter:
+
+| Surface | Before | After |
+|---|---|---|
+| Search columns reachable | `embedding` only (1536d OpenAI hardcoded) | Any column in the `embedding_columns` registry — vector or halfvec, any dim ≤ 8192 |
+| Per-call override | image-only via hidden internal flag | `gbrain query --json '{...,"embedding_column":"embedding_voyage"}'` |
+| Cross-column cache contamination | possible if you ever flipped columns | `knobs_hash` v=3 makes `(col, prov)` part of the cache key — silent corruption impossible |
+| `cosineReScore` rerank space | always pulled from `embedding` | pulls from the active column (D9 — Voyage HNSW now ranked against Voyage vectors, not OpenAI ones) |
+| Doctor diagnostics | `embeddings` check only | new `embedding_column_registry` check: format_type dim drift, missing HNSW indexes, coverage <90% gate |
+| Eval replay parity | results changed across column flips ("false regressions") | each `eval_candidates` row stores the column that ran; replay honors it |
+
+What this means: you can run a side-by-side provider eval today. Set `embedding_voyage` as the default for a session, run `gbrain query "..." --json` across your test queries, capture the results, flip back to `embedding`, replay the captured rows with `gbrain eval replay --against ...`, see the Jaccard@k drift between providers. The cache won't lie to you because it sits in a different keyspace for each provider. Doctor will yell if you accidentally point at a column that's only 50% populated.
+
+### Itemized changes
+
+#### Added
+
+- **`embedding_columns` config registry** — declare which content_chunks columns are searchable. JSON map keyed by column name, each entry has `{provider, dimensions, type}` where type ∈ `vector | halfvec`. Set via `gbrain config set embedding_columns '...JSON...'` (DB plane). Validation runs at config-set time: regex on keys, type/dim/provider field shapes. Bad config refuses to load with a paste-ready hint.
+- **`search_embedding_column` config key** — picks the default column for hybridSearch. `gbrain config set search_embedding_column embedding_voyage` flips your whole brain. Coverage gate: refuses the switch when the target column is <90% populated unless you pass `--coverage-override`.
+- **`embedding_column` MCP param on the `query` op** — per-call override for A/B benchmarking. Unknown column names throw a structured error with the list of registered names. The `search` op (keyword-only) deliberately does NOT accept the param — it would be silent UX (CDX-9).
+- **`gbrain doctor` registry check** — `embedding_column_registry` probes each declared column via `format_type(atttypid, atttypmod)` so dim drift (declared 1024d, actual 1536d) surfaces with a paste-ready ALTER. Postgres also checks HNSW index presence; warns if missing. Coverage % on the active default column; warns when below 90% (skips the warn on empty brains).
+- **`isCacheSafe(resolved, cfg)` helper** — the cache-skip decision compares full embedding space (name + dim + model) against cfg, not just the column name. A user who overrides the `embedding` builtin to point at Voyage doesn't accidentally keep using the OpenAI-sized cache.
+
+#### Changed
+
+- **`hybridSearch` resolves the column at the boundary** — engines now take a pre-validated `ResolvedColumn` descriptor, not a raw string. Engine code is config-free and unit-testable in isolation (D11 / CDX-5).
+- **`gateway.embedQuery(text, { embeddingModel, dimensions })`** — query-side embed path accepts a model override. The resolved column's provider drives the embed call, so a query against `embedding_voyage` actually embeds via Voyage, not the global default (D10).
+- **`gateway.isAvailable('embedding', modelOverride?)`** — the availability check honors the override. Hybrid skips vector search only when the column's provider is down, not the global default's (CDX-4).
+- **`engine.getEmbeddingsByChunkIds(ids, column?)`** — `cosineReScore` hydrates embeddings from the active column. Without this, Voyage HNSW retrieval rescored against OpenAI vectors → NaN or wrong rankings (CDX-3 / D9).
+- **`KNOBS_HASH_VERSION` bumped 2→3** — the cache key now folds in column + provider. Pre-v3 cache rows become unreachable on first re-query (one-time miss spike). Source change lives in `mode.ts`, not `query-cache.ts`.
+- **`eval_candidates.embedding_column`** — schema migration v68. Per-row column metadata so `gbrain eval replay` reproduces the same column the capture ran against. NULL-tolerant; pre-v0.36 rows fall back to current default.
+
+#### Fixed (codex /ship findings)
+
+- **Prototype-pollution-safe registry (#1)** — registry uses `Object.create(null)` + `Object.hasOwn`. `gbrain config set search_embedding_column constructor` now correctly rejects rather than resolving to `Object.prototype.constructor`.
+- **Descriptor passthrough re-validates (#2)** — internal SDK callers passing a hand-rolled `ResolvedColumn` get full validation (name regex, type ∈ {vector,halfvec}, dims in [1, 8192]). Eliminates the SQL-injection escape hatch through the descriptor field.
+- **DB-plane config works without a file (#3)** — `loadConfigWithEngine` synthesizes a minimal base when `loadConfig()` returns null. Env-only Postgres installs can `gbrain config set search_embedding_column X` and the resolver actually sees it.
+- **Cache skip is embedding-space-based (#4)** — replaced name-based `isDefaultColumn` with `isCacheSafe(resolved, cfg)` at the call site. User overrides of the `embedding` builtin no longer leak across vector spaces.
+- **Doctor empty-brain UX (#5)** — coverage gate short-circuits when chunk count is 0. Fresh installs no longer see "Active column 'embedding' is 0.0% populated".
+
+#### Tests
+
+- New: `test/search/embedding-column.test.ts` (50 cases — resolver, registry, validation, prototype-pollution, descriptor passthrough, `isCacheSafe`).
+- New: `test/gateway-embed-model-override.test.ts` (8 cases — model/dim override, `isAvailable` override).
+- New: `test/cosine-rescore-column.test.ts` (4 PGLite cases — column-parameter hydration).
+- New: `test/operations-embedding-column.test.ts` (6 cases — `query` accepts param, `search` rejects it).
+- New: `test/e2e/embedding-column-pglite.test.ts` (9 cases — multi-col, halfvec, cosineReScore, unknown-name throw).
+- New: `test/e2e/embedding-column-postgres.test.ts` (7 cases — real-pgvector halfvec, HNSW index visibility, format_type dim drift, coverage gate).
+- New: `test/e2e/eval-replay-column.test.ts` (5 cases — column metadata persistence + replay honors).
+- Extended: `test/search-mode.test.ts`, `test/search/knobs-hash-reranker.test.ts` — v=3 hash, col/prov fields, append-only convention.
+
+#### Plan reviewed
+
+`/plan-eng-review` + codex outside voice surfaced 16 findings during planning + shipping (D1-D16 in the plan + 5 codex /ship findings). Every one applied; the plan file is at `~/.claude/plans/system-instruction-you-are-working-sparkling-sun.md`.
+
+## To take advantage of v0.36.3.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns:
+
+1. Apply the schema migration:
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. (Optional, only if you've backfilled extra columns via ALTER TABLE) declare them in the registry:
+   ```bash
+   gbrain config set embedding_columns '{
+     "embedding_voyage": { "provider": "voyage:voyage-3-large", "dimensions": 1024, "type": "vector" },
+     "embedding_zeroentropy": { "provider": "zeroentropyai:zembed-1", "dimensions": 2560, "type": "halfvec" }
+   }'
+   ```
+3. Verify with doctor:
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name == "embedding_column_registry")'
+   ```
+4. (Optional) flip the default for an A/B run:
+   ```bash
+   gbrain config set search_embedding_column embedding_voyage
+   gbrain query "test query" --json | jq '.results[0]'
+   gbrain config set search_embedding_column embedding  # flip back
+   ```
+
+If any step fails, file an issue at https://github.com/garrytan/gbrain/issues with `gbrain doctor` output and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
 ## [0.35.7.0] - 2026-05-17
 
 **The contradiction probe grew up. Typed claims over time, regressions detected automatically, founder scorecards as a one-liner.**
