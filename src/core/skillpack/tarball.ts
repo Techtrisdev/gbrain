@@ -52,15 +52,24 @@ export interface TarballPackResult {
   compressedBytes: number;
 }
 
+/** Extract caps shape — caller can override any subset. */
+export interface ExtractCaps {
+  maxFiles: number;
+  maxBytesPerFile: number;
+  maxTotalBytes: number;
+  maxPathLength: number;
+  /** Reject if decompressed/compressed ratio exceeds this. */
+  maxCompressionRatio: number;
+}
+
 /** Default extract caps. Override per-call if a publisher pack is exceptional. */
-export const DEFAULT_EXTRACT_CAPS = {
+export const DEFAULT_EXTRACT_CAPS: ExtractCaps = {
   maxFiles: 5000,
   maxBytesPerFile: 1024 * 1024, // 1 MB
   maxTotalBytes: 100 * 1024 * 1024, // 100 MB
   maxPathLength: 255,
-  /** Reject if decompressed/compressed ratio exceeds this. */
   maxCompressionRatio: 100,
-} as const;
+};
 
 export interface TarballExtractOptions {
   /** Absolute path to the .tgz file. */
@@ -68,7 +77,7 @@ export interface TarballExtractOptions {
   /** Absolute path where contents should be extracted (must not exist or be empty). */
   destDir: string;
   /** Cap overrides; merged with defaults. */
-  caps?: Partial<typeof DEFAULT_EXTRACT_CAPS>;
+  caps?: Partial<ExtractCaps>;
 }
 
 export interface TarballExtractResult {

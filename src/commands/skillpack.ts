@@ -29,6 +29,17 @@ import { runMigrateFence } from '../core/skillpack/migrate-fence.ts';
 import { runScrubLegacy } from '../core/skillpack/scrub-legacy.ts';
 import { runHarvest, HarvestError } from '../core/skillpack/harvest.ts';
 import { autoDetectSkillsDir } from '../core/repo-root.ts';
+import {
+  RemoteSourceError,
+  classifySpec,
+  resolveSource,
+} from '../core/skillpack/remote-source.ts';
+import {
+  ScaffoldThirdPartyError,
+  runScaffoldThirdParty,
+} from '../core/skillpack/scaffold-third-party.ts';
+import { SkillpackManifestError } from '../core/skillpack/manifest-v1.ts';
+import { VERSION } from '../version.ts';
 
 const HELP_TOP = `gbrain skillpack <subcommand> [options]
 
@@ -190,13 +201,28 @@ async function cmdList(args: string[]): Promise<void> {
 async function cmdScaffold(args: string[]): Promise<void> {
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
-      'gbrain skillpack scaffold <name> | --all [--workspace PATH] [--dry-run] [--json]',
+      'gbrain skillpack scaffold <name> | <source> | --all [--workspace PATH] [--dry-run] [--trust] [--no-cache] [--json]\n\n' +
+      '<name>   — bundled skill slug (e.g. `book-mirror`)\n' +
+      '<source> — third-party skillpack source. Accepted shapes:\n' +
+      '             owner/repo                (expands to https://github.com/owner/repo)\n' +
+      '             https://...git            (verbatim https URL)\n' +
+      '             ./local/dir/              (local pack root)\n' +
+      '             ./local/pack.tgz          (local tarball)\n' +
+      '\nFlags:\n' +
+      '  --workspace PATH    Target workspace (default: auto-detected)\n' +
+      '  --all               Scaffold every bundled skill (gbrain only)\n' +
+      '  --dry-run           Validate + report; no writes\n' +
+      '  --trust             Skip first-install confirm prompt (CI / unattended agents)\n' +
+      '  --no-cache          Force fresh clone/extract for third-party sources\n' +
+      '  --json              Stable JSON envelope for agent consumption',
     );
     process.exit(0);
   }
   const json = args.includes('--json');
   const dryRun = args.includes('--dry-run');
   const all = args.includes('--all');
+  const trustFlag = args.includes('--trust');
+  const noCache = args.includes('--no-cache');
   let name: string | null = null;
   let workspace: string | null = null;
   for (let i = 0; i < args.length; i++) {
@@ -211,13 +237,33 @@ async function cmdScaffold(args: string[]): Promise<void> {
     }
   }
   if (!all && !name) {
-    console.error('Error: pass a skill name or --all.');
+    console.error('Error: pass a skill name, third-party source, or --all.');
     process.exit(2);
   }
 
-  const gbrainRoot = findGbrainOrDie();
+  // Disambiguate bundled-skill name vs third-party source.
+  //
+  // Routing rule: when the input contains `://`, `/`, or ends in `.tgz` /
+  // `.tar.gz`, it's a third-party source. Otherwise it's a bundled-skill
+  // slug. Bare kebab names ("book-mirror") stay on the v0.36 bundled path
+  // — that's where the existing tests live and most agents will go.
+  const isThirdPartySpec = !all && name !== null && /[\/:]|\.(tgz|tar\.gz)$/.test(name);
+
   const targetWorkspace = resolveWorkspace({ workspace });
 
+  if (isThirdPartySpec) {
+    await runThirdPartyScaffold({
+      spec: name!,
+      targetWorkspace,
+      dryRun,
+      trustFlag,
+      noCache,
+      json,
+    });
+    return;
+  }
+
+  const gbrainRoot = findGbrainOrDie();
   try {
     const result = runScaffold({
       gbrainRoot,
@@ -243,6 +289,123 @@ async function cmdScaffold(args: string[]): Promise<void> {
     process.exit(0);
   } catch (err) {
     if (err instanceof ScaffoldError || err instanceof BundleError) {
+      console.error(`skillpack scaffold: ${(err as Error).message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// scaffold — third-party source path (new in v0.37)
+// ---------------------------------------------------------------------------
+
+interface ThirdPartyScaffoldOptions {
+  spec: string;
+  targetWorkspace: string;
+  dryRun: boolean;
+  trustFlag: boolean;
+  noCache: boolean;
+  json: boolean;
+}
+
+async function runThirdPartyScaffold(opts: ThirdPartyScaffoldOptions): Promise<void> {
+  // Step 1: resolve the source (clone / extract / point at local dir).
+  let resolved;
+  try {
+    // classifySpec also rejects bare kebab inputs ("hackathon-evaluation")
+    // because those need to flow through the registry-client first; that
+    // path lands in a follow-up commit. For now, bare kebabs fall back
+    // to the bundled-skill path (handled by the dispatcher).
+    const cls = classifySpec(opts.spec);
+    if (cls.kind === 'kebab') {
+      console.error(
+        `Error: bare short name "${opts.spec}" needs registry lookup, which is not yet wired in v0.37. ` +
+          `Pass the full source instead (owner/repo, https URL, ./path, or ./*.tgz).`,
+      );
+      process.exit(2);
+    }
+    resolved = resolveSource(opts.spec, { noCache: opts.noCache });
+  } catch (err) {
+    if (err instanceof RemoteSourceError) {
+      console.error(`skillpack scaffold: ${err.message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+
+  // Step 2: orchestrator handles manifest validation, trust prompt, copy,
+  // state.json update, and bootstrap display.
+  try {
+    const result = await runScaffoldThirdParty(
+      {
+        resolved,
+        targetWorkspace: opts.targetWorkspace,
+        trustFlag: opts.trustFlag,
+        dryRun: opts.dryRun,
+      },
+      VERSION,
+    );
+
+    if (opts.json) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: result.status !== 'aborted_no_trust',
+            status: result.status,
+            pack: {
+              name: result.manifest.name,
+              version: result.manifest.version,
+              author: result.manifest.author,
+            },
+            source: result.resolved.source,
+            source_kind: result.resolved.kind,
+            pinned_commit: result.resolved.pinned_commit,
+            tarball_sha256: result.resolved.tarball_sha256,
+            cache_hit: result.resolved.cache_hit,
+            trust: { trusted: result.trustDecision.trusted, reason: result.trustDecision.reason },
+            copy: result.copy?.summary ?? null,
+            bootstrap_shown: result.bootstrap.shown,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      if (result.status === 'aborted_no_trust') {
+        console.error(
+          `skillpack scaffold: aborted (trust decision: ${result.trustDecision.reason}). No files written.`,
+        );
+        process.exit(1);
+      }
+      const m = result.manifest;
+      const summary = result.copy?.summary;
+      console.log(
+        `${opts.dryRun ? 'scaffold (dry-run)' : 'scaffold'}: ${m.name}@${m.version} by ${m.author}` +
+          (summary
+            ? ` — ${summary.wroteNew} wrote, ${summary.skippedExisting} skipped`
+            : ''),
+      );
+      if (result.resolved.kind !== 'local') {
+        console.log(
+          `Source: ${result.resolved.source}` +
+            (result.resolved.pinned_commit ? ` @ ${result.resolved.pinned_commit.slice(0, 12)}` : ''),
+        );
+      }
+      if (result.bootstrap.shown) {
+        // Bootstrap framing on stderr so stdout stays clean for the agent contract.
+        process.stderr.write('\n' + result.bootstrap.text + '\n');
+      }
+      if (!opts.dryRun && summary && summary.wroteNew > 0) {
+        console.log(
+          `\nNext: your agent walks skills/*/SKILL.md frontmatter triggers: for routing.\n` +
+            `Run \`gbrain skillpack reference ${m.name}\` later if upstream changes.`,
+        );
+      }
+    }
+    process.exit(result.status === 'aborted_no_trust' ? 1 : 0);
+  } catch (err) {
+    if (err instanceof ScaffoldThirdPartyError || err instanceof SkillpackManifestError) {
       console.error(`skillpack scaffold: ${(err as Error).message}`);
       process.exit(2);
     }
