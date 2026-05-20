@@ -2,11 +2,11 @@
 
 All notable changes to GBrain will be documented in this file.
 
-## [0.37.0.0] - 2026-05-19
+## [0.38.0.0] - 2026-05-19
 
 **Skillpacks become a real ecosystem. You can ship one, someone else can install it, and gbrain has an opinion about quality.**
 
-Pre-v0.37, skillpacks were one bundle — gbrain shipped its own pack at `openclaw.plugin.json` and that was it. v0.37 opens the door: anyone with a GitHub repo (or a tarball) can publish a skillpack, anyone else can scaffold it into their agent workspace, and `gbrain skillpack doctor` scores any candidate pack against a 10-dimension quality rubric with paste-ready fixes for every failure. The model is **scaffolding, not amber** — v0.36 already retired the install/uninstall semantics; v0.37 extends `scaffold` to third-party sources without re-introducing the managed-block trap.
+Pre-v0.38, skillpacks were one bundle — gbrain shipped its own pack at `openclaw.plugin.json` and that was it. v0.38 opens the door: anyone with a GitHub repo (or a tarball) can publish a skillpack, anyone else can scaffold it into their agent workspace, and `gbrain skillpack doctor` scores any candidate pack against a 10-dimension quality rubric with paste-ready fixes for every failure. The model is **scaffolding, not amber** — v0.36 already retired the install/uninstall semantics; v0.38 extends `scaffold` to third-party sources without re-introducing the managed-block trap.
 
 ### What you can now do
 
@@ -67,7 +67,7 @@ The v0.36.1.0 hindsight calibration wave shipped three new cycle phases (`propos
 
 These were unrelated to skillpack work; surfaced during the cathedral's E2E sweep and fixed as clean-up commits.
 
-### To take advantage of v0.37.0.0
+### To take advantage of v0.38.0.0
 
 `gbrain upgrade` runs `gbrain apply-migrations` which is a no-op for this release (no schema migrations). To start publishing skillpacks:
 
