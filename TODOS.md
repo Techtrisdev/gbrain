@@ -1,6 +1,10 @@
 # TODOS
 
 
+## v0.37.6.0 pre-existing master test regression (noticed during ship)
+
+- [ ] **P0: `test/doctor-report-remote.test.ts:65` — `full report on healthy brain` fails with `health_score: 50` (expects `>=70`).** Reproduces in isolation on fresh PGLite. Introduced by master's v0.37.3.0 (#1215, `skill_brain_first` doctor check) which appears to return non-ok on freshly-initialized test brains, dropping the composite health score below the test's threshold. The test was passing 17/17 in isolation against pre-merge state. Fix shape: either (a) `skill_brain_first` should return `ok` (or `n/a`) on empty/test brains with no user-authored skills, OR (b) `doctor-report-remote.test.ts:68` should seed the skills directory before computing the score, OR (c) downgrade `skill_brain_first` non-ok to a check that doesn't penalize the score on fresh brains. Owner: maintainer of #1215. Noticed during /ship of garrytan/kolkata-v3 → v0.37.6.0.
+
 ## v0.37.5.0 NESTED_QUOTES validator follow-up
 
 - [ ] **v0.37.x+: unify `serializeFrontmatter` tag/title quoting with `brain-writer.ts:184`'s single-quote-with-`''`-escape style for consistency.** Cosmetic only now that the validator at `src/core/markdown.ts:219-238` is YAML-aware (v0.37.5.0). Today the emitter still produces `tags: ["yc"]` (double-quoted via `JSON.stringify`) while the repair path produces `tags: ['yc']` (single-quoted). Both are valid YAML and the validator accepts both, so this is cosmetic — but new writes drifting from repair-side output reads as inconsistency. Original signal: PR #1217 by @garrytan-agents (closed in favor of the validator fix). Touch `src/core/frontmatter-inference.ts:391-416` only; should be ~5 LOC + the existing test at `test/frontmatter-inference.test.ts:239` updated.
