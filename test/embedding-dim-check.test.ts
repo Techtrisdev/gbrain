@@ -15,6 +15,9 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   readContentChunksEmbeddingDim,
   embeddingMismatchMessage,
+  resolveSchemaEmbeddingDim,
+  resolveSchemaMultimodalDim,
+  PGVECTOR_COLUMN_MAX_DIMS,
 } from '../src/core/embedding-dim-check.ts';
 
 // Canonical pattern: single engine per file, init once, disconnect once.
@@ -93,5 +96,165 @@ describe('embeddingMismatchMessage', () => {
     const doctorMsg = embeddingMismatchMessage({ currentDims: 1536, requestedDims: 768, source: 'doctor' });
     expect(initMsg).toContain('Refusing to silently re-template');
     expect(doctorMsg).toContain('Embedding dimension mismatch detected');
+  });
+});
+
+// ============================================================================
+// v0.37.x — D11 + D12 preflight resolvers
+// ============================================================================
+
+describe('resolveSchemaEmbeddingDim', () => {
+  test('OpenAI text-embedding-3-large resolves at default 1536', () => {
+    const got = resolveSchemaEmbeddingDim({ embedding_model: 'openai:text-embedding-3-large' });
+    expect(got).toEqual({
+      ok: true,
+      dim: 1536,
+      model: 'openai:text-embedding-3-large',
+      provider: 'openai',
+      recipeDefault: 1536,
+    });
+  });
+
+  test('ZeroEntropy zembed-1 resolves at recipe default', () => {
+    const got = resolveSchemaEmbeddingDim({ embedding_model: 'zeroentropyai:zembed-1' });
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      expect(got.provider).toBe('zeroentropyai');
+      expect(got.model).toBe('zeroentropyai:zembed-1');
+      expect(got.dim).toBeGreaterThan(0);
+    }
+  });
+
+  test('ZeroEntropy Matryoshka explicit dim (1280) accepted', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'zeroentropyai:zembed-1',
+      embedding_dimensions: 1280,
+    });
+    expect(got.ok).toBe(true);
+    if (got.ok) expect(got.dim).toBe(1280);
+  });
+
+  test('ZeroEntropy Matryoshka invalid dim (1024) rejected — 1024 is Voyage step, not ZE', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'zeroentropyai:zembed-1',
+      embedding_dimensions: 1024,
+    });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/does not support custom dimensions 1024|only emits/);
+  });
+
+  test('OpenAI text-3-large rejects 2048 (not in declared dims_options)', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 2048,
+    });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/rejects custom dimensions 2048|does not support custom dimensions/);
+  });
+
+  test('OpenAI text-3-large accepts 768 (declared in recipe dims_options)', () => {
+    // text-embedding-3-large declares dims_options including 768.
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 768,
+    });
+    expect(got.ok).toBe(true);
+    if (got.ok) expect(got.dim).toBe(768);
+  });
+
+  test('unknown provider rejected with provider list hint', () => {
+    const got = resolveSchemaEmbeddingDim({ embedding_model: 'notarealprovider:foo' });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/unknown provider/i);
+  });
+
+  test('missing colon rejected', () => {
+    const got = resolveSchemaEmbeddingDim({ embedding_model: 'openai' });
+    expect(got.ok).toBe(false);
+  });
+
+  test('negative dim rejected', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: -100,
+    });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/positive integer/);
+  });
+
+  test('zero dim rejected', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 0,
+    });
+    expect(got.ok).toBe(false);
+  });
+
+  test('non-integer dim rejected', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536.5,
+    });
+    expect(got.ok).toBe(false);
+  });
+
+  test('dim exceeding pgvector column cap rejected', () => {
+    const got = resolveSchemaEmbeddingDim({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: PGVECTOR_COLUMN_MAX_DIMS + 1,
+    });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/exceed pgvector's column cap/);
+  });
+
+  test('regression: bug-reporter scenario — OpenAI auto-pick resolves at 1536', () => {
+    const got = resolveSchemaEmbeddingDim({ embedding_model: 'openai:text-embedding-3-large' });
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      expect(got.dim).toBe(1536);
+      expect(got.model).toBe('openai:text-embedding-3-large');
+    }
+  });
+});
+
+describe('resolveSchemaMultimodalDim', () => {
+  test('voyage voyage-multimodal-3 accepted', () => {
+    const got = resolveSchemaMultimodalDim({ embedding_multimodal_model: 'voyage:voyage-multimodal-3' });
+    expect(got.ok).toBe(true);
+    if (got.ok) {
+      expect(got.provider).toBe('voyage');
+      expect(got.dim).toBeGreaterThan(0);
+    }
+  });
+
+  test('OpenAI text-embedding-3-large rejected — not multimodal', () => {
+    const got = resolveSchemaMultimodalDim({
+      embedding_multimodal_model: 'openai:text-embedding-3-large',
+    });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/does not support multimodal/);
+  });
+
+  test('voyage text-only model (voyage-3-large) rejected via allow-list', () => {
+    const got = resolveSchemaMultimodalDim({
+      embedding_multimodal_model: 'voyage:voyage-3-large',
+    });
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.error).toMatch(/not in provider "voyage"'s multimodal allow-list/);
+  });
+
+  test('unknown provider rejected', () => {
+    const got = resolveSchemaMultimodalDim({
+      embedding_multimodal_model: 'notarealprovider:foo',
+    });
+    expect(got.ok).toBe(false);
+  });
+
+  test('dim above pgvector cap rejected', () => {
+    const got = resolveSchemaMultimodalDim({
+      embedding_multimodal_model: 'voyage:voyage-multimodal-3',
+      embedding_multimodal_dimensions: PGVECTOR_COLUMN_MAX_DIMS + 1,
+    });
+    expect(got.ok).toBe(false);
   });
 });

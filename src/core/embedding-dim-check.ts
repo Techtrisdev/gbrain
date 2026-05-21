@@ -15,6 +15,64 @@
 
 import type { BrainEngine } from './engine.ts';
 import { PGVECTOR_HNSW_VECTOR_MAX_DIMS } from './vector-index.ts';
+import { resolveRecipe } from './ai/model-resolver.ts';
+import type { Recipe } from './ai/types.ts';
+import { AIConfigError } from './ai/errors.ts';
+import {
+  supportsVoyageOutputDimension,
+  isValidVoyageOutputDim,
+  VOYAGE_VALID_OUTPUT_DIMS,
+  supportsZeroEntropyDimension,
+  isValidZeroEntropyDim,
+  ZEROENTROPY_VALID_DIMS,
+  isOpenAITextEmbedding3Model,
+  isValidOpenAITextEmbedding3Dim,
+  maxOpenAITextEmbedding3Dim,
+} from './ai/dims.ts';
+
+/**
+ * pgvector supports vector(N) columns up to 16000 dimensions. HNSW indexing
+ * is capped at PGVECTOR_HNSW_VECTOR_MAX_DIMS (2000); above that, exact scan
+ * still works but searches are slower.
+ *
+ * The preflight resolver below uses this as the hard upper bound so anything
+ * pgvector itself would reject (e.g. an accidental `embedding_dimensions: 99999`)
+ * fails at init time rather than at first embed.
+ */
+export const PGVECTOR_COLUMN_MAX_DIMS = 16000;
+
+/**
+ * v0.37 (D9): runtime guard for the deferred-setup mode.
+ *
+ * Init's `--no-embedding` opt-in writes `embedding_disabled: true` to
+ * config.json. Every embed callsite (CLI: `gbrain embed`, `gbrain import`;
+ * library: `runEmbedCore`) consults this guard so the user gets a clear
+ * "configure embedding first" message rather than an opaque gateway error
+ * at first vector write.
+ *
+ * Returns void on the happy path. Throws `EmbeddingDisabledError` when the
+ * config has `embedding_disabled: true`. The error type lets callers in
+ * CLI mode print a paste-ready hint + exit 1, and library callers (Minion
+ * handlers) bubble it back as a structured job failure.
+ */
+export class EmbeddingDisabledError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EmbeddingDisabledError';
+  }
+}
+
+export function assertEmbeddingEnabled(cfg: { embedding_disabled?: boolean } | null): void {
+  if (cfg?.embedding_disabled) {
+    throw new EmbeddingDisabledError(
+      'This brain was initialized with `--no-embedding` (deferred setup).\n' +
+      'Configure an embedding provider before running embed / import:\n' +
+      '  gbrain config set embedding_model <provider>:<model>\n' +
+      '  gbrain config set embedding_dimensions <N>\n' +
+      '  gbrain init --force --embedding-model <provider>:<model>   # re-init to size schema\n',
+    );
+  }
+}
 
 export interface ColumnDimResult {
   /** Whether the `content_chunks.embedding` column exists. False on a fresh brain. */
@@ -117,4 +175,232 @@ export function embeddingMismatchMessage(opts: {
   ].filter(Boolean);
 
   return lines.join('\n');
+}
+
+// ============================================================================
+// v0.37.x — preflight schema-dim resolution (D11 + D12)
+//
+// Resolves the dim that the PGLite schema substitution will use BEFORE
+// `engine.initSchema()` runs, so init can't create a column whose width
+// disagrees with the gateway-resolved provider. Pure functions, no I/O —
+// init calls them, exits early on error, never writes anything to disk in
+// the failure path. The post-init invariant assertion stays as a regression
+// guardrail; after this resolver lands it can never fire.
+// ============================================================================
+
+/** Tagged-union result of preflight resolution. */
+export type ResolveSchemaDimResult =
+  | { ok: true; dim: number; model: string; provider: string; recipeDefault: number }
+  | { ok: false; error: string };
+
+/** Inputs for the embedding-tier preflight resolver. */
+export interface ResolveSchemaEmbeddingDimOpts {
+  /** `provider:model` string (e.g. `openai:text-embedding-3-large`). Required. */
+  embedding_model: string;
+  /** Explicit override (Matryoshka step, custom dim). Optional. */
+  embedding_dimensions?: number;
+}
+
+/**
+ * Resolve the dim that will land in `content_chunks.embedding`'s vector(N)
+ * column. Caller is `init.ts:initPGLite` before any DB write happens.
+ *
+ * Validations:
+ *  1. `embedding_model` parses as `provider:model`.
+ *  2. Provider is a known recipe.
+ *  3. Recipe declares an `embedding` touchpoint.
+ *  4. Resolved dim is a positive integer.
+ *  5. Resolved dim ≤ PGVECTOR_COLUMN_MAX_DIMS (16000).
+ *  6. If user passed `embedding_dimensions`, it either matches
+ *     `recipe.touchpoints.embedding.default_dims` OR is in the recipe's
+ *     `dims_options` list (Matryoshka providers). Otherwise reject — the
+ *     user picked a model that doesn't support custom dims.
+ */
+export function resolveSchemaEmbeddingDim(opts: ResolveSchemaEmbeddingDimOpts): ResolveSchemaDimResult {
+  try {
+    const { recipe, parsed } = resolveRecipe(opts.embedding_model);
+    const tp = recipe.touchpoints.embedding;
+    if (!tp) {
+      return {
+        ok: false,
+        error:
+          `Provider "${recipe.id}" does not offer embedding models. ` +
+          `Pick a recipe with an embedding touchpoint (gbrain providers list).`,
+      };
+    }
+    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_dimensions);
+  } catch (err) {
+    return { ok: false, error: err instanceof AIConfigError ? err.message : String(err) };
+  }
+}
+
+/** Inputs for the multimodal-tier preflight resolver (D12). */
+export interface ResolveSchemaMultimodalDimOpts {
+  /** `provider:model` string for the multimodal endpoint. Required. */
+  embedding_multimodal_model: string;
+  /** Explicit override. Optional. */
+  embedding_multimodal_dimensions?: number;
+}
+
+/**
+ * Resolve the dim that will land in `content_chunks.embedding_multimodal`'s
+ * vector(N) column. Mirrors `resolveSchemaEmbeddingDim` but also checks the
+ * recipe-level `supports_multimodal` flag and the per-model
+ * `multimodal_models` allow-list (some recipes like Voyage mix text-only
+ * and multimodal models in one embedding touchpoint).
+ */
+export function resolveSchemaMultimodalDim(opts: ResolveSchemaMultimodalDimOpts): ResolveSchemaDimResult {
+  try {
+    const { recipe, parsed } = resolveRecipe(opts.embedding_multimodal_model);
+    const tp = recipe.touchpoints.embedding;
+    if (!tp) {
+      return {
+        ok: false,
+        error:
+          `Provider "${recipe.id}" does not offer embedding models. ` +
+          `Pick a recipe with an embedding touchpoint that supports multimodal input.`,
+      };
+    }
+    if (!tp.supports_multimodal) {
+      return {
+        ok: false,
+        error:
+          `Provider "${recipe.id}" does not support multimodal embeddings. ` +
+          `Configured recipes that do: voyage (voyage-multimodal-3). ` +
+          `Run \`gbrain providers list\` to see touchpoint coverage.`,
+      };
+    }
+    if (tp.multimodal_models && !tp.multimodal_models.includes(parsed.modelId)) {
+      return {
+        ok: false,
+        error:
+          `Model "${parsed.modelId}" is not in provider "${recipe.id}"'s multimodal allow-list ` +
+          `(allowed: ${tp.multimodal_models.join(', ')}). ` +
+          `Pick a multimodal-capable model from this provider.`,
+      };
+    }
+    return validateDimAgainstTouchpoint(parsed.modelId, recipe, tp.default_dims, tp.dims_options, opts.embedding_multimodal_dimensions);
+  } catch (err) {
+    return { ok: false, error: err instanceof AIConfigError ? err.message : String(err) };
+  }
+}
+
+/**
+ * Shared validation of a requested dim against a recipe touchpoint's
+ * declared dims, including provider-specific Matryoshka allow-lists.
+ *
+ * Recipes (`src/core/ai/recipes/*.ts`) declare `default_dims` per touchpoint
+ * but do NOT generally encode Matryoshka steps as `dims_options`. The
+ * per-provider valid-dim allow-lists live in `src/core/ai/dims.ts`:
+ *   - `VOYAGE_VALID_OUTPUT_DIMS` (256/512/1024/2048) for flexible Voyage models
+ *   - `ZEROENTROPY_VALID_DIMS` (2560/1280/640/320/160/80/40) for ZE zembed-1
+ *   - OpenAI text-embedding-3-* accepts ANY positive integer up to the
+ *     model's native size (1536 small / 3072 large)
+ *
+ * Validation order:
+ *   1. recipe-declared `dims_options` (highest precedence — recipe author
+ *      knows their backend)
+ *   2. provider-specific dim.ts allow-lists (for known Matryoshka providers)
+ *   3. fall through to "this model only emits default_dims" rejection
+ */
+function validateDimAgainstTouchpoint(
+  modelId: string,
+  recipe: Recipe,
+  defaultDims: number,
+  dimsOptions: number[] | undefined,
+  requestedDims: number | undefined,
+): ResolveSchemaDimResult {
+  const dim = requestedDims ?? defaultDims;
+
+  if (!Number.isInteger(dim) || dim <= 0) {
+    return {
+      ok: false,
+      error: `Embedding dimensions must be a positive integer; got ${JSON.stringify(dim)}.`,
+    };
+  }
+  if (dim > PGVECTOR_COLUMN_MAX_DIMS) {
+    return {
+      ok: false,
+      error:
+        `Embedding dimensions ${dim} exceed pgvector's column cap of ${PGVECTOR_COLUMN_MAX_DIMS}. ` +
+        `Pick a model that returns ≤${PGVECTOR_COLUMN_MAX_DIMS} dims.`,
+    };
+  }
+
+  if (requestedDims !== undefined && requestedDims !== defaultDims) {
+    // User asked for a non-default dim. Walk the precedence chain.
+    const customDimOk = isCustomDimValidForProvider(recipe, modelId, requestedDims, dimsOptions);
+    if (!customDimOk.valid) {
+      return { ok: false, error: customDimOk.error };
+    }
+  }
+
+  return {
+    ok: true,
+    dim,
+    model: `${recipe.id}:${modelId}`,
+    provider: recipe.id,
+    recipeDefault: defaultDims,
+  };
+}
+
+interface CustomDimCheck {
+  valid: boolean;
+  error: string;
+}
+
+function isCustomDimValidForProvider(
+  recipe: Recipe,
+  modelId: string,
+  requestedDims: number,
+  dimsOptions: number[] | undefined,
+): CustomDimCheck {
+  // Tier 1: recipe-declared dims_options.
+  if (dimsOptions && dimsOptions.length > 0) {
+    if (dimsOptions.includes(requestedDims)) return { valid: true, error: '' };
+    return {
+      valid: false,
+      error:
+        `Provider "${recipe.id}" model "${modelId}" rejects custom dimensions ${requestedDims} ` +
+        `(allowed: ${dimsOptions.join(', ')}).`,
+    };
+  }
+
+  // Tier 2: provider-specific Matryoshka allow-lists.
+  if (recipe.id === 'voyage' && supportsVoyageOutputDimension(modelId)) {
+    if (isValidVoyageOutputDim(requestedDims)) return { valid: true, error: '' };
+    return {
+      valid: false,
+      error:
+        `Voyage model "${modelId}" rejects custom dimensions ${requestedDims} ` +
+        `(allowed: ${VOYAGE_VALID_OUTPUT_DIMS.join(', ')}).`,
+    };
+  }
+  if (recipe.id === 'zeroentropyai' && supportsZeroEntropyDimension(modelId)) {
+    if (isValidZeroEntropyDim(requestedDims)) return { valid: true, error: '' };
+    return {
+      valid: false,
+      error:
+        `ZeroEntropy model "${modelId}" does not support custom dimensions ${requestedDims} ` +
+        `(allowed: ${ZEROENTROPY_VALID_DIMS.join(', ')}).`,
+    };
+  }
+  if (recipe.id === 'openai' && isOpenAITextEmbedding3Model(modelId)) {
+    if (isValidOpenAITextEmbedding3Dim(modelId, requestedDims)) return { valid: true, error: '' };
+    const maxDim = maxOpenAITextEmbedding3Dim(modelId);
+    return {
+      valid: false,
+      error:
+        `OpenAI ${modelId} accepts dimensions 1..${maxDim}, got ${requestedDims}.`,
+    };
+  }
+
+  // Tier 3: provider not known to support custom dims at all.
+  return {
+    valid: false,
+    error:
+      `Provider "${recipe.id}" model "${modelId}" does not support custom dimensions ${requestedDims} ` +
+      `(this model only emits its default vector size). ` +
+      `Either drop --embedding-dimensions or pick a Matryoshka-aware model.`,
+  };
 }
