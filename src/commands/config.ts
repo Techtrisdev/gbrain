@@ -106,6 +106,37 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       process.exit(1);
     }
   } else if (action === 'set' && key && value) {
+    // v0.37 (D6): strict unknown-key rejection with --force escape hatch.
+    // Catches the silent-no-op class the bug reporter hit (`embedding.provider`,
+    // `embedding.model`, `embedding.dimensions` all accepted today). Levenshtein
+    // suggests the canonical key when one is within edit distance ≤ 3.
+    const forceFlag = args.includes('--force');
+    if (!forceFlag) {
+      const { KNOWN_CONFIG_KEYS, KNOWN_CONFIG_KEY_PREFIXES } = await import('../core/config.ts');
+      const isKnown = KNOWN_CONFIG_KEYS.includes(key);
+      const matchesPrefix = KNOWN_CONFIG_KEY_PREFIXES.some(p => key.startsWith(p));
+      if (!isKnown && !matchesPrefix) {
+        const { suggestNearest } = await import('../core/levenshtein.ts');
+        const suggestion = suggestNearest(key, KNOWN_CONFIG_KEYS, 3);
+        console.error(`[config] Unknown config key "${key}".`);
+        if (suggestion) {
+          console.error(`[config] Did you mean "${suggestion}"?`);
+        } else {
+          console.error(`[config] No similar known key. Run \`gbrain config show\` to see currently-set keys.`);
+        }
+        console.error(`[config] If this is intentional (downstream tooling, forward-compat), re-run with --force.`);
+        process.exit(1);
+      }
+    } else {
+      // --force: accept but warn loudly so the user sees what they're doing.
+      const { KNOWN_CONFIG_KEYS, KNOWN_CONFIG_KEY_PREFIXES } = await import('../core/config.ts');
+      const isKnown = KNOWN_CONFIG_KEYS.includes(key);
+      const matchesPrefix = KNOWN_CONFIG_KEY_PREFIXES.some(p => key.startsWith(p));
+      if (!isKnown && !matchesPrefix) {
+        console.error(`[config] WARN: writing unknown key "${key}" with --force. Nothing in gbrain reads this.`);
+      }
+    }
+
     // v0.36 (D12 + D14): validate embedding-column keys at set time so a
     // bad config gets rejected loud + early. The `--coverage-override`
     // flag lets the user proceed past the < 90% gate when they know

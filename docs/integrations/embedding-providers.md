@@ -1,6 +1,6 @@
 # Embedding providers
 
-GBrain ships with 16 embedding-provider recipes covering OpenAI, OpenRouter (single key, many hosted models), the major hosted alternatives, three local options, and a universal escape hatch (LiteLLM proxy). Run `gbrain providers list` to see the live registry; `gbrain providers explain --json` emits a machine-readable matrix for agents.
+GBrain ships with 16 embedding-provider recipes covering OpenAI, ZeroEntropy, Voyage, OpenRouter (single key, many hosted models), the major hosted alternatives, three local options, and a universal escape hatch (LiteLLM proxy). Run `gbrain providers list` to see the live registry; `gbrain providers explain --json` emits a machine-readable matrix for agents.
 
 This page is the human-readable counterpart: capability per provider, env-var setup, dimensions, cost, and known constraints.
 
@@ -13,10 +13,17 @@ gbrain providers test --model openai:text-embedding-3-large   # smoke-test
 gbrain init --pglite --model voyage            # use a non-default provider
 ```
 
+## Init resolves your provider from env keys
+
+As of v0.37, `gbrain init --pglite` auto-detects which provider to use from your env vars. With `OPENAI_API_KEY` set, you get OpenAI. With `ZEROENTROPY_API_KEY` set, you get ZeroEntropy. If multiple provider keys are set, init fires an interactive picker. If no provider keys are set in a non-TTY context (CI, Docker build), init exits 1 with a paste-ready setup hint. Explicit flags (`--embedding-model`, `--no-embedding`) always win over env detection.
+
+The resolved provider + dimensions get persisted to `~/.gbrain/config.json` atomically, so subsequent runs are deterministic across releases.
+
 ## TL;DR table
 
 | Provider | env vars | default dims | cost ($/1M tokens) | local? | multimodal? |
 |---|---|---|---|---|---|
+| `zeroentropyai` | `ZEROENTROPY_API_KEY` | 2560 (Matryoshka to 1280/640/320/...) | 0.05 | no | no |
 | `openai` | `OPENAI_API_KEY` | 1536 | 0.13 | no | no |
 | `openrouter` | `OPENROUTER_API_KEY` | 1536 | 0.02 | no | model-dependent |
 | `voyage` | `VOYAGE_API_KEY` | 1024 | 0.18 | no | yes (`voyage-multimodal-3`) |
@@ -32,6 +39,24 @@ gbrain init --pglite --model voyage            # use a non-default provider
 | `anthropic` | (no embedding model — chat only) | — | — | — | — |
 | `deepseek` | (no embedding model — chat only) | — | — | — | — |
 | `groq` | (no embedding model — chat only) | — | — | — | — |
+
+**Note on local providers.** Ollama and llama-server have no required API key, so they don't show up in env-detection auto-pick. Pick them explicitly with `--embedding-model ollama:<model>` to avoid silently routing to a daemon that may not be running.
+
+## If first import fails
+
+If `gbrain import` fails with `expected N dimensions, not M`, run `gbrain doctor`. The output will print the exact `gbrain config set ...` or `gbrain retrieval-upgrade` command to repair the mismatch. **You should not need to delete `~/.gbrain`.** The bug-class that historically forced `rm -rf` recoveries is closed as of v0.37.
+
+The doctor distinguishes two repair paths:
+
+- **Empty brain** (no embedded chunks yet) — drop and re-init at the right dim:
+  ```
+  gbrain init --force --pglite --embedding-model <provider>:<model> --embedding-dimensions <N>
+  ```
+
+- **Non-empty brain** — migrate cleanly with the supported reindex path:
+  ```
+  gbrain retrieval-upgrade --to <provider>:<model> --reindex
+  ```
 
 ## Decision tree
 

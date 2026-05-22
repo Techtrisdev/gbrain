@@ -34,6 +34,15 @@ export interface GBrainConfig {
   /** AI gateway config (v0.14+). Default: "openai:text-embedding-3-large" / 1536 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
+  /**
+   * v0.37 (D9): user opted into deferred-setup mode at init time via
+   * `gbrain init --no-embedding`. When true, embed callsites and `gbrain
+   * import` refuse with a `gbrain config set embedding_model <id>` hint
+   * rather than proceeding with a default that may not match a real key.
+   * Mutually exclusive with `embedding_model` being set — init writes one
+   * or the other, never both.
+   */
+  embedding_disabled?: boolean;
   expansion_model?: string;
   /**
    * Default chat model for `gateway.chat()` callers (v0.27+).
@@ -319,6 +328,116 @@ export async function loadConfigWithEngine(
   }
   return merged;
 }
+
+/**
+ * v0.37 (D6): canonical list of known config keys for `gbrain config set`
+ * validation. Includes both the static GBrainConfig fields (file plane)
+ * and well-known DB-plane keys.
+ *
+ * This is NOT a runtime allow-list applied to reads — gateway/reader code
+ * still tolerates extra keys. It's the suggestion source for "did you mean"
+ * Levenshtein on `set`. Missing keys can be passed through with `--force`.
+ *
+ * When adding a new persistent config key:
+ *   1. Add it to the GBrainConfig interface (if file-plane) OR document it
+ *      below (if DB-plane).
+ *   2. Add the canonical name to this list so `gbrain config set` accepts it
+ *      without `--force`.
+ */
+export const KNOWN_CONFIG_KEYS: readonly string[] = [
+  // File-plane (GBrainConfig static fields)
+  'engine',
+  'database_url',
+  'database_path',
+  'openai_api_key',
+  'anthropic_api_key',
+  'embedding_model',
+  'embedding_dimensions',
+  'embedding_disabled',
+  'expansion_model',
+  'chat_model',
+  'chat_fallback_chain',
+  'provider_base_urls',
+  'storage',
+  'eval',
+  'eval.capture',
+  'eval.scrub_pii',
+  'embedding_multimodal',
+  'embedding_multimodal_model',
+  'embedding_image_ocr',
+  'embedding_image_ocr_model',
+  'embedding_columns',
+  'search_embedding_column',
+  'remote_mcp',
+  'sync',
+  'sync.repo_path',
+  'sync.last_commit',
+  // DB-plane (v0.32.3 search modes + related)
+  'search.mode',
+  'search.cache.enabled',
+  'search.cache.similarity_threshold',
+  'search.cache.ttl_seconds',
+  'search.token_budget',
+  'search.expansion',
+  'search.intent_weighting',
+  'search.limit_default',
+  'search.mode_upgrade_notice_shown',
+  'search.unified_multimodal',
+  'search.unified_multimodal_only',
+  'search.cross_modal.llm_intent',
+  'search.image_query.max_bytes',
+  'search.reranker.enabled',
+  'search.track_retrieval',
+  // Models tier system (v0.31.12)
+  'models.default',
+  'models.tier.utility',
+  'models.tier.reasoning',
+  'models.tier.deep',
+  'models.tier.subagent',
+  'models.aliases',
+  'models.dream.synthesize',
+  'models.dream.patterns',
+  'models.dream.synthesize_verdict',
+  'models.drift',
+  'models.auto_think',
+  'models.think',
+  'models.subagent',
+  'models.expansion',
+  'models.chat',
+  'models.eval.longmemeval',
+  'facts.extraction_model',
+  // Dream cycle config
+  'dream.synthesize.session_corpus_dir',
+  'dream.synthesize.meeting_transcripts_dir',
+  'dream.synthesize.last_completion_ts',
+  'dream.synthesize.verdict_model',
+  'dream.synthesize.max_prompt_tokens',
+  'dream.synthesize.max_chunks_per_transcript',
+  'dream.patterns.lookback_days',
+  'dream.patterns.min_evidence',
+  // Emotional weight (v0.29)
+  'emotional_weight.high_tags',
+  'emotional_weight.user_holder',
+  // Cycle phase config
+  'cycle.grade_takes.write_gstack_learnings',
+  // Misc
+  'artifacts_sync_mode',
+  'cross_project_learnings',
+];
+
+/**
+ * v0.37 (D6): well-known prefix patterns for DB-plane keys that have
+ * unbounded sub-keys. Used as a softer gate before falling back to
+ * Levenshtein suggestion in `gbrain config set`.
+ */
+export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
+  'search.',           // search.* (mode, cache.*, etc.)
+  'models.',           // models.* (tier, aliases, per-task)
+  'dream.',            // dream.synthesize.*, dream.patterns.*
+  'cycle.',            // cycle.<phase>.*
+  'embedding_columns.', // per-column overrides
+  'provider_base_urls.', // per-provider base URL overrides
+];
 
 export function saveConfig(config: GBrainConfig): void {
   mkdirSync(getConfigDir(), { recursive: true });

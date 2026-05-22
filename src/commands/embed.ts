@@ -4,6 +4,8 @@ import type { ChunkInput } from '../core/types.ts';
 import { chunkText } from '../core/chunkers/recursive.ts';
 import { createProgress, type ProgressReporter } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { assertEmbeddingEnabled } from '../core/embedding-dim-check.ts';
+import { loadConfig } from '../core/config.ts';
 
 export interface EmbedOpts {
   /** Embed ALL pages (every chunk). */
@@ -67,6 +69,12 @@ export interface EmbedResult {
  * auto-embed step) can report embeddings in their own structured output.
  */
 export async function runEmbedCore(engine: BrainEngine, opts: EmbedOpts): Promise<EmbedResult> {
+  // T7 (D9): refuse cleanly when init persisted the deferred-setup sentinel.
+  // Skipped in dryRun mode so plan-mode introspection still works.
+  if (!opts.dryRun) {
+    assertEmbeddingEnabled(loadConfig());
+  }
+
   const result: EmbedResult = {
     embedded: 0,
     skipped: 0,

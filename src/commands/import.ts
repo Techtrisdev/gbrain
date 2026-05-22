@@ -49,6 +49,22 @@ export async function runImport(
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
   const jsonOutput = args.includes('--json');
+
+  // T7 (D9): refuse cleanly when init persisted the deferred-setup sentinel,
+  // unless the user is explicitly skipping embedding via `--no-embed` (in
+  // which case the chunks land without vectors and the user can backfill
+  // later with `gbrain embed --stale` after configuring a provider).
+  if (!noEmbed) {
+    const { assertEmbeddingEnabled } = await import('../core/embedding-dim-check.ts');
+    const { loadConfig } = await import('../core/config.ts');
+    try {
+      assertEmbeddingEnabled(loadConfig());
+    } catch (e) {
+      console.error(`\n${e instanceof Error ? e.message : e}`);
+      console.error('Tip: run `gbrain import <dir> --no-embed` to import without embedding now.');
+      process.exit(1);
+    }
+  }
   // v0.30.x follow-up to PR #707: programmatic sourceId support so internal
   // callers (performFullSync, future Step 6 paths) can route to a named
   // source.

@@ -1359,6 +1359,29 @@ async function checkSubagentProvider(engine: BrainEngine): Promise<Check> {
           `Fix: \`gbrain config set models.tier.subagent anthropic:claude-sonnet-4-6\` to lock it in.`,
       };
     }
+
+    // v0.37 (T10 / D7): warn when the configured chat_model is non-Anthropic
+    // AND ANTHROPIC_API_KEY isn't set. Subagent jobs require Anthropic
+    // regardless of chat_model (minions/queue.ts:97 enforces this); without
+    // the key, gbrain dream / gbrain agent run / gbrain autopilot will all
+    // fail at first job submission. Catches the post-init drift case the
+    // init-time caveat would have shown if init had been re-run.
+    try {
+      const { loadConfig } = await import('../core/config.ts');
+      const cfg = loadConfig();
+      const chatModel = cfg?.chat_model;
+      if (chatModel && !isAnthropicProvider(chatModel) && !process.env.ANTHROPIC_API_KEY) {
+        return {
+          name: 'subagent_provider',
+          status: 'warn',
+          message:
+            `chat_model is "${chatModel}" (non-Anthropic) and ANTHROPIC_API_KEY is not set. ` +
+            `Subagent features (gbrain dream, gbrain agent run, gbrain autopilot) will fail at job submission. ` +
+            `Chat alone (gbrain think) still works. Set ANTHROPIC_API_KEY before running subagent commands.`,
+        };
+      }
+    } catch { /* loadConfig may throw; fall through */ }
+
     return { name: 'subagent_provider', status: 'ok', message: 'Subagent tier resolves to Anthropic' };
   } catch (e) {
     return {
@@ -2393,7 +2416,63 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     const configuredDims = getEmbeddingDimensions();
     const available = isAvailable('embedding');
 
-    if (!available) {
+    // v0.37 (T9, codex #7 nuance): catch the v0.36 silent-default case where
+    // config has no embedding_model but the schema column exists at a dim
+    // that doesn't match the gateway's resolved default. Empty-brain vs
+    // non-empty-brain branching determines the repair hint:
+    //   - empty brain (no embedded chunks) → `gbrain init --force --embedding-model …`
+    //   - non-empty brain → `gbrain retrieval-upgrade --to … --reindex`
+    // The bug-reporter's `rm -rf ~/.gbrain` recovery is never the right answer.
+    let surfacedUnconfiguredDrift = false;
+    try {
+      const { loadConfig } = await import('../core/config.ts');
+      const cfg = loadConfig();
+      const fileEmbeddingSet = !!cfg?.embedding_model;
+      const deferredSetup = cfg?.embedding_disabled === true;
+      if (!fileEmbeddingSet && !deferredSetup) {
+        // Read column dim + chunk count
+        const { readContentChunksEmbeddingDim } = await import('../core/embedding-dim-check.ts');
+        const colDim = await readContentChunksEmbeddingDim(engine);
+        if (colDim.exists && colDim.dims !== null && colDim.dims !== configuredDims) {
+          // Determine if the brain has any content — drift is only a real
+          // user-facing problem once the user has imported anything. A
+          // pristine brain (0 total chunks) is still in fresh-install state;
+          // first import will hit the loud preflight before any column
+          // write, so doctor doesn't need to pre-warn.
+          let totalChunks = 0;
+          let embeddedCount = 0;
+          try {
+            const rows = await engine.executeRaw<{ total: number | string; embedded: number | string }>(
+              `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE embedding IS NOT NULL)::int AS embedded FROM content_chunks`,
+            );
+            totalChunks = Number(rows?.[0]?.total ?? 0);
+            embeddedCount = Number(rows?.[0]?.embedded ?? 0);
+          } catch { /* table may be missing or fresh; treat as empty */ }
+
+          if (totalChunks > 0) {
+            const fix = embeddedCount === 0
+              ? `No embeddings yet — drop the empty schema and re-init at the right dim:\n        gbrain init --force --pglite --embedding-model ${configuredModel} --embedding-dimensions ${configuredDims}`
+              : `Non-empty brain (${embeddedCount} embedded chunks). Migrate cleanly:\n        gbrain retrieval-upgrade --to ${configuredModel} --reindex`;
+
+            checks.push({
+              name: 'embedding_provider',
+              status: 'warn',
+              message:
+                `Schema column is vector(${colDim.dims}) but gateway default resolves to ${configuredModel} (${configuredDims}d). ` +
+                `Persist your provider choice with \`gbrain config set embedding_model ${configuredModel}\` AND fix the schema:\n      ${fix}`,
+            });
+            surfacedUnconfiguredDrift = true;
+          }
+        }
+      }
+    } catch {
+      // loadConfig may throw on a malformed config; let the existing
+      // available/probe branch surface the issue.
+    }
+
+    if (surfacedUnconfiguredDrift) {
+      // Bail out — the warn above is more actionable than the live probe.
+    } else if (!available) {
       // Per v0.28.5 plan P1: silently skipped when no API key is configured.
       // Doctor must stay green on CI / local-only / offline environments where
       // a full provider probe isn't possible. The skipped status is still

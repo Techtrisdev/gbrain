@@ -3,7 +3,7 @@
 
 ## v0.37.8.0 pre-existing master test regression (noticed during ship)
 
-- [ ] **P0: `test/doctor-report-remote.test.ts:65` — `full report on healthy brain` fails with `health_score: 50` (expects `>=70`).** Reproduces in isolation on fresh PGLite. Introduced by master's v0.37.3.0 (#1215, `skill_brain_first` doctor check) which appears to return non-ok on freshly-initialized test brains, dropping the composite health score below the test's threshold. Fix shape: either (a) `skill_brain_first` should return `ok` (or `n/a`) on empty/test brains with no user-authored skills, OR (b) `doctor-report-remote.test.ts:68` should seed the skills directory before computing the score, OR (c) downgrade `skill_brain_first` non-ok to a check that doesn't penalize the score on fresh brains. Owner: maintainer of #1215. Noticed during /ship of garrytan/kolkata-v3 → v0.37.8.0.
+- [x] **P0: `test/doctor-report-remote.test.ts:65` — `full report on healthy brain` fails with `health_score: 50` (expects `>=70`).** **Completed:** v0.37.10.0 (2026-05-21). Resolved structurally by the empty-brain-100/100 fix in `src/core/pglite-engine.ts` + `src/core/postgres-engine.ts` (commit 9aa571f3): pages-empty brains now get vacuous-truth full marks on every breakdown component (35/25/15/15/10), so the freshly-initialized test brain's composite stays >=70 even when `skill_brain_first` returns non-ok. Test file renamed to `test/doctor-report-remote.serial.test.ts` and made hermetic (isolates `GBRAIN_HOME` to a tempdir via beforeAll/afterAll per `scripts/check-test-isolation.sh` R1 — env mutation requires serial quarantine).
 
 ## v0.37.7.0 federated-brains + autopilot safety follow-ups (v0.37.x+)
 
@@ -235,17 +235,58 @@
   update PR. Or a release-cadence audit checklist item. Today: when the
   estimate looks off, hand-edit the constants.
 
-- [ ] **v0.32.x: interactive provider chooser in `gbrain init`.** The full
-  wizard piece of the v0.32 discoverability lane was deferred. Today
-  `gbrain init` (no flags, TTY) silently uses OpenAI default. Plan: hook
-  into `init.ts:resolveAIOptions`, when no `--model` AND TTY AND not
-  `--non-interactive`, call `runExplain([])` (non-JSON path) from
-  `providers.ts:233-350` to print the provider matrix, then prompt with
-  readline (mirror `supabaseWizard()` at `init.ts:108`). Suggest
-  recommended based on env detection. Refuse `user_provided_models`
-  shorthand (already done in v0.32.0). Tests:
-  `test/init-provider-wizard.test.ts` (TTY → prompt fires; non-TTY →
-  falls through; invalid choice → re-prompts).
+- [x] ~~**v0.32.x: interactive provider chooser in `gbrain init`.**~~
+  **SUPERSEDED by v0.37 — closed by the env-detection + hybrid picker wave.**
+  `src/commands/init-provider-picker.ts` mirrors this design: filters to
+  env-ready recipes, prompts via readline through `readLineSafe`, surfaces
+  the subagent-Anthropic caveat on non-Anthropic chat picks. Env detection
+  in `resolveAIOptions` auto-picks when env is unambiguous (one provider's
+  keys set), fires the picker when multiple providers are ready, and exits 1
+  with a paste-ready setup hint in non-TTY zero-key contexts (D3). See
+  `~/.claude/plans/system-instruction-you-are-working-enumerated-mccarthy.md`
+  for the full decision trail.
+
+## Embedding-provider follow-ups (v0.37+)
+
+- [ ] **v0.37+: dedicated migration script for v0.36 broken installs.** v0.37
+  ships D5 + step 11 of the env-detection wave, which surfaces v0.36 silent-
+  default brains in `gbrain doctor` with a paste-ready repair command. What's
+  not yet built: a one-shot orchestrator under `src/commands/migrations/v0_37_x.ts`
+  that detects the broken state (vector(1536) schema + empty
+  `config.embedding_model` + 0 embedded chunks) on `gbrain upgrade` and runs
+  the repair automatically. Same shape as `src/commands/migrations/v0_12_2.ts`.
+  Telemetry-gated: only worth writing if issues show widespread breakage.
+
+- [ ] **v0.37+: namespaced extension fields for `gbrain config set`.** v0.37
+  D6 ships strict unknown-key rejection with a `--force` escape hatch +
+  Levenshtein "did you mean" suggestion. Codex finding #8 from the eng review
+  argued for a `gbrain.ext.<key>` namespace pattern instead of `--force`
+  accepting arbitrary top-level keys; deferred for follow-up. Revisit if
+  `--force` shows misuse in practice (e.g. tooling writing dozens of unknown
+  keys, polluting `gbrain config show`).
+
+- [ ] **v0.37+: runtime config-key inventory audit.** Codex finding #12 from
+  the eng review: the `KNOWN_CONFIG_KEYS` allow-list in `src/core/config.ts`
+  is hand-maintained. A future runtime audit could walk every `cfg.X` access
+  site at startup and cross-check against the allow-list, catching drift
+  when new code paths read a key the maintainer forgot to declare. Pre-merge
+  manual grep (`grep -rE "config\.\w+" src/`) is sufficient today.
+
+- [ ] **v0.38+: env-key typo detection at `gbrain config set` time too.**
+  v0.37 D13 ships Levenshtein typo detection at init for env vars
+  (`OPENAPI_API_KEY` → `OPENAI_API_KEY`). The same logic isn't applied at
+  `gbrain config set` for value-level provider strings (e.g.
+  `gbrain config set embedding_model openai:text-embedign-3-large` —
+  notice the typo'd model name). Cheap to add: parse the value as
+  `provider:model`, suggest the nearest from the recipe's `models[]` list.
+
+- [ ] **v0.38+: extend init env-detection to multimodal explicitly via picker.**
+  v0.37 T11 hooks `resolveSchemaMultimodalDim` preflight into
+  `gbrain reindex --multimodal`. The picker doesn't yet have a 'multimodal'
+  touchpoint mode — multimodal model selection happens via
+  `gbrain config set embedding_multimodal_model` or env detection of
+  multimodal-capable providers. Future polish: extend the picker with a
+  fourth touchpoint case so first-time users discover the option at init.
 
 - [ ] **v0.32.x: real-credentials per-recipe smoke-test CI matrix.** Codex
   finding #6 noted that unit tests via `__setEmbedTransportForTests` prove

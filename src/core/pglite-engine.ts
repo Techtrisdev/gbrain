@@ -3768,11 +3768,18 @@ export class PGLiteEngine implements BrainEngine {
     const noDeadLinks = pageCount > 0 ? 1 - Math.min(deadLinks / pageCount, 1) : 1;
     // Bug 11 — per-component points. Sum equals brainScore by construction
     // so `doctor` can render a breakdown that adds up to the total.
-    const embedCoverageScore = pageCount === 0 ? 0 : Math.round(embedCoverage * 35);
-    const linkDensityScore = pageCount === 0 ? 0 : Math.round(linkDensity * 25);
-    const timelineCoverageScore = pageCount === 0 ? 0 : Math.round(timelineCoverageDensity * 15);
-    const noOrphansScore = pageCount === 0 ? 0 : Math.round(noOrphans * 15);
-    const noDeadLinksScore = pageCount === 0 ? 0 : Math.round(noDeadLinks * 10);
+    //
+    // v0.37.10.0: empty brains (pageCount === 0) get FULL marks (100/100),
+    // not 0. Semantically an empty brain has no coverage problem to penalize
+    // — there's nothing to embed, nothing to link, nothing to orphan. The
+    // pre-fix "empty = 0" caused fresh-init brains to score as critically
+    // unhealthy on `gbrain doctor`, which was a structural surprise to users
+    // who'd just successfully run init.
+    const embedCoverageScore = pageCount === 0 ? 35 : Math.round(embedCoverage * 35);
+    const linkDensityScore = pageCount === 0 ? 25 : Math.round(linkDensity * 25);
+    const timelineCoverageScore = pageCount === 0 ? 15 : Math.round(timelineCoverageDensity * 15);
+    const noOrphansScore = pageCount === 0 ? 15 : Math.round(noOrphans * 15);
+    const noDeadLinksScore = pageCount === 0 ? 10 : Math.round(noDeadLinks * 10);
     const brainScore = embedCoverageScore + linkDensityScore + timelineCoverageScore + noOrphansScore + noDeadLinksScore;
 
     return {
