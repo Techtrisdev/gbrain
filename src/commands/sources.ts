@@ -47,6 +47,12 @@ import {
   resolveSourceWithTier,
   SOURCE_TIER_NAMES,
 } from '../core/source-resolver.ts';
+import {
+  loadAllSources,
+  parseSourceConfig,
+  isSourceFederated,
+  type SourceRow as LoadedSourceRow,
+} from '../core/sources-load.ts';
 
 // ── Validation ──────────────────────────────────────────────
 
@@ -84,18 +90,10 @@ interface SourceListEntry {
 
 // ── Helpers ─────────────────────────────────────────────────
 
-function parseConfig(config: unknown): Record<string, unknown> {
-  if (typeof config === 'string') {
-    try { return JSON.parse(config) as Record<string, unknown>; } catch { return {}; }
-  }
-  if (typeof config === 'object' && config !== null) return config as Record<string, unknown>;
-  return {};
-}
-
-function isFederated(config: unknown): boolean {
-  const parsed = parseConfig(config);
-  return parsed.federated === true;
-}
+// v0.40 (D7): shared helpers — re-exported as local names for back-compat
+// with existing call sites that import `parseConfig`/`isFederated` by intent.
+const parseConfig = parseSourceConfig;
+const isFederated = isSourceFederated;
 
 async function fetchSource(engine: BrainEngine, id: string): Promise<SourceRow | null> {
   const rows = await engine.executeRaw<SourceRow>(
@@ -184,10 +182,10 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
 async function runList(engine: BrainEngine, args: string[]): Promise<void> {
   const json = args.includes('--json');
 
-  const rows = await engine.executeRaw<SourceRow>(
-    `SELECT id, name, local_path, last_commit, last_sync_at, config, created_at
-       FROM sources ORDER BY (id = 'default') DESC, id`,
-  );
+  // v0.40 (D7): loadAllSources is the single source of truth for source enum.
+  // Pass includeArchived=true to preserve the legacy `runList` behavior of
+  // surfacing archived rows (they get the ⚠ marker below).
+  const rows: LoadedSourceRow[] = await loadAllSources(engine, { includeArchived: true });
 
   const entries: SourceListEntry[] = [];
   for (const r of rows) {
@@ -547,6 +545,290 @@ async function runFederate(engine: BrainEngine, args: string[], value: boolean):
     [JSON.stringify(config), id],
   );
   console.log(`Source "${id}" is now ${value ? 'federated (appears in cross-source default search)' : 'isolated (only searched when explicitly named)'}.`);
+
+  // v0.40 D19: auto-submit embed-backfill when coverage < 100%. Federation
+  // flip is a moment when the user explicitly opted into seeing this source
+  // in default search; un-embedded chunks would hide content from the very
+  // moment they wanted visibility. Best-effort — submission failure does NOT
+  // fail the flip.
+  try {
+    const { isFederatedV2Enabled } = await import('../core/feature-flags.ts');
+    if (!(await isFederatedV2Enabled(engine))) return;
+
+    const { loadAllSources } = await import('../core/sources-load.ts');
+    const { computeAllSourceMetrics } = await import('../core/source-health.ts');
+    const sources = await loadAllSources(engine, { includeArchived: false });
+    const metrics = await computeAllSourceMetrics(engine, sources);
+    const m = metrics.find((x) => x.source_id === id);
+    if (!m || m.total_chunks === 0 || m.embed_coverage_pct >= 100) return;
+
+    const { submitEmbedBackfill } = await import('../core/embed-backfill-submit.ts');
+    const sub = await submitEmbedBackfill(engine, id, { reason: 'federation_flip' });
+    if (sub.status === 'submitted') {
+      const missing = m.total_chunks - m.embedded_chunks;
+      console.log(`  → embed-backfill job ${sub.jobId} queued for missing ${missing} chunks.`);
+    } else if (sub.status === 'cooldown') {
+      console.log(`  → embed-backfill skipped (cooldown). Manually trigger with: gbrain jobs submit embed-backfill --params '{"sourceId":"${id}"}'`);
+    } else if (sub.status === 'spend_capped') {
+      console.log(`  → embed-backfill skipped (24h spend cap $${sub.spendCapUsd} reached for this source).`);
+    }
+  } catch (err) {
+    // Federation flip already succeeded; embed-backfill is a follow-up nicety.
+    console.error(`  → embed-backfill submission failed (flip succeeded): ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+// ── v0.40 sources status (D12) ──────────────────────────────
+async function runStatus(engine: BrainEngine, args: string[]): Promise<void> {
+  const json = args.includes('--json');
+  const { loadAllSources } = await import('../core/sources-load.ts');
+  const { computeAllSourceMetrics } = await import('../core/source-health.ts');
+  const sources = await loadAllSources(engine, { includeArchived: false });
+  if (sources.length === 0) {
+    if (json) {
+      console.log(JSON.stringify({ schema_version: 1, sources: [] }, null, 2));
+    } else {
+      console.log('No sources registered. Use `gbrain sources add <id> --path <path>` first.');
+    }
+    return;
+  }
+  const metrics = await computeAllSourceMetrics(engine, sources);
+
+  if (json) {
+    console.log(JSON.stringify({ schema_version: 1, sources: metrics }, null, 2));
+    return;
+  }
+
+  // Human-readable table: SOURCE | LAG | EMBED | FAILS | QUEUE | PAGES | LAST SYNC
+  console.log('SOURCES — health');
+  console.log('────────────────');
+  console.log(
+    `  ${'SOURCE'.padEnd(20)}  ${'LAG'.padEnd(8)}  ${'EMBED'.padEnd(7)}  ${'FAILS'.padEnd(6)}  ${'QUEUE'.padEnd(6)}  ${'PAGES'.padStart(8)}  LAST SYNC`,
+  );
+  for (const m of metrics) {
+    const lag = m.lag_seconds === null
+      ? 'never'
+      : formatLag(m.lag_seconds);
+    const embed = `${m.embed_coverage_pct.toFixed(0)}%`;
+    const fails = String(m.failed_jobs_24h);
+    const queue = String(m.queue_depth);
+    const pages = m.total_pages.toLocaleString();
+    const sync = m.last_sync_at ? new Date(m.last_sync_at).toISOString().slice(0, 19).replace('T', ' ') : 'never';
+    console.log(`  ${m.source_id.padEnd(20)}  ${lag.padEnd(8)}  ${embed.padEnd(7)}  ${fails.padEnd(6)}  ${queue.padEnd(6)}  ${pages.padStart(8)}  ${sync}`);
+  }
+  console.log('');
+  for (const m of metrics) {
+    const warns: string[] = [];
+    if (!m.local_path) warns.push('no local_path');
+    if (m.lag_seconds === null) warns.push(`never synced — run \`gbrain sync --source ${m.source_id}\``);
+    if (m.embed_coverage_pct < 95 && m.total_chunks > 100) {
+      warns.push(`${(100 - m.embed_coverage_pct).toFixed(1)}% un-embedded — run \`gbrain embed --stale --source ${m.source_id}\``);
+    }
+    if (m.failed_jobs_24h >= 3) {
+      warns.push(`${m.failed_jobs_24h} failures in 24h — check \`gbrain jobs list --status failed\``);
+    }
+    if (warns.length > 0) {
+      console.log(`  ⚠ ${m.source_id}: ${warns.join('; ')}`);
+    }
+  }
+}
+
+function formatLag(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+// ── v0.40 sources webhook (D8) ──────────────────────────────
+async function runWebhook(engine: BrainEngine, args: string[]): Promise<void> {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'set':    return runWebhookSet(engine, rest);
+    case 'show':   return runWebhookShow(engine, rest);
+    case 'rotate': return runWebhookRotate(engine, rest);
+    case 'clear':  return runWebhookClear(engine, rest);
+    case undefined:
+    case '--help':
+    case '-h':
+      console.log(`Usage: gbrain sources webhook <subcommand> <source-id> [options]
+
+Subcommands:
+  set <id>    [--secret VAL] [--github-repo owner/name]   One-time reveal
+  show <id>                                                Metadata only
+  rotate <id>                                              New secret, reveal
+  clear <id>                                               Remove webhook config`);
+      return;
+    default:
+      console.error(`Unknown webhook subcommand: ${sub}`);
+      process.exit(2);
+  }
+}
+
+async function runWebhookSet(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error('Usage: gbrain sources webhook set <id> [--secret VAL] [--github-repo owner/name]');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const explicitSecret = args.find((a, i) => args[i - 1] === '--secret');
+  const githubRepo = args.find((a, i) => args[i - 1] === '--github-repo');
+  if (!githubRepo) {
+    console.error('--github-repo owner/name is required (e.g. "Garry-s-List/zion-brain")');
+    process.exit(2);
+  }
+  if (!/^[\w.-]+\/[\w.-]+$/.test(githubRepo)) {
+    console.error(`Invalid --github-repo format: "${githubRepo}". Expected "owner/name".`);
+    process.exit(2);
+  }
+
+  const { randomBytes } = await import('node:crypto');
+  const secret = explicitSecret ?? randomBytes(32).toString('hex');
+  const cfg = parseConfig(src.config);
+  cfg.webhook_secret = secret;
+  cfg.github_repo = githubRepo;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+
+  console.log(`Webhook configured for source "${id}":`);
+  console.log(`  github_repo:    ${githubRepo}`);
+  console.log(`  webhook_secret: ${secret}`);
+  console.log('');
+  console.log('--- Paste this into GitHub repo settings → Webhooks → Add webhook ---');
+  console.log('  Payload URL:  <your gbrain serve --http URL>/webhooks/github');
+  console.log('  Content type: application/json');
+  console.log(`  Secret:       ${secret}`);
+  console.log('  Events:       Just the push event');
+  console.log('  Active:       checked');
+  console.log('');
+  console.log('⚠ This secret is shown ONCE. Save it now; subsequent `gbrain sources webhook show` will NOT display it.');
+}
+
+async function runWebhookShow(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error('Usage: gbrain sources webhook show <id>');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const cfg = parseConfig(src.config);
+  const githubRepo = typeof cfg.github_repo === 'string' ? cfg.github_repo : '(not set)';
+  const secretSet = typeof cfg.webhook_secret === 'string' && cfg.webhook_secret.length > 0;
+  const trackedBranch = typeof cfg.tracked_branch === 'string' ? cfg.tracked_branch : '(auto-detected on next sync, default main)';
+
+  console.log(`Webhook configuration for source "${id}":`);
+  console.log(`  github_repo:    ${githubRepo}`);
+  console.log(`  webhook_secret: ${secretSet ? '<set — use `webhook rotate` to reveal a new one>' : '(not set)'}`);
+  console.log(`  tracked_branch: ${trackedBranch}`);
+}
+
+async function runWebhookRotate(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error('Usage: gbrain sources webhook rotate <id>');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const { randomBytes } = await import('node:crypto');
+  const secret = randomBytes(32).toString('hex');
+  const cfg = parseConfig(src.config);
+  cfg.webhook_secret = secret;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+  console.log(`New webhook secret for source "${id}":`);
+  console.log(`  ${secret}`);
+  console.log('');
+  console.log('⚠ Update the GitHub webhook config to use this new secret. The old one is invalidated immediately.');
+}
+
+async function runWebhookClear(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error('Usage: gbrain sources webhook clear <id>');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const cfg = parseConfig(src.config);
+  delete cfg.webhook_secret;
+  delete cfg.github_repo;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+  console.log(`Webhook configuration cleared for source "${id}".`);
+}
+
+// ── v0.40 sources tracked-branch (D20) ──────────────────────
+async function runTrackedBranch(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error('Usage: gbrain sources tracked-branch <id> [--set <branch>] [--detect]');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const setArg = args.find((a, i) => args[i - 1] === '--set');
+  const detect = args.includes('--detect');
+  const cfg = parseConfig(src.config);
+
+  if (setArg) {
+    cfg.tracked_branch = setArg;
+    await engine.executeRaw(
+      `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+      [JSON.stringify(cfg), id],
+    );
+    console.log(`Tracked branch for source "${id}" set to "${setArg}".`);
+    return;
+  }
+  if (detect) {
+    if (!src.local_path) {
+      console.error(`Source "${id}" has no local_path; cannot auto-detect branch.`);
+      process.exit(1);
+    }
+    try {
+      const { execFileSync } = await import('node:child_process');
+      const branch = execFileSync('git', ['-C', src.local_path, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' }).trim();
+      cfg.tracked_branch = branch;
+      await engine.executeRaw(
+        `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+        [JSON.stringify(cfg), id],
+      );
+      console.log(`Detected branch "${branch}" for source "${id}"; persisted to config.tracked_branch.`);
+    } catch (e) {
+      console.error(`git rev-parse failed: ${e instanceof Error ? e.message : String(e)}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Read mode: just print
+  const tracked = typeof cfg.tracked_branch === 'string' ? cfg.tracked_branch : '(unset — defaults to main)';
+  console.log(`Source "${id}" tracked_branch: ${tracked}`);
 }
 
 // ── `sources current` (v0.37.7.0) ──────────────────────────
@@ -615,6 +897,11 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     case 'purge':      return runPurge(engine, rest);
     case 'archived':   return runListArchived(engine, rest);
     case 'current':    return runCurrent(engine, rest);
+    // v0.40.5.0 Federated Sync v2
+    case 'status':     return runStatus(engine, rest);
+    case 'webhook':    return runWebhook(engine, rest);
+    case 'tracked-branch': return runTrackedBranch(engine, rest);
+    // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);
     case undefined:
     case '--help':

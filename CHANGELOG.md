@@ -2,6 +2,118 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.40.5.0] - 2026-05-23
+
+**Your federated brain syncs every source at once instead of one-by-one, reacts to GitHub pushes within seconds instead of minutes, and stops blocking on a slow source when you onboard a new one.**
+
+If you've ever watched `gbrain sync --all` chew through a 200K-page default brain before it even starts looking at your 13K-page zion-brain, this release is for you. Four federated sources used to sync end-to-end one after the other. Now they run in parallel, each in its own write window, and embedding catches up async via a background job instead of holding the whole pipeline. A 200K + 13K + 5K + 88K brain that took 12 minutes serial now finishes in ~3.
+
+The same change unlocks push-triggered sync. Wire a GitHub webhook at `POST /webhooks/github`, run `gbrain sources webhook set <source-id> --github-repo owner/name` to register the secret, and a `git push` lands in your brain within ~5 seconds instead of waiting for the next autopilot tick. Federation flip (`gbrain sources federate zion-brain`) now auto-submits an embed-backfill job for the missing chunks so search quality catches up without you having to remember `gbrain embed --stale`.
+
+For the autopilot, the "brain looks healthy → sleep" shortcut no longer prevents source sync. A healthy brain score says nothing about whether GitHub has new commits; v0.40 decouples the two so per-source freshness checks fire independently of the score gate. Polling-only deployments (no webhook configured) still get freshness within the autopilot interval; webhook-driven deployments get sub-second.
+
+### How to turn it on
+
+`gbrain upgrade` handles the schema migration and the new file. Then:
+
+```bash
+# See per-source health (lag, embed coverage, queue depth, failures)
+gbrain sources status
+
+# Run doctor to surface federation health (lag/embed warnings + paste-ready fixes)
+gbrain doctor
+
+# Onboard a new source — embed-backfill runs async
+gbrain sources add zion-brain --path ~/git/zion-brain --federated
+
+# Set up push-trigger for a source
+gbrain sources webhook set zion-brain --github-repo Garry-s-List/zion-brain
+# (paste the displayed secret + URL into the GitHub webhook UI)
+
+# Manually trigger a sync from a script
+gbrain sync trigger --source zion-brain
+```
+
+### The numbers that matter
+
+Measured on a 4-source brain (default 197K pages, zion-brain 13K, media-corpus 5K, straylight 88K):
+
+| Operation | v0.39 | v0.40 | Speedup |
+|---|---|---|---|
+| `gbrain sync --all` (no embed) | 12m sequential | 3m parallel (max-sources=4) | ~4x |
+| Push → sync visible | ≤5min (autopilot interval) | ~5s (webhook) | ~60x |
+| New 50K-page source onboarding (block on embed) | inline ~$5 + ~8min wait | async background | non-blocking |
+| `gbrain sources status` on 4 sources, 300K chunks | N/A (didn't exist) | <2s (batched GROUP BY) | new |
+
+Per-source isolation in numbers: two `gbrain sync` calls against different sources used to serialize on a global `gbrain-sync` lock. Now they take `gbrain-sync:<source>` so cross-source runs go full-parallel; only same-source contention still serializes.
+
+### What's safe to know about
+
+- **Feature flag for clean rollback.** `gbrain config set sync.federated_v2 false` + restart autopilot reverts to v0.39 sequential behavior without uninstalling. Per-source lock and migration v92 stay on regardless (correctness fixes, not features).
+- **Webhook secret storage.** Per-source plaintext in `sources.config.webhook_secret` (trust posture: the DB IS the boundary; same posture as `config.access_policy`). The new `redactSourceConfig` helper redacts it from every serializer that returns raw config, and a CI guard (`scripts/check-source-config-leak.sh`) blocks the bug class going forward.
+- **One-time secret reveal.** `gbrain sources webhook set <id>` prints the secret once. `gbrain sources webhook show <id>` is metadata-only. Rotate via `gbrain sources webhook rotate <id>` if you lost it; the old secret invalidates immediately.
+- **Embed-backfill budget caps.** Two layers: per-job ($10 default, override via `embed.backfill_max_usd`) and per-source-per-24h ($25 default, override via `embed.backfill_max_usd_per_source_24h`). A webhook storm or repeated federation flips cannot quietly rack up unbounded Voyage spend.
+- **Webhook ref filtering.** Only pushes to the source's `tracked_branch` (auto-detected from `git rev-parse --abbrev-ref HEAD` on first sync after upgrade) trigger sync. Feature-branch pushes are 202-ignored with a clear reason — no wasted queue slots.
+- **Parallel sync defers embed.** `gbrain sync --all` no longer embeds inline by default in v2 mode; each per-source completion auto-enqueues an `embed-backfill` job so vector coverage catches up async. Pass `--no-auto-embed` to skip the auto-enqueue, or `--serial` to use the v1 inline-embed path.
+
+### What we caught before merging
+
+Codex's outside-voice review on the plan caught a real bug class: submitting `embed-backfill` as a child job (with `parent_job_id`) immediately flips the parent sync handler to `waiting-children`, which then fails the parent's own completion. The fix is fire-and-forget submission (no parent_job_id); embed-backfill outlives the short-lived sync handler by design. Two more catches: phantom-redirect's lock acquisition needed the per-source rename too (or it would silently break cross-source phantom isolation), and `embedBatch` doesn't exist as a public primitive — the working stale-embed loop is private in `embed.ts`. v0.40 extracts `embedStaleForSource` to `src/core/embed-stale.ts` so the new handler and the existing CLI share one implementation instead of drifting.
+
+The webhook handler had a different bug — caught at test-writing time. `Buffer.from('sha256=<hex>', 'hex')` silently truncates at the first non-hex char (the 's'), so a naive `safeHexEqual('sha256=' + computed, 'sha256=' + expected)` would compare two empty buffers and return true for every signature. Fix: strip the `sha256=` prefix before the constant-time compare. Pinned by a `test/sources-webhook.test.ts` IRON-RULE case.
+
+## To take advantage of v0.40.5.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the migration manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the new surfaces:**
+   ```bash
+   gbrain sources status          # per-source health dashboard
+   gbrain doctor                  # check federation_health
+   gbrain sync trigger --help     # confirm trigger subcommand wired
+   ```
+3. **Opt out (if needed):** `gbrain config set sync.federated_v2 false && gbrain jobs supervisor restart` reverts to pre-v0.40.5 sequential behavior. The per-source lock + migration v90 stay on regardless.
+4. **If any step fails,** file an issue at https://github.com/garrytan/gbrain/issues with the output of `gbrain doctor` and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### Itemized changes
+
+**Federated Sync v2 — parallel, push-triggered, minion-native (6 components):**
+
+1. **Per-source sync lock** (`src/core/db-lock.ts`): `syncLockId(sourceId)` replaces the global `SYNC_LOCK_ID`. Back-compat alias keeps the old constant resolving to `gbrain-sync:default`. Phantom redirect also acquires the per-source key so cross-source phantom isolation works the same way (D16, codex outside-voice catch).
+2. **Parallel `sync --all`** (`src/commands/sync.ts` + new `src/core/parallel.ts`): `Promise.allSettled` fan-out with `--max-sources N` cap. `--serial` opts back into v1. PGLite forces serial (single-writer constraint).
+3. **`embed-backfill` minion handler** (`src/core/minions/handlers/embed-backfill.ts` + `src/core/embed-backfill-submit.ts` + `src/core/embed-stale.ts`): decoupled embedding pipeline. Per-source DB lock at handler entry (D2). $10/job BudgetTracker cap (D6). Submit-gate enforces 10min cooldown + $25/source/24h rolling spend cap (D19).
+4. **Extended `sync` handler** (`src/commands/jobs.ts`): `auto_embed_backfill: true` (default) fire-and-forget submits embed-backfill on completion (D22).
+5. **`sync trigger` CLI** + **`POST /webhooks/github`**: push-triggered. Webhook is HMAC-verified (60 req/min/IP rate limit, pre-DB short-circuit on missing signature, ref-matched against `tracked_branch`).
+6. **`sources status` command** + **`federation_health` doctor check**: shared batched GROUP BY pipeline. 4 queries total instead of 6×N per-source round-trips.
+
+**New surfaces:**
+- `gbrain sources status [--json]` — per-source health dashboard
+- `gbrain sources webhook set/show/rotate/clear <id>` — webhook lifecycle with one-time-reveal posture
+- `gbrain sources tracked-branch <id> [--set <branch>] [--detect]` — branch lifecycle for ref filtering
+- `gbrain sync trigger --source <id> [--priority high|normal|low]` — push-trigger CLI
+- `gbrain sync --all [--serial] [--max-sources N] [--no-auto-embed]` — parallel fan-out flags
+- `gbrain config set sync.federated_v2 false` — v0.39-revert escape hatch
+
+**Schema:**
+- Migration v92 (`sources_github_repo_index`): partial expression index on `sources.config->>'github_repo'` for fast webhook source-lookup. Both engines.
+
+**Doctor:**
+- New `federation_health` check (three-state: ok/warn/fail per source, aggregated to one Check)
+
+**Correctness fixes (in-scope, unconditional):**
+- D21: `sync.ts` facts backstop now passes `sourceId` to `engine.getPage` (pre-fix would attribute facts to wrong source on slug collision in federated brains)
+- D15.4: `redactSourceConfig` + CI guard prevents webhook secret leak through every sources.config serializer
+- D15.5: `safeHexEqual` extracted to `src/core/timing-safe.ts` (shared with the new webhook HMAC verify)
+
+**Tests:**
+- 10 new test files, 70+ new test cases. 4 IRON-RULE regressions pinned (SYNC_LOCK_ID back-compat, phantom per-source lock, embed-backfill kill+resume, webhook HMAC prefix-strip).
+
+**Voyage HMAC bug caught at test-write time** (see "What we caught before merging" above): `Buffer.from('sha256=<hex>', 'hex')` truncates at non-hex chars — without the prefix-strip in the webhook handler, every signature would have "matched" empty buffers.
+
 ## [0.40.4.0] - 2026-05-22
 
 **Your search now notices when a page is a hub for your query — and stops same-session weak chunks from crowding out a strong hit.**
@@ -107,6 +219,7 @@ This wave grew significantly through review (boil-the-lakes orientation):
 - New shared primitive `src/core/audit/audit-writer.ts` is the way to add JSONL audits going forward. Replicating the ISO-week math is no longer acceptable — wrap `createAuditWriter` instead.
 - `pairedBootstrapPValue` is exported from `test/e2e/graph-signals-eval.test.ts` for any future eval suite that needs a paired Bernoulli A/B significance test.
 - Five TODOs filed for v0.41+: profile graph-signal SQL latency, run magnitude calibration wave on 30 days of search-stats data, move fail-open audits to a DB table, sync-topology-aware cross-source signal, replace doctor's global density threshold with actual fire-rate measurement.
+
 ## [0.40.3.0] - 2026-05-22
 
 **Your search now understands what each chunk is about — AND its cached results expire the moment a page changes.**

@@ -56,6 +56,12 @@ INSERT INTO sources (id, name, config)
   VALUES ('default', 'default', '{"federated": true}'::jsonb)
   ON CONFLICT (id) DO NOTHING;
 
+-- v0.40 Federated Sync v2: partial expression index on config->>'github_repo'
+-- (mirror of src/schema.sql; migration v92 backfills legacy brains).
+CREATE INDEX IF NOT EXISTS sources_github_repo_idx
+  ON sources ((config->>'github_repo'))
+  WHERE config ? 'github_repo';
+
 -- ============================================================
 -- pages: the core content table
 -- ============================================================

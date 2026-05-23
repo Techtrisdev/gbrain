@@ -625,6 +625,12 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   //   - synopsis-failures audit JSONL entries from the last 7 days
   checks.push(await checkContextualRetrievalCoverage(engine));
 
+  // 12. v0.40.5.0 Federated Sync v2 (T12) — federation_health:
+  //   - Per-source lag, embed coverage, failed-job rate.
+  //   - Single-source brain short-circuits to ok.
+  //   - Three-state: ok / warn / fail.
+  checks.push(await checkFederationHealth(engine));
+
   return computeDoctorReport(checks);
 }
 
@@ -1383,6 +1389,84 @@ export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Che
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { name: 'source_routing_health', status: 'warn', message: `Check failed: ${msg}` };
+  }
+}
+
+/**
+ * v0.40 Federated Sync v2 (T12) — federation_health.
+ *
+ * Per-source dashboard surface for the autopilot/operator.
+ * Three-state per-source (then aggregated to single Check):
+ *
+ *   ok    — all federated sources synced within 1h AND embed coverage >=95%
+ *           (or chunks <100), AND failed_jobs_24h < 3
+ *   warn  — any source has lag > 1h + federated, OR coverage < 95% with
+ *           chunks > 100, OR failed_jobs_24h >= 3
+ *   fail  — any source has lag > 24h, OR coverage < 50% with chunks > 1000
+ *
+ * Single-source brain short-circuits to ok (no federation to check).
+ * Each warning carries a paste-ready remediation hint.
+ */
+export async function checkFederationHealth(engine: BrainEngine): Promise<Check> {
+  try {
+    const { loadAllSources } = await import('../core/sources-load.ts');
+    const { computeAllSourceMetrics } = await import('../core/source-health.ts');
+    const sources = await loadAllSources(engine, { includeArchived: false });
+    if (sources.length <= 1) {
+      return {
+        name: 'federation_health',
+        status: 'ok',
+        message: 'Single-source brain (no federation to check)',
+      };
+    }
+    const metrics = await computeAllSourceMetrics(engine, sources);
+
+    const warns: string[] = [];
+    const fails: string[] = [];
+    for (const m of metrics) {
+      // Fail thresholds first (most severe)
+      if (m.lag_seconds !== null && m.lag_seconds > 24 * 3600) {
+        fails.push(`${m.source_id}: stale ${Math.floor(m.lag_seconds / 3600)}h — run \`gbrain sync trigger --source ${m.source_id}\``);
+        continue;
+      }
+      if (m.embed_coverage_pct < 50 && m.total_chunks > 1000) {
+        fails.push(`${m.source_id}: ${m.embed_coverage_pct.toFixed(1)}% embed coverage (${m.total_chunks.toLocaleString()} chunks) — run \`gbrain jobs submit embed-backfill --params '{"sourceId":"${m.source_id}"}'\``);
+        continue;
+      }
+      // Warns
+      if (m.federated && m.lag_seconds !== null && m.lag_seconds > 3600) {
+        warns.push(`${m.source_id}: federated source ${Math.floor(m.lag_seconds / 3600)}h+ stale — run \`gbrain sync trigger --source ${m.source_id}\``);
+      }
+      if (m.embed_coverage_pct < 95 && m.total_chunks > 100) {
+        warns.push(`${m.source_id}: ${m.embed_coverage_pct.toFixed(1)}% embed coverage — run \`gbrain jobs submit embed-backfill --params '{"sourceId":"${m.source_id}"}'\``);
+      }
+      if (m.failed_jobs_24h >= 3) {
+        warns.push(`${m.source_id}: ${m.failed_jobs_24h} failures in 24h — check \`gbrain jobs list --status failed\``);
+      }
+    }
+
+    if (fails.length > 0) {
+      return {
+        name: 'federation_health',
+        status: 'fail',
+        message: `${fails.length} federation failure(s):\n  ${fails.join('\n  ')}`,
+      };
+    }
+    if (warns.length > 0) {
+      return {
+        name: 'federation_health',
+        status: 'warn',
+        message: `${warns.length} federation warning(s):\n  ${warns.join('\n  ')}`,
+      };
+    }
+    return {
+      name: 'federation_health',
+      status: 'ok',
+      message: `${metrics.length} source(s) healthy (parallel sync, async embed)`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { name: 'federation_health', status: 'warn', message: `Check failed: ${msg}` };
   }
 }
 
