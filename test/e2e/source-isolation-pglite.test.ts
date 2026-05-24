@@ -84,6 +84,23 @@ beforeEach(async () => {
     chunk_source: 'compiled_truth',
     token_count: 11,
   }], { sourceId: 'src-b' });
+
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, config) VALUES ('shared', 'shared', '{}'::jsonb) ON CONFLICT DO NOTHING`,
+  );
+  await engine.putPage('docs/shared-only', {
+    type: 'guide',
+    title: 'Shared Only',
+    compiled_truth: 'Shared-only canonical content. Important context here.',
+    timeline: '',
+    frontmatter: {},
+  }, { sourceId: 'shared' });
+  await engine.upsertChunks('docs/shared-only', [{
+    chunk_index: 0,
+    chunk_text: 'Shared-only canonical content. Important context here.',
+    chunk_source: 'compiled_truth',
+    token_count: 7,
+  }], { sourceId: 'shared' });
 });
 
 describe('v0.34.1 source-isolation regression (#861)', () => {
@@ -262,6 +279,117 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     const rows = result as Array<{ source_id?: string }>;
     for (const r of rows) {
       expect(r.source_id).toBe('default');
+    }
+  });
+
+  test('query source_id override rejects unauthorized remote source', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const queryOp = operations.find(o => o.name === 'query');
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default'],
+      },
+    };
+    await expect(
+      queryOp!.handler(ctx as any, { query: 'Bob lives only', source_id: 'src-b' }),
+    ).rejects.toThrow('Requested source is outside caller read scope');
+  });
+
+  test('query source_id=__all__ clamps to allowed sources for remote callers', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const queryOp = operations.find(o => o.name === 'query');
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default'],
+      },
+    };
+    const result = await queryOp!.handler(ctx as any, { query: 'Important context', source_id: '__all__' });
+    const rows = result as Array<{ source_id?: string }>;
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) {
+      expect(r.source_id).toBe('default');
+    }
+  });
+
+  test('get_page can read an explicitly allowed shared source', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default', 'shared'],
+      },
+    };
+    const page = await getPageOp!.handler(ctx as any, { slug: 'docs/shared-only', source_id: 'shared' });
+    expect((page as { source_id?: string }).source_id).toBe('shared');
+    expect((page as { title?: string }).title).toBe('Shared Only');
+  });
+
+  test('get_page rejects an explicit unauthorized source', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default', 'shared'],
+      },
+    };
+    await expect(
+      getPageOp!.handler(ctx as any, { slug: 'people/bob', source_id: 'src-b' }),
+    ).rejects.toThrow('Requested source is outside caller read scope');
+  });
+
+  test('think gather applies federated source scope to page, take, and graph streams', async () => {
+    const { runGather } = await import('../../src/core/think/gather.ts');
+    const result = await runGather(engine, {
+      question: 'Important context',
+      gatherLimit: 20,
+      allowedSources: ['default'],
+      remote: true,
+    });
+    for (const p of result.pages as Array<{ source_id?: string }>) {
+      expect(p.source_id).toBe('default');
+    }
+    for (const t of result.takes as Array<{ source_id?: string }>) {
+      if (t.source_id) expect(t.source_id).toBe('default');
     }
   });
 });
