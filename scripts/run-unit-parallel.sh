@@ -61,7 +61,13 @@ fi
 [ "$N" -gt 8 ] && N=8
 
 INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
-SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-600}"
+# v0.40.10 flake-hardening: bump per-shard cap 600 → 900. The test suite
+# grew through v0.40.x — individual shards now legitimately run 1100+ tests
+# and take 620-770s wallclock under 8-shard parallel CPU contention. The
+# 600s cap was calibrated when shards held ~600 tests. Bumping preserves
+# wedge-detection (a real hang would still hit 900s) without false-killing
+# fully-completed shards. Override via GBRAIN_TEST_SHARD_TIMEOUT=N.
+SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-900}"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Output directories. Prefer workspace-local .context/, fall back to /tmp.
