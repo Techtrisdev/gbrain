@@ -68,6 +68,14 @@ interface SourceScopeAudit {
   outcome: SourceScopeAuditOutcome;
 }
 
+export function resolveIngestSourceId(authInfo: AuthInfo, requestedSourceId?: string | null): string {
+  const tokenSourceId = authInfo.sourceId || 'default';
+  const requested = requestedSourceId?.trim();
+  if (!requested) return tokenSourceId;
+  if (requested === tokenSourceId) return tokenSourceId;
+  throw new Error('Requested ingest source is outside caller write scope');
+}
+
 function buildSourceScopeAudit(
   operation: string,
   params: unknown,
@@ -1617,9 +1625,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (file-watcher, inbox-folder, cron-scheduler) while serve --http hosts
   // the network surface and submits Minion jobs directly.
   //
-  // Auth: existing OAuth `write` scope. Rate limit: 100 events / 10s per
-  // IP (reuses the IP-keyed pattern from ccRateLimiter; a future tweak
-  // could key on authInfo.clientId for fairer per-agent fairness).
+  // Auth: existing OAuth `write` scope. Events are bound to the OAuth
+  // client's source_id; X-Gbrain-Source-Id may only repeat that value and
+  // cannot widen write authority. Rate limit: 100 events / 10s per IP
+  // (reuses the IP-keyed pattern from ccRateLimiter; a future tweak could
+  // key on authInfo.clientId for fairer per-agent fairness).
   // Payload cap: 1 MB default. Content-type allowlist: markdown, plain,
   // HTML, JSON. Binary content is REJECTED with HTTP 415 in v1 — the
   // binary-upload flow ships as a separate route in a later wave when
@@ -1753,7 +1763,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const content = body.toString('utf8');
       const contentHash = computeContentHash(content);
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
-      const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
+      let sourceId: string;
+      try {
+        sourceId = resolveIngestSourceId(authInfo, req.header('x-gbrain-source-id')).slice(0, 256);
+      } catch (err) {
+        res.status(403).json({
+          error: 'permission_denied',
+          message: err instanceof Error ? err.message : 'Requested ingest source is outside caller write scope',
+        });
+        return;
+      }
       const callerSlug = req.header('x-gbrain-slug');
 
       const event: IngestionEvent = {

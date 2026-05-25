@@ -88,6 +88,9 @@ beforeEach(async () => {
   await engine.executeRaw(
     `INSERT INTO sources (id, name, config) VALUES ('shared', 'shared', '{}'::jsonb) ON CONFLICT DO NOTHING`,
   );
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, config) VALUES ('capture-events', 'capture-events', '{}'::jsonb) ON CONFLICT DO NOTHING`,
+  );
   await engine.putPage('docs/shared-only', {
     type: 'guide',
     title: 'Shared Only',
@@ -101,6 +104,20 @@ beforeEach(async () => {
     chunk_source: 'compiled_truth',
     token_count: 7,
   }], { sourceId: 'shared' });
+
+  await engine.putPage('events/ambient-capture-only', {
+    type: 'event',
+    title: 'Ambient Capture Only',
+    compiled_truth: 'Ambient capture event stream should stay isolated. Important context here.',
+    timeline: '',
+    frontmatter: {},
+  }, { sourceId: 'capture-events' });
+  await engine.upsertChunks('events/ambient-capture-only', [{
+    chunk_index: 0,
+    chunk_text: 'Ambient capture event stream should stay isolated. Important context here.',
+    chunk_source: 'compiled_truth',
+    token_count: 10,
+  }], { sourceId: 'capture-events' });
 });
 
 describe('v0.34.1 source-isolation regression (#861)', () => {
@@ -391,5 +408,75 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     for (const t of result.takes as Array<{ source_id?: string }>) {
       if (t.source_id) expect(t.source_id).toBe('default');
     }
+  });
+
+  test('automated capture OAuth writer cannot widen read scope with source overrides', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const queryOp = operations.find(o => o.name === 'query');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'capture-events',
+      auth: {
+        token: 'test',
+        clientId: 'simon-ambient-capture',
+        scopes: ['read', 'write'],
+        sourceId: 'capture-events',
+        allowedSources: ['capture-events'],
+      },
+    };
+
+    await expect(
+      queryOp!.handler(ctx as any, { query: 'Shared-only canonical', source_id: 'shared' }),
+    ).rejects.toThrow('Requested source is outside caller read scope');
+    await expect(
+      getPageOp!.handler(ctx as any, { slug: 'docs/shared-only', source_id: 'shared' }),
+    ).rejects.toThrow('Requested source is outside caller read scope');
+
+    const allResult = await queryOp!.handler(ctx as any, {
+      query: 'Important context',
+      source_id: '__all__',
+      limit: 20,
+    });
+    for (const r of allResult as Array<{ source_id?: string }>) {
+      expect(r.source_id).toBe('capture-events');
+    }
+  });
+
+  test('other OAuth clients cannot read an automated capture source unless explicitly granted', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const searchOp = operations.find(o => o.name === 'search');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'jarvis-openclaw',
+        scopes: ['read', 'write'],
+        sourceId: 'default',
+        allowedSources: ['default', 'shared'],
+      },
+    };
+
+    const searchResult = await searchOp!.handler(ctx as any, {
+      query: 'Ambient capture event stream',
+      limit: 20,
+    });
+    for (const r of searchResult as Array<{ source_id?: string }>) {
+      expect(r.source_id).not.toBe('capture-events');
+    }
+
+    await expect(
+      getPageOp!.handler(ctx as any, { slug: 'events/ambient-capture-only', source_id: 'capture-events' }),
+    ).rejects.toThrow('Requested source is outside caller read scope');
   });
 });
