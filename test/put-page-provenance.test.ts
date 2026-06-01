@@ -134,6 +134,57 @@ describe('put_page provenance — trusted local caller (ctx.remote === false)', 
 });
 
 describe('put_page provenance — CV6 spoofing guard (ctx.remote !== false)', () => {
+  test('remote caller cannot redirect explicit source_id away from authenticated source', async () => {
+    const ctx = makeCtx({ remote: true, sourceId: 'default' });
+
+    await expect(
+      putPageOp.handler(ctx, {
+        slug: 'wiki/p3a-source-redirect',
+        source_id: 'shared',
+        content: '---\ntype: note\ntitle: Redirect\n---\n\nbody',
+      }),
+    ).rejects.toThrow(/source_id 'shared'.*authenticated source 'default'/);
+
+    const rows = await engine.executeRaw(
+      'SELECT source_id, slug FROM pages WHERE slug = $1',
+      ['wiki/p3a-source-redirect'],
+    ) as Array<{ source_id: string; slug: string }>;
+    expect(rows).toEqual([]);
+  });
+
+  test('remote caller cannot redirect via frontmatter source_id', async () => {
+    const ctx = makeCtx({ remote: true, sourceId: 'default' });
+
+    await expect(
+      putPageOp.handler(ctx, {
+        slug: 'wiki/p3a-frontmatter-source-redirect',
+        content: '---\ntype: note\ntitle: Redirect\nsource_id: shared\n---\n\nbody',
+      }),
+    ).rejects.toThrow(/frontmatter source_id 'shared'.*authenticated source 'default'/);
+
+    const rows = await engine.executeRaw(
+      'SELECT source_id, slug FROM pages WHERE slug = $1',
+      ['wiki/p3a-frontmatter-source-redirect'],
+    ) as Array<{ source_id: string; slug: string }>;
+    expect(rows).toEqual([]);
+  });
+
+  test('remote caller may repeat its authenticated source_id explicitly', async () => {
+    const ctx = makeCtx({ remote: true, sourceId: 'default' });
+
+    await putPageOp.handler(ctx, {
+      slug: 'wiki/p3a-source-explicit-self',
+      source_id: 'default',
+      content: '---\ntype: note\ntitle: Explicit Self\nsource_id: default\n---\n\nbody',
+    });
+
+    const rows = await engine.executeRaw(
+      'SELECT source_id, slug FROM pages WHERE slug = $1',
+      ['wiki/p3a-source-explicit-self'],
+    ) as Array<{ source_id: string; slug: string }>;
+    expect(rows).toEqual([{ source_id: 'default', slug: 'wiki/p3a-source-explicit-self' }]);
+  });
+
   test('remote caller cannot claim source_kind: capture-cli', async () => {
     const ctx = makeCtx({ remote: true });
     await putPageOp.handler(ctx, {
