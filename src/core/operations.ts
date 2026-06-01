@@ -10,7 +10,8 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
-import { serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
+import { parseMarkdown, serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
+import { isValidSourceId } from './source-id.ts';
 import { mkdirSync, writeFileSync, existsSync, statSync } from 'fs';
 import { dirname } from 'path';
 import { hybridSearch, hybridSearchCached } from './search/hybrid.ts';
@@ -538,6 +539,7 @@ const put_page: Operation = {
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
+    source_id: { type: 'string', required: false, description: 'Optional explicit target source. Remote callers may only set this to their authenticated source.' },
     // v0.39.3.0 provenance write-through (WARN-8 + A1 + CV6). Optional fields
     // for trusted local callers (capture CLI, autopilot, dream cycle). Remote
     // MCP callers (ctx.remote !== false) have their values OVERRIDDEN with
@@ -552,6 +554,40 @@ const put_page: Operation = {
   scope: 'write',
   handler: async (ctx, p) => {
     const slug = p.slug as string;
+    const remoteCaller = ctx.remote !== false;
+
+    // Remote MCP callers get write authority only to the source bound to
+    // their token (ctx.sourceId). A caller-provided source_id, whether as a
+    // tool argument or in page frontmatter, is never allowed to redirect a
+    // write into another source such as `shared`.
+    const requestedSourceId = p.source_id as string | undefined;
+    if (remoteCaller && requestedSourceId !== undefined) {
+      if (!isValidSourceId(requestedSourceId)) {
+        throw new OperationError('invalid_params', `Invalid source_id: ${JSON.stringify(requestedSourceId)}`);
+      }
+      if (requestedSourceId !== ctx.sourceId) {
+        throw new OperationError(
+          'permission_denied',
+          `put_page source_id '${requestedSourceId}' does not match authenticated source '${ctx.sourceId}'`,
+        );
+      }
+    }
+
+    if (remoteCaller) {
+      const parsedForBoundary = parseMarkdown(p.content as string, `${slug}.md`);
+      const frontmatterSourceId = parsedForBoundary.frontmatter.source_id;
+      if (frontmatterSourceId !== undefined) {
+        if (!isValidSourceId(frontmatterSourceId)) {
+          throw new OperationError('invalid_params', `Invalid frontmatter source_id: ${JSON.stringify(frontmatterSourceId)}`);
+        }
+        if (frontmatterSourceId !== ctx.sourceId) {
+          throw new OperationError(
+            'permission_denied',
+            `put_page frontmatter source_id '${frontmatterSourceId}' does not match authenticated source '${ctx.sourceId}'`,
+          );
+        }
+      }
+    }
 
     // v0.39.3.0 CV6 trust gate for provenance write-through (WARN-8).
     // Only trusted LOCAL callers (ctx.remote === false — capture CLI,
