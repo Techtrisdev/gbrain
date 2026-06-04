@@ -422,6 +422,88 @@ export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sou
   return {};
 }
 
+type GetPageResolution = {
+  page: Awaited<ReturnType<BrainEngine['getPage']>>;
+  resolvedSourceId?: string;
+};
+
+function getReadableSourceIds(ctx: OperationContext): string[] | undefined {
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0) return allowed;
+  if (ctx.sourceId) return [ctx.sourceId];
+  return undefined;
+}
+
+function assertGetPageRequestedSource(ctx: OperationContext, requestedSourceId: string): string {
+  if (requestedSourceId === '__all__') {
+    throw new OperationError(
+      'invalid_params',
+      "get_page source_id='__all__' is ambiguous; pass a concrete source_id.",
+    );
+  }
+  if (!isValidSourceId(requestedSourceId)) {
+    throw new OperationError('invalid_params', `Invalid source_id: ${JSON.stringify(requestedSourceId)}`);
+  }
+
+  if (ctx.remote === true) {
+    const readable = getReadableSourceIds(ctx) ?? [];
+    if (!readable.includes(requestedSourceId)) {
+      throw new OperationError(
+        'permission_denied',
+        `get_page source_id '${requestedSourceId}' is outside the authenticated read scope`,
+      );
+    }
+  }
+
+  return requestedSourceId;
+}
+
+async function getPageWithinReadScope(
+  ctx: OperationContext,
+  slug: string,
+  opts: { includeDeleted: boolean; requestedSourceId?: string },
+): Promise<GetPageResolution> {
+  if (opts.requestedSourceId !== undefined) {
+    const sourceId = assertGetPageRequestedSource(ctx, opts.requestedSourceId);
+    return {
+      page: await ctx.engine.getPage(slug, { includeDeleted: opts.includeDeleted, sourceId }),
+      resolvedSourceId: sourceId,
+    };
+  }
+
+  const readable = getReadableSourceIds(ctx);
+  if (!readable || readable.length === 0) {
+    const page = await ctx.engine.getPage(slug, { includeDeleted: opts.includeDeleted });
+    return { page, resolvedSourceId: page?.source_id };
+  }
+
+  const primarySourceId = ctx.sourceId && readable.includes(ctx.sourceId) ? ctx.sourceId : undefined;
+  if (primarySourceId) {
+    const primaryPage = await ctx.engine.getPage(slug, {
+      includeDeleted: opts.includeDeleted,
+      sourceId: primarySourceId,
+    });
+    if (primaryPage) return { page: primaryPage, resolvedSourceId: primarySourceId };
+  }
+
+  const fallbackSourceIds = readable.filter((sourceId) => sourceId !== primarySourceId);
+  const matches: Array<{ sourceId: string; page: NonNullable<GetPageResolution['page']> }> = [];
+  for (const sourceId of fallbackSourceIds) {
+    const page = await ctx.engine.getPage(slug, { includeDeleted: opts.includeDeleted, sourceId });
+    if (page) matches.push({ sourceId, page });
+  }
+
+  if (matches.length === 0) return { page: null };
+  if (matches.length === 1) {
+    return { page: matches[0].page, resolvedSourceId: matches[0].sourceId };
+  }
+  throw new OperationError(
+    'ambiguous_slug',
+    `Page slug '${slug}' exists in multiple readable sources`,
+    `Pass source_id as one of: ${matches.map((match) => match.sourceId).join(', ')}`,
+  );
+}
+
 export interface Operation {
   name: string;
   description: string;
@@ -457,25 +539,23 @@ const get_page: Operation = {
     slug: { type: 'string', required: true, description: 'Page slug' },
     fuzzy: { type: 'boolean', description: 'Enable fuzzy slug resolution (default: false)' },
     include_deleted: { type: 'boolean', description: 'v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.' },
+    source_id: { type: 'string', description: "Optional concrete source to read from. Remote callers may only use sources in their authenticated read scope; '__all__' is rejected for get_page." },
   },
   handler: async (ctx, p) => {
     const slug = p.slug as string;
     const fuzzy = (p.fuzzy as boolean) || false;
     const includeDeleted = (p.include_deleted as boolean) === true;
-    // v0.31.8 (D20): thread ctx.sourceId through read-side ops. Only pass
-    // sourceId when it's set on ctx — when unset (local CLI default chain
-    // resolves to no source), the engine two-branch query falls through to
-    // the cross-source view, preserving pre-v0.31.8 behavior. MCP callers
-    // (stdio + HTTP) populate ctx.sourceId via the transport layer.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    const requestedSourceId = typeof p.source_id === 'string' ? p.source_id : undefined;
 
-    let page = await ctx.engine.getPage(slug, { includeDeleted, ...sourceOpts });
+    let resolved = await getPageWithinReadScope(ctx, slug, { includeDeleted, requestedSourceId });
+    let page = resolved.page;
     let resolved_slug: string | undefined;
 
     if (!page && fuzzy) {
       const candidates = await ctx.engine.resolveSlugs(slug);
       if (candidates.length === 1) {
-        page = await ctx.engine.getPage(candidates[0], { includeDeleted, ...sourceOpts });
+        resolved = await getPageWithinReadScope(ctx, candidates[0], { includeDeleted, requestedSourceId });
+        page = resolved.page;
         resolved_slug = candidates[0];
       } else if (candidates.length > 1) {
         return { error: 'ambiguous_slug', candidates };
@@ -493,6 +573,7 @@ const get_page: Operation = {
     // inside bumpLastRetrievedAt (D2).
     bumpLastRetrievedAt(ctx.engine, [page.id]);
 
+    const sourceOpts = resolved.resolvedSourceId ? { sourceId: resolved.resolvedSourceId } : {};
     const tags = await ctx.engine.getTags(page.slug, sourceOpts);
     // Privacy boundary for the per-token allow-list (v0.28.6 for takes,
     // v0.32.2 for facts).

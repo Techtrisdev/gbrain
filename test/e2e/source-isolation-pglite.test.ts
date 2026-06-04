@@ -236,6 +236,115 @@ describe('v0.34.1 source-isolation regression (#861)', () => {
     expect(sources.has('src-b')).toBe(true);
   });
 
+  test('get_page can read a unique page from federated allowedSources', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    expect(getPageOp).toBeDefined();
+
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default', 'src-b'],
+      },
+    };
+
+    const result = await getPageOp!.handler(ctx as any, { slug: 'people/bob' });
+    expect((result as any).source_id).toBe('src-b');
+    expect((result as any).title).toBe('Bob Source-B Only');
+  });
+
+  test('get_page keeps scalar source precedence when duplicate slugs exist', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    expect(getPageOp).toBeDefined();
+
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default', 'src-b'],
+      },
+    };
+
+    const result = await getPageOp!.handler(ctx as any, { slug: 'people/alice' });
+    expect((result as any).source_id).toBe('default');
+    expect((result as any).title).toBe('Alice Source-A');
+  });
+
+  test('get_page accepts an explicit source_id inside federated read scope', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    expect(getPageOp).toBeDefined();
+    expect(getPageOp!.params.source_id).toBeDefined();
+
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default', 'src-b'],
+      },
+    };
+
+    const result = await getPageOp!.handler(ctx as any, {
+      slug: 'people/alice',
+      source_id: 'src-b',
+    });
+    expect((result as any).source_id).toBe('src-b');
+    expect((result as any).title).toBe('Alice Source-B');
+  });
+
+  test('get_page rejects an explicit source_id outside remote read scope', async () => {
+    const { operations } = await import('../../src/core/operations.ts');
+    const getPageOp = operations.find(o => o.name === 'get_page');
+    expect(getPageOp).toBeDefined();
+
+    const ctx = {
+      engine,
+      config: { engine: 'pglite' as const },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      dryRun: false,
+      remote: true,
+      sourceId: 'default',
+      auth: {
+        token: 'test',
+        clientId: 'test',
+        scopes: ['read'],
+        sourceId: 'default',
+        allowedSources: ['default'],
+      },
+    };
+
+    await expect(getPageOp!.handler(ctx as any, {
+      slug: 'people/alice',
+      source_id: 'src-b',
+    })).rejects.toMatchObject({ code: 'permission_denied' });
+  });
+
   test('#876 federated_read empty array means no federated reads', async () => {
     // sourceScopeOpts treats allowedSources: [] (explicit empty) as "no
     // federated scope" and falls back to scalar sourceId. An empty array
