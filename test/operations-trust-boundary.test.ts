@@ -36,7 +36,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { operations, type OperationContext } from '../src/core/operations.ts';
+import { operations, resolveQuerySourceScope, type OperationContext } from '../src/core/operations.ts';
 import { hasScope } from '../src/core/scope.ts';
 
 let engine: PGLiteEngine;
@@ -263,5 +263,50 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
     expect(threw, 'search_by_image(image_path) with remote=true MUST reject').toBe(true);
     expect(message.toLowerCase()).toContain('image_path');
     expect(message.toLowerCase()).toContain('permission_denied');
+  });
+});
+
+describe('query source-scope boundary (Stage-0.5 / M1 query_all + query_forced_jarvis leak)', () => {
+  // Pre-fix, the query op's source_id param let a scoped OAuth client read
+  // foreign sources: source_id='__all__' returned {} (no filter → every source)
+  // and a forced foreign source_id was honored verbatim. resolveQuerySourceScope
+  // now routes remote callers through the same read-scope ladder as get_page.
+  const remoteShared = (): OperationContext =>
+    makeContext({ remote: true, sourceId: 'shared', auth: { allowedSources: ['shared'] } as any });
+
+  test("remote '__all__' is reduced to the caller's read scope, NOT all sources", () => {
+    expect(resolveQuerySourceScope(remoteShared(), '__all__')).toEqual({ sourceIds: ['shared'] });
+  });
+
+  test('remote foreign explicit source_id is rejected', () => {
+    let threw = false, msg = '';
+    try { resolveQuerySourceScope(remoteShared(), 'jarvis-openclaw'); }
+    catch (e) { threw = true; msg = e instanceof Error ? e.message : String(e); }
+    expect(threw, "remote query source_id='jarvis-openclaw' MUST reject").toBe(true);
+    expect(msg.toLowerCase()).toContain('authenticated read scope');
+  });
+
+  test('remote in-scope explicit source_id is allowed', () => {
+    expect(resolveQuerySourceScope(remoteShared(), 'shared')).toEqual({ sourceId: 'shared' });
+  });
+
+  test('remote with no source_id stays scoped to allowedSources', () => {
+    expect(resolveQuerySourceScope(remoteShared(), undefined)).toEqual({ sourceIds: ['shared'] });
+  });
+
+  test("local (CLI) caller retains cross-source '__all__' + explicit override", () => {
+    const local = makeContext({ remote: false, sourceId: 'default' });
+    expect(resolveQuerySourceScope(local, '__all__')).toEqual({});
+    expect(resolveQuerySourceScope(local, 'some-other-source')).toEqual({ sourceId: 'some-other-source' });
+  });
+
+  test('query op handler rejects a forced foreign source_id end-to-end (remote)', async () => {
+    const queryOp = operations.find((op) => op.name === 'query');
+    expect(queryOp).toBeDefined();
+    let threw = false, msg = '';
+    try { await queryOp!.handler(remoteShared(), { query: 'anything', source_id: 'jarvis-openclaw' }); }
+    catch (e) { threw = true; msg = e instanceof Error ? e.message : String(e); }
+    expect(threw, 'query(source_id=foreign) with remote=true MUST reject').toBe(true);
+    expect(msg.toLowerCase()).toContain('authenticated read scope');
   });
 });

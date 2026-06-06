@@ -458,6 +458,45 @@ function assertGetPageRequestedSource(ctx: OperationContext, requestedSourceId: 
   return requestedSourceId;
 }
 
+/**
+ * Resolve the source scope for the `query` op's optional `source_id` param.
+ *
+ * Remote OAuth callers may NEVER widen beyond their authenticated read scope
+ * (#876 federated read). Pre-fix, `source_id='__all__'` returned `{}` (no filter
+ * → every source) and an explicit `source_id` was honored verbatim, so a scoped
+ * client could read another source's pages by passing `source_id='__all__'` or a
+ * forced foreign `source_id` (Stage-0.5 boundary finding; the M1
+ * query_all / query_forced_jarvis leak). This mirrors get_page's
+ * `assertGetPageRequestedSource` + `sourceScopeOpts` discipline:
+ *   - remote `'__all__'` → reduce to the caller's allowed read set, never all
+ *   - remote concrete id → must be inside the authenticated read scope, else deny
+ *   - local (CLI) callers → retain cross-source `'__all__'` + explicit override
+ */
+export function resolveQuerySourceScope(
+  ctx: OperationContext,
+  sourceIdParam: string | undefined,
+): { sourceId?: string; sourceIds?: string[] } {
+  if (sourceIdParam === undefined) return sourceScopeOpts(ctx);
+
+  if (ctx.remote === true) {
+    if (sourceIdParam === '__all__') return sourceScopeOpts(ctx);
+    if (!isValidSourceId(sourceIdParam)) {
+      throw new OperationError('invalid_params', `Invalid source_id: ${JSON.stringify(sourceIdParam)}`);
+    }
+    const readable = getReadableSourceIds(ctx) ?? [];
+    if (!readable.includes(sourceIdParam)) {
+      throw new OperationError(
+        'permission_denied',
+        `query source_id '${sourceIdParam}' is outside the authenticated read scope`,
+      );
+    }
+    return { sourceId: sourceIdParam };
+  }
+
+  if (sourceIdParam === '__all__') return {};
+  return { sourceId: sourceIdParam };
+}
+
 async function getPageWithinReadScope(
   ctx: OperationContext,
   slug: string,
@@ -1428,7 +1467,7 @@ const query: Operation = {
     source_id: {
       type: 'string',
       description:
-        "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to force cross-source search in multi-source brains.",
+        "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to force cross-source search in multi-source brains. Remote OAuth callers are confined to their authenticated read scope: '__all__' is reduced to that scope (not all sources), and a source_id outside it is rejected.",
     },
     cross_modal: {
       type: 'string',
@@ -1460,12 +1499,11 @@ const query: Operation = {
     // Explicit per-call source_id must win over ctx.sourceId. The special
     // __all__ value opts out of source filtering for local cross-source search.
     const sourceIdParam = typeof p.source_id === 'string' ? p.source_id : undefined;
-    const querySourceScope =
-      sourceIdParam !== undefined
-        ? sourceIdParam === '__all__'
-          ? {}
-          : { sourceId: sourceIdParam }
-        : sourceScopeOpts(ctx);
+    // #876 / Stage-0.5 boundary fix: route the query op's source scope through
+    // the same remote-aware ladder as get_page, so a scoped OAuth client cannot
+    // read foreign sources via source_id='__all__' or a forced source_id. Feeds
+    // both the image branch and the text (hybridSearchCached) branch below.
+    const querySourceScope = resolveQuerySourceScope(ctx, sourceIdParam);
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
