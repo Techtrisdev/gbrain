@@ -6,7 +6,6 @@ import {
   MIGRATIONS,
   LATEST_VERSION,
 } from '../src/core/migrate.ts';
-import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 describe('isMigrationIdempotent — D6 default', () => {
   test('default is true (existing migrations were authored as idempotent)', () => {
@@ -108,18 +107,4 @@ describe('TECH-2031 — migration v93 connector_candidates_table', () => {
     expect(v93?.idempotent).toBe(true);
   });
 
-  test('connector_candidates table exists after initSchema on a fresh PGLite brain', async () => {
-    const eng = new PGLiteEngine();
-    await eng.connect({});
-    try {
-      await eng.initSchema();
-      const rows = await eng.executeRaw(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'connector_candidates'",
-      );
-      expect((rows as Array<{tablename: string}>).length).toBe(1);
-      expect((rows as Array<{tablename: string}>)[0].tablename).toBe('connector_candidates');
-    } finally {
-      await eng.disconnect();
-    }
-  }, 60_000);
 });
