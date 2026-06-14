@@ -8,8 +8,8 @@
             "src/core/migrate.ts",
             "src/core/pglite-schema.ts"
           ],
-          "mode": "append-only",
-          "reason": "Declared schema subtasks append coordinated schema / migration / PGLite-mirror blocks. These are upstream-owned (garrytan/gbrain) files; modularizing them would maximize merge-conflict pain on the two highest-churn upstream files, so structurally-required append growth is allowed while non-append edits still trip the gate."
+          "mode": "accepted-file-monolith",
+          "reason": "Upstream-owned (garrytan/gbrain) monoliths that grow via coordinated MID-STRUCTURE edits — new DDL in schema.sql, a new migration object inserted mid-MIGRATIONS-array in migrate.ts, and a mirrored block in pglite-schema.ts. These are not prefix-appends, so append-only cannot cover them (the TECH-2031 dogfood escalated on exactly this). Modularizing upstream-owned files would maximize merge-conflict pain on the highest-churn upstream files. File-level acceptance only — function-level monolith findings and every other detector are still enforced."
         },
         {
           "paths": [
