@@ -29,7 +29,7 @@ export interface ConnectorCandidateItem {
   /** Version string for this candidate (default '1'). */
   version?: string;
   /** Full set of upstream record IDs this candidate summarises. */
-  source_record_ids?: string[];
+  source_record_ids?: readonly string[] | string[];
   /** Provider that produced this candidate (e.g. 'crunchbase', 'apollo'). */
   provider?: string;
   /** Proposed brain slug — never inserted into pages. */
@@ -39,7 +39,7 @@ export interface ConnectorCandidateItem {
   /** LLM-assigned confidence score, 0..1. */
   confidence?: number;
   /** PII/field redaction tags (JSONB array). */
-  redactions?: unknown[];
+  redactions?: readonly unknown[] | unknown[];
   /** When this candidate should be considered stale. */
   expires_at?: Date;
   /** As-of timestamp for the upstream data. */
@@ -118,13 +118,13 @@ function buildCandidateRow(
     source_id: item.source_id,
     source_record_id: item.source_record_id,
     version: item.version ?? '1',
-    source_record_ids: item.source_record_ids ?? [],
+    source_record_ids: item.source_record_ids ? [...item.source_record_ids] : [],
     provider: item.provider ?? null,
     proposed_slug: item.proposed_slug ?? null,
     // Use caller-supplied markdown if provided; otherwise render a stub.
     proposed_markdown: item.proposed_markdown ?? renderCandidateMarkdown(item),
     confidence: item.confidence ?? null,
-    redactions: item.redactions ?? [],
+    redactions: item.redactions ? [...item.redactions] : [],
     expires_at: item.expires_at ?? null,
     as_of: item.as_of ?? null,
     rationale_ref: item.rationale_ref ?? null,
