@@ -1,0 +1,25 @@
+{
+  "detectors": {
+    "monolith": {
+      "structuralGrowthAllowances": [
+        {
+          "paths": [
+            "src/schema.sql",
+            "src/core/migrate.ts",
+            "src/core/pglite-schema.ts"
+          ],
+          "mode": "append-only",
+          "reason": "Declared schema subtasks append coordinated schema / migration / PGLite-mirror blocks. These are upstream-owned (garrytan/gbrain) files; modularizing them would maximize merge-conflict pain on the two highest-churn upstream files, so structurally-required append growth is allowed while non-append edits still trip the gate."
+        },
+        {
+          "paths": [
+            "src/core/schema-embedded.ts"
+          ],
+          "mode": "generated",
+          "generatedFrom": "src/schema.sql",
+          "command": "bun run build:schema"
+        }
+      ]
+    }
+  }
+}
