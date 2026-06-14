@@ -762,6 +762,39 @@ CREATE INDEX IF NOT EXISTS think_ab_results_recent_idx
   ON think_ab_results (source_id, ran_at DESC);
 
 -- ============================================================
+-- connector_candidates (TECH-2031): table-only connector output store.
+-- PGLite parity with src/schema.sql. No RLS block (PGLite has no role system).
+-- See schema.sql for design rationale.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS connector_candidates (
+  id                 BIGSERIAL     PRIMARY KEY,
+  source_id          TEXT          NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  source_record_id   TEXT          NOT NULL,
+  version            TEXT          NOT NULL DEFAULT '1',
+  source_record_ids  TEXT[]        NOT NULL DEFAULT '{}',
+  provider           TEXT,
+  proposed_slug      TEXT,
+  proposed_markdown  TEXT,
+  confidence         REAL,
+  redactions         JSONB         NOT NULL DEFAULT '[]'::jsonb,
+  expires_at         TIMESTAMPTZ,
+  as_of              TIMESTAMPTZ,
+  rationale_ref      TEXT,
+  status             TEXT          NOT NULL DEFAULT 'pending'
+                                   CHECK (status IN ('pending','accepted','rejected')),
+  status_reason      TEXT,
+  acted_by           TEXT,
+  acted_at           TIMESTAMPTZ,
+  superseded_by      BIGINT        REFERENCES connector_candidates(id) ON DELETE SET NULL,
+  proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  CONSTRAINT connector_candidates_source_record_version_unique
+    UNIQUE (source_id, source_record_id, version)
+);
+
+CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
+  ON connector_candidates (source_id, status, proposed_at DESC);
+
+-- ============================================================
 -- access_tokens: legacy bearer tokens for remote MCP access
 -- ============================================================
 CREATE TABLE IF NOT EXISTS access_tokens (
