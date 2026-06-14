@@ -6,6 +6,7 @@ import {
   MIGRATIONS,
   LATEST_VERSION,
 } from '../src/core/migrate.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 
 describe('isMigrationIdempotent — D6 default', () => {
   test('default is true (existing migrations were authored as idempotent)', () => {
@@ -77,4 +78,48 @@ describe('MigrationRetryExhausted (F2 named-PID UX)', () => {
     expect(err.message).toContain('No idle-in-transaction blockers');
     expect(err.message).toContain('pg_locks');
   });
+});
+
+// TECH-2031: connector_candidates migration v93
+// Moved here from migrate.test.ts to keep that file from growing further.
+describe('TECH-2031 — migration v93 connector_candidates_table', () => {
+  test('LATEST_VERSION is >= 93 after TECH-2031 lands', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(93);
+  });
+
+  test('MIGRATIONS contains an entry with version 93 and name connector_candidates_table', () => {
+    const v93 = MIGRATIONS.find(m => m.version === 93);
+    expect(v93).toBeDefined();
+    expect(v93?.name).toBe('connector_candidates_table');
+  });
+
+  test('v93 migration SQL creates the connector_candidates table', () => {
+    const v93 = MIGRATIONS.find(m => m.version === 93);
+    expect(v93?.sql).toContain('CREATE TABLE IF NOT EXISTS connector_candidates');
+  });
+
+  test('v93 migration SQL creates the connector_candidates index', () => {
+    const v93 = MIGRATIONS.find(m => m.version === 93);
+    expect(v93?.sql).toContain('connector_candidates_source_status_proposed_idx');
+  });
+
+  test('v93 migration is marked idempotent', () => {
+    const v93 = MIGRATIONS.find(m => m.version === 93);
+    expect(v93?.idempotent).toBe(true);
+  });
+
+  test('connector_candidates table exists after initSchema on a fresh PGLite brain', async () => {
+    const eng = new PGLiteEngine();
+    await eng.connect({});
+    try {
+      await eng.initSchema();
+      const rows = await eng.executeRaw(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename = 'connector_candidates'",
+      );
+      expect((rows as Array<{tablename: string}>).length).toBe(1);
+      expect((rows as Array<{tablename: string}>)[0].tablename).toBe('connector_candidates');
+    } finally {
+      await eng.disconnect();
+    }
+  }, 60_000);
 });
