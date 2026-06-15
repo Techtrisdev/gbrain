@@ -484,6 +484,55 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
           logError('dispatch.freshness-gate', e);
         }
 
+        // ── TECH-2038: connector poll dispatch ───────────────────────
+        // Parallel to the git-sync freshness branch above, and likewise
+        // independent of the brain-score gate: a connector source has no
+        // local_path and no git commits, so brain_score (embed coverage /
+        // link density / orphans) says nothing about whether the upstream
+        // SaaS has new records. Selection is fail-closed and default-off:
+        //   - the source must have NO local_path (git-sync owns those), AND
+        //   - at least one config.connectors.<provider>.enabled === true, AND
+        //   - the kill-switch (env GBRAIN_CONNECTORS_KILLSWITCH or per-source
+        //     config.connectors_killswitch) must NOT be tripped.
+        // Each enabled provider on each eligible source is submitted as one
+        // `connector_poll` job, coalesced per (source, provider, slot) via the
+        // idempotency key so repeated ticks don't stack duplicate polls.
+        try {
+          const { loadAllSources } = await import('../core/sources-load.ts');
+          const { selectEnabledConnectorSources } = await import('../core/connectors/poll.ts');
+          const allSources = await loadAllSources(engine);
+          const targets = selectEnabledConnectorSources(
+            allSources.map((s) => ({ id: s.id, local_path: s.local_path, config: s.config })),
+          );
+          for (const target of targets) {
+            try {
+              const job = await queue.add(
+                'connector_poll',
+                { sourceId: target.sourceId, provider: target.provider },
+                {
+                  queue: 'default',
+                  idempotency_key: `connector-poll:${target.sourceId}:${target.provider}:${slot}`,
+                  max_attempts: 2,
+                  timeout_ms: timeoutMs,
+                  maxWaiting: 1,
+                },
+              );
+              if (jsonMode) {
+                process.stderr.write(JSON.stringify({
+                  event: 'dispatched', job_id: job.id, mode: 'connector_poll',
+                  source_id: target.sourceId, provider: target.provider,
+                }) + '\n');
+              } else {
+                console.log(`[dispatch] job #${job.id} connector_poll (${target.sourceId}/${target.provider})`);
+              }
+            } catch (e) {
+              logError('dispatch.connector', e);
+            }
+          }
+        } catch (e) {
+          logError('dispatch.connector-gate', e);
+        }
+
         // Cheap path: engine.getHealth() is a single SQL count query.
         const health = await engine.getHealth();
         const score = health.brain_score;

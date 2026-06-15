@@ -41,6 +41,8 @@ describe('registerBuiltinHandlers', () => {
     expect(names).toContain('extract');
     expect(names).toContain('backlinks');
     expect(names).toContain('autopilot-cycle');
+    // TECH-2038 — connector_poll
+    expect(names).toContain('connector_poll');
   });
 
   test('total handler count includes all 7 names', () => {
