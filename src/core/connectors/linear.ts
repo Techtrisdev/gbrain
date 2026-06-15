@@ -227,7 +227,16 @@ function classifyTake(payload: LinearWebhookPayload): { type: LinearTakeType; ow
   if (('assigneeId' in from || 'assignee' in from) && (str(data.assigneeId) || asRecord(data.assignee))) {
     return { type: 'commitment', owner: ownerOf(data) };
   }
-  if ('priority' in from) return { type: 'action_item', owner: ownerOf(data) };
+  if ('priority' in from) {
+    // Linear priority: 1=urgent … 4=low, 0=none. LOWER number = HIGHER priority.
+    // A raise (new < old) pulls work forward → action_item; a lower/clear is the
+    // semantic opposite → open_question. Unknown/missing either side → open_question.
+    const newP = typeof data.priority === 'number' ? data.priority : undefined;
+    const oldP = typeof from.priority === 'number' ? from.priority : undefined;
+    const raised =
+      newP !== undefined && oldP !== undefined && newP !== 0 && (oldP === 0 || newP < oldP);
+    return { type: raised ? 'action_item' : 'open_question', owner: ownerOf(data) };
+  }
   return { type: 'open_question', owner: ownerOf(data) };
 }
 
@@ -243,12 +252,23 @@ function ownerOf(data: Record<string, unknown>): string {
   );
 }
 
-/** A short, human summary line for a Linear entity (body is dropped by minimize). */
+/**
+ * A short, human summary line for a Linear entity. NEVER body-derived: bodies are
+ * dropped by minimize, and strip() does not catch the names/addresses/deal-terms a
+ * comment body can contain (its documented v1 boundary). So a titleless entity (a
+ * Comment, which carries only `body`) returns a structural type/identifier label —
+ * e.g. "Comment on <issueId>" — never any body-derived text. Only the structural
+ * title/name fields (which are not free-form prose) flow into the kept summary.
+ */
 function summaryFor(type: string | undefined, data: Record<string, unknown>): string {
-  const title = str(data.title) ?? str(data.name) ?? str(data.body)?.slice(0, 140);
+  const title = str(data.title) ?? str(data.name);
   const identifier = str(data.identifier);
   const label = identifier ? `${identifier}` : (type ?? 'record');
-  return title ? `${label}: ${title}` : label;
+  if (title) return `${label}: ${title}`;
+  // Titleless (e.g. a Comment): anchor to the parent issue id when present, else the label.
+  const parentIssueId = str(data.issueId) ?? str(asRecord(data.issue)?.id);
+  if (type === 'Comment' && parentIssueId) return `Comment on ${parentIssueId}`;
+  return label;
 }
 
 // ── The connector ────────────────────────────────────────────────────────────────
@@ -302,47 +322,40 @@ export const linearConnector: SaaSConnector = {
     const profile = profileForType(type);
     const summary = summaryFor(type, data);
 
-    const metadata: Record<string, unknown> = {
-      // snake_case, case-sensitive — matched against redact.ts profile allowlists.
-      number: str(data.identifier) ?? str(data.number),
-      author: ownerOf(data),
-      state: str(asRecord(data.state)?.name) ?? str(data.stateType),
-      url: str(data.url),
-      labels: Array.isArray(data.labelIds) ? data.labelIds : undefined,
-      updated_at: str(data.updatedAt),
-      created_at: str(data.createdAt),
-    };
+    // NOTE: structural metadata is intentionally NOT surfaced on the candidate.
+    // toCandidate emits only the redacted summary (as proposed_markdown) + provider /
+    // slug / confidence — it does not pass `item.metadata` through to a row. We deliberately
+    // do NOT build a metadata object here: a copycat connector must not assume metadata
+    // is written, or it would inherit the unstripped-array hole (e.g. a labels[] array,
+    // which minimize keeps verbatim — arrays are not run through strip()). If a future
+    // ticket surfaces metadata, it must add per-element string stripping first.
 
     const records: NormalizedRecord[] = [
       {
         sourceRecordId: id,
         profile,
-        item: { sourceRecordId: id, metadata, summary, body: str(data.description) ?? str(data.body) },
+        // body is carried only so minimize() records the `body:dropped` trail; it is
+        // ALWAYS dropped and never reaches a candidate column.
+        item: { sourceRecordId: id, summary, body: str(data.description) ?? str(data.body) },
         proposedSlug: `linear-${type?.toLowerCase() ?? 'record'}-${id}`,
       },
     ];
 
-    // AC4: typed rationale take on material change — a SECOND table-only candidate,
-    // carrying its take type + owner in (allowlisted) metadata. The take's own
-    // text/owner are redacted by landRecords just like any other candidate.
+    // AC4: typed rationale take on material change — a SECOND table-only candidate.
+    // Its take type + owner ride in the redacted summary (the human-readable rationale
+    // line); landRecords minimizes + redacts it like any other candidate.
     if (materialChange(p)) {
       const { type: takeType, owner } = classifyTake(p);
-      const takeId = `${id}:take:${takeType}`;
+      // Discriminate by updatedAt so a re-completion (completed → reopened → completed)
+      // lands a SECOND distinct take instead of colliding on ON CONFLICT. Deterministic
+      // per upstream state, so duplicate webhook deliveries of the SAME event still dedupe.
+      const eventStamp = str(data.updatedAt) ?? '';
+      const takeId = `${id}:take:${takeType}:${eventStamp}`;
       records.push({
         sourceRecordId: takeId,
         profile,
         item: {
           sourceRecordId: takeId,
-          // url/author/state survive the profile allowlist; take_type/owner are
-          // intentionally non-allowlisted structural tags carried for the reviewer —
-          // they are DROPPED by minimize (fail-closed) and re-expressed in the summary,
-          // which is the redacted, human-readable rationale line.
-          metadata: {
-            url: str(data.url),
-            author: owner,
-            state: str(asRecord(data.state)?.name) ?? str(data.stateType),
-            updated_at: str(data.updatedAt),
-          },
           summary: `[${takeType}] ${owner}: ${summary}`,
           body: str(data.description) ?? str(data.body),
         },
@@ -425,24 +438,27 @@ export function readBackfillWatermark(source: ConnectorSource): string | null {
   return str(linear?.backfill_cursor) ?? null;
 }
 
-/** Merge the new watermark into sources.config and persist via UPDATE … ::jsonb. */
+/**
+ * Persist ONLY the watermark, server-side, with no dependency on the snapshot we read
+ * at backfill start. A whole-config `UPDATE sources SET config = $1::jsonb` from a stale
+ * in-memory snapshot is a lost-update race: a concurrent secret rotation (or any other
+ * sibling config write) between our read and our write would be clobbered. `jsonb_set`
+ * with `create_missing = true` mutates only the {connectors,linear,backfill_cursor} path
+ * against the CURRENT row, leaving every sibling key intact. (The path's parent objects
+ * must exist for jsonb_set to descend; `connector set`/`enable` always create
+ * connectors.linear before backfill can run, so the path is present.)
+ */
 export async function writeBackfillWatermark(
   engine: BrainEngine,
   source: ConnectorSource,
   watermark: string,
 ): Promise<void> {
-  const raw =
-    (typeof source.config === 'string' ? safeParseConfig(source.config) : source.config) ?? {};
-  const cfg: Record<string, unknown> = { ...raw };
-  const connectors: Record<string, unknown> = { ...(asRecord(cfg.connectors) ?? {}) };
-  const linear: Record<string, unknown> = { ...(asRecord(connectors[PROVIDER]) ?? {}) };
-  linear.backfill_cursor = watermark;
-  connectors[PROVIDER] = linear;
-  cfg.connectors = connectors;
-  await engine.executeRaw(`UPDATE sources SET config = $1::jsonb WHERE id = $2`, [
-    JSON.stringify(cfg),
-    source.id,
-  ]);
+  await engine.executeRaw(
+    `UPDATE sources
+        SET config = jsonb_set(config, '{connectors,linear,backfill_cursor}', to_jsonb($1::text), true)
+      WHERE id = $2`,
+    [watermark, source.id],
+  );
 }
 
 function safeParseConfig(s: string): Record<string, unknown> | null {
@@ -463,7 +479,8 @@ interface LinearIssuesPage {
 
 /**
  * Fetch one page of issues updated after the watermark, ordered by updatedAt asc, with
- * cursor pagination. Uses the OAuth bearer token. Pure HTTP via fetch (mockable in tests).
+ * cursor pagination. `token` is a BARE access token (no scheme); this function prepends
+ * `Bearer `. Pure HTTP via fetch (mockable in tests).
  */
 export async function fetchIssuesPage(
   token: string,
@@ -492,7 +509,9 @@ export async function fetchIssuesPage(
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: token,
+      // Contract: getValidAccessToken returns a BARE access token; the connector adds
+      // the `Bearer ` scheme prefix here.
+      authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({ query, variables }),
   });
