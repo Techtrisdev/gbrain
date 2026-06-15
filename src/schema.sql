@@ -1189,6 +1189,49 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
 CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
   ON connector_candidates (source_id, status, proposed_at DESC);
 
+-- ============================================================
+-- connector_tokens (TECH-2033): encrypted outbound-OAuth credential custody.
+-- ============================================================
+-- One custody record per (source, provider) for an outbound OAuth grant.
+-- Neon stores CIPHERTEXT ONLY — the AES-256-GCM envelope ({kid, iv, ciphertext,
+-- tag}) is sealed by a MASTER KEY from env (GBRAIN_CONNECTOR_MASTER_KEY) that
+-- NEVER touches the DB. No plaintext access/refresh token lives in any column
+-- (or in sources.config). `status='needs_reauth'` is the fail-closed terminal
+-- state set on decrypt failure or a detected refresh-token reuse (RFC 9700).
+--
+-- Identity is (source_id, provider) — ONE account per (source, provider). The
+-- read surface getValidAccessToken(engine, sourceId, provider) takes no account,
+-- so the unique key MUST NOT include account or the single-row read +
+-- needs_reauth marking would be nondeterministic with >1 account. `account` is a
+-- stored attribute (the provider workspace this grant maps to), not part of the
+-- key. Multi-account-per-(source,provider) is a future extension that would
+-- thread `account` through getValidAccessToken.
+--
+-- iv/tag/ciphertext are hex TEXT (12-byte IV → 24 hex chars; 16-byte tag → 32).
+-- kid identifies the master-key generation so a key rotation can re-wrap.
+-- Mirrored in src/core/pglite-schema.ts + migration v94 (src/core/migrate.ts).
+CREATE TABLE IF NOT EXISTS connector_tokens (
+  id            BIGSERIAL     PRIMARY KEY,
+  source_id     TEXT          NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  provider      TEXT          NOT NULL,
+  account       TEXT          NOT NULL,
+  kid           TEXT          NOT NULL,
+  iv            TEXT          NOT NULL,
+  ciphertext    TEXT          NOT NULL,
+  tag           TEXT          NOT NULL,
+  expires_at    TIMESTAMPTZ,
+  status        TEXT          NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active','needs_reauth','revoked')),
+  created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  CONSTRAINT connector_tokens_source_provider_unique
+    UNIQUE (source_id, provider)
+);
+
+-- hot path: getValidAccessToken resolves a single (source, provider) row.
+CREATE INDEX IF NOT EXISTS connector_tokens_source_provider_idx
+  ON connector_tokens (source_id, provider);
+
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS $$
 BEGIN
@@ -1256,6 +1299,8 @@ BEGIN
     ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
     -- TECH-2031 connector candidates store
     ALTER TABLE connector_candidates ENABLE ROW LEVEL SECURITY;
+    -- TECH-2033 encrypted connector token custody store
+    ALTER TABLE connector_tokens ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;

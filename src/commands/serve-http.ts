@@ -44,6 +44,7 @@ import {
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
+import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -89,6 +90,45 @@ export function resolveBootstrapToken(
     };
   }
   return { kind: 'ok', token: trimmed, fromEnv: true };
+}
+
+/**
+ * A minted, not-yet-consumed connector OAuth `state` binding (TECH-2033).
+ * `expiresAt` is epoch ms.
+ */
+export interface ConnectorOAuthState {
+  sourceId: string;
+  provider: string;
+  expiresAt: number;
+}
+
+/**
+ * Pure validation of a connector OAuth `/callback` state against the in-memory
+ * mint store. Extracted so the forged/expired/wrong-provider rejection logic is
+ * unit-testable without booting Express (matching this module's probe-helper
+ * convention). The route is a thin wrapper that consumes (deletes) the matched
+ * key on success.
+ *
+ * Returns `{ ok: true, key, sourceId }` only when a minted state for THIS
+ * provider matches `state` via a constant-time compare AND has not expired.
+ * Otherwise `{ ok: false, reason }`. An unminted/forged state, a state minted
+ * for a different provider, and an expired state all fail closed.
+ */
+export function resolveConnectorCallbackState(
+  states: Map<string, ConnectorOAuthState>,
+  provider: string,
+  state: string,
+  now: number,
+  constantTimeEqual: (a: string, b: string) => boolean,
+): { ok: true; key: string; sourceId: string } | { ok: false; reason: 'invalid_state' } {
+  for (const [key, v] of states) {
+    if (v.provider !== provider) continue;
+    if (v.expiresAt <= now) continue; // expired → not a match
+    if (constantTimeEqual(key, state)) {
+      return { ok: true, key, sourceId: v.sourceId };
+    }
+  }
+  return { ok: false, reason: 'invalid_state' };
 }
 
 export type ProbeHealthResult =
@@ -2065,6 +2105,108 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
     },
   );
+
+  // ---------------------------------------------------------------------------
+  // /admin/api/connectors/:provider/connect + /callback — outbound OAuth (TECH-2033)
+  // ---------------------------------------------------------------------------
+  // The custody layer (src/core/connectors/credentials.ts) owns encryption,
+  // refresh-rotation, and the connector_tokens store. These two routes only
+  // drive a registered provider's OAuth dance and hand the resulting grant to
+  // storeToken — provider specifics (authorizeUrl/exchangeCode/refresh) live in
+  // the connector module, not here. An unregistered provider → 404.
+  //
+  // CSRF: /connect mints an opaque `state` bound to (source, provider) in a
+  // short-lived in-memory map; /callback rejects any state it didn't mint
+  // (constant-time compare) and consumes it single-use. The connect route is
+  // admin-gated (it provisions a credential for a source); the callback is the
+  // provider's redirect target and is gated by the unguessable state instead.
+  //
+  // SINGLE-INSTANCE ASSUMPTION (TECH-2033): `connectorOAuthStates` is in-process,
+  // so a /callback that lands on a DIFFERENT Node instance than the /connect
+  // that minted the state (multi-instance behind a load balancer, or a process
+  // restart between connect and callback) would 400 invalid_state. gbrain runs
+  // single-instance today, so this is correct as-is. Multi-instance support
+  // would replace this Map with a short-TTL `connector_oauth_states` DB table
+  // (mint on connect, consume+delete on callback) — and the refresh single-flight
+  // would then rest solely on the Postgres advisory lock as the cross-instance
+  // serializer (see credentials.ts `refreshLocks` note). Not built now.
+  const connectorOAuthBase = (publicUrl || `http://localhost:${port}`).replace(/\/+$/, '');
+  const CONNECTOR_STATE_TTL_MS = 10 * 60 * 1000;
+  const connectorOAuthStates = new Map<string, ConnectorOAuthState>();
+
+  function connectorRedirectUri(provider: string): string {
+    return `${connectorOAuthBase}/admin/api/connectors/${encodeURIComponent(provider)}/callback`;
+  }
+  function sweepConnectorStates(): void {
+    const now = Date.now();
+    for (const [k, v] of connectorOAuthStates) if (v.expiresAt <= now) connectorOAuthStates.delete(k);
+  }
+
+  // POST /admin/api/connectors/:provider/connect — begin the grant.
+  // Body: { sourceId }. Returns { authorizeUrl } the operator opens in a browser.
+  app.post('/admin/api/connectors/:provider/connect', requireAdmin, express.json(), (req: Request, res: Response) => {
+    const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+    const cfg = getOAuthProvider(provider);
+    if (!cfg) {
+      res.status(404).json({ error: 'unknown_provider', provider });
+      return;
+    }
+    const sourceId = (req.body as Record<string, unknown>)?.sourceId;
+    if (!sourceId || typeof sourceId !== 'string') {
+      res.status(400).json({ error: 'sourceId required' });
+      return;
+    }
+    sweepConnectorStates();
+    const state = randomBytes(32).toString('hex');
+    connectorOAuthStates.set(state, { sourceId, provider, expiresAt: Date.now() + CONNECTOR_STATE_TTL_MS });
+    const redirectUri = connectorRedirectUri(provider);
+    let authorizeUrl: string;
+    try {
+      authorizeUrl = cfg.authorizeUrl(state, redirectUri);
+    } catch (e) {
+      connectorOAuthStates.delete(state);
+      res.status(500).json({ error: 'authorize_url_failed', message: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+    res.json({ authorizeUrl, redirectUri, state, expiresIn: CONNECTOR_STATE_TTL_MS / 1000 });
+  });
+
+  // GET /admin/api/connectors/:provider/callback — provider redirect target.
+  // Query: { code, state }. Exchanges the code, encrypts + persists the grant.
+  app.get('/admin/api/connectors/:provider/callback', async (req: Request, res: Response) => {
+    const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+    const cfg = getOAuthProvider(provider);
+    if (!cfg) {
+      res.status(404).json({ error: 'unknown_provider', provider });
+      return;
+    }
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    if (!code || !state) {
+      res.status(400).json({ error: 'missing_code_or_state' });
+      return;
+    }
+    sweepConnectorStates();
+    // Constant-time lookup: find the matching minted state (and confirm provider).
+    // Pure helper so the forged/expired/wrong-provider rejection is unit-tested.
+    const matched = resolveConnectorCallbackState(
+      connectorOAuthStates, provider, state, Date.now(), safeStateEqual,
+    );
+    if (!matched.ok) {
+      res.status(400).json({ error: matched.reason });
+      return;
+    }
+    connectorOAuthStates.delete(matched.key); // single-use
+    try {
+      const token = await cfg.exchangeCode(code, connectorRedirectUri(provider));
+      await storeToken(engine, matched.sourceId, provider, token);
+      res.json({ status: 'connected', source_id: matched.sourceId, provider, account: token.account });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('connector oauth callback: exchange/store error:', msg);
+      res.status(502).json({ error: 'code_exchange_failed', message: msg });
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Start server
