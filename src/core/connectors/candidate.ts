@@ -127,9 +127,9 @@ function buildCandidateRow(
   return {
     source_id: item.source_id,
     source_record_id: item.source_record_id,
-    version: item.version ?? '1',
+    version: strip(item.version ?? '1'),
     source_record_ids: item.source_record_ids ? [...item.source_record_ids] : [],
-    provider: item.provider ?? null,
+    provider: item.provider != null ? strip(item.provider) : null,
     proposed_slug: item.proposed_slug != null ? strip(item.proposed_slug) : null,
     proposed_markdown: strip(proposedMarkdown),
     confidence: item.confidence ?? null,

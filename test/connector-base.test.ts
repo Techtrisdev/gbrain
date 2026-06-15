@@ -229,30 +229,35 @@ const slugLeakConnector: SaaSConnector = {
   toCandidate: (record, sourceId) => ({
     source_id: sourceId,
     source_record_id: record.sourceRecordId,
-    provider: 'slug-leak',
-    // Raw secrets in slug + rationale_ref; NO proposed_markdown, forcing toRow's
-    // stub generator (which embeds proposed_slug into the body) — the field that
-    // bypassed landRecords' only strip in the pre-fix code.
+    // Raw secrets in EVERY connector-controlled output field, and NO proposed_markdown
+    // (forcing toRow's stub generator, which embeds proposed_slug/provider/version into
+    // the body) — exercising both the page-body path and the standalone columns.
+    provider: `slug-leak-${SECRET_MARKER}`,
+    version: `v-${SECRET_MARKER}`,
     proposed_slug: `leak-${SECRET_MARKER}`,
     rationale_ref: `https://x.test/?token=${SECRET_MARKER}`,
   }),
 };
 
 describe('toRow write boundary — every output field is redacted, incl. the generated stub', () => {
-  test('strips proposed_slug, rationale_ref, and the stub-generated proposed_markdown', async () => {
+  test('strips proposed_slug, rationale_ref, provider, version, and the stub-generated proposed_markdown', async () => {
     const { engine, calls } = makeFakeEngine();
     await landRecords(engine, 'src-1', slugLeakConnector, slugLeakConnector.normalize(null));
 
     const insert = calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql));
     expect(insert).toBeDefined();
     const p = insert!.params;
+    const version = p[2] as string; // $3
+    const provider = p[4] as string; // $5
     const proposedSlug = p[5] as string; // $6
     const proposedMarkdown = p[6] as string; // $7 — stub-generated (connector gave none), then stripped
     const rationaleRef = p[11] as string; // $12
 
     expect(proposedSlug).not.toContain(SECRET_MARKER);
     expect(rationaleRef).not.toContain(SECRET_MARKER);
-    // The stub embeds proposed_slug into the body — must be stripped at the boundary.
+    expect(provider).not.toContain(SECRET_MARKER);
+    expect(version).not.toContain(SECRET_MARKER);
+    // The stub embeds proposed_slug/provider/version into the body — must be stripped.
     expect(proposedMarkdown).not.toContain(SECRET_MARKER);
     // Nothing anywhere in the INSERT carries the raw secret.
     expect(JSON.stringify(p)).not.toContain(SECRET_MARKER);
