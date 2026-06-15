@@ -8,7 +8,7 @@
  *   1. an issue update webhook → a high-confidence metadata candidate.
  *   2. an ETag 304 Not Modified on backfill → no-op (no candidate).
  *   3. a bad signature → reject (verifyWebhook false).
- *   4. a duplicate X-GitHub-Delivery → dedupe (no second candidate).
+ *   4. a replayed delivery (same issue/PR id) → dedupe via the candidate ON CONFLICT.
  *   5. a secret in an issue body → never reaches a candidate row.
  *
  * Plus: the DISTINCT provider key (`github_kb`, so the inbound route is /webhooks/github_kb
@@ -34,7 +34,7 @@ const {
   readBackfillEtag,
   signGitHubWebhook,
   mintAppJwt,
-  markDelivery,
+  readRepoFullName,
 } = await import('../src/core/connectors/github.ts');
 const { landRecords } = await import('../src/core/connectors/base.ts');
 
@@ -388,37 +388,22 @@ describe('GitHub_kb verifyWebhook (AC3: sha256= HMAC, constant-time)', () => {
   });
 });
 
-// ── 4. a duplicate X-GitHub-Delivery → dedupe ──────────────────────────────────────
+// ── 4. a replayed delivery → dedupe via the candidate ON CONFLICT ──────────────────
 
-describe('GitHub_kb delivery idempotency (AC3: duplicate X-GitHub-Delivery)', () => {
-  test('markDelivery returns false the first time, true on a replay (bounded LRU)', () => {
-    const id = `delivery-${Math.random()}`;
-    expect(markDelivery(id)).toBe(false); // first sight
-    expect(markDelivery(id)).toBe(true); // replay
-    expect(markDelivery(id)).toBe(true); // still a replay
-  });
-
-  test('a replayed delivery id stamped on the payload yields NO record (fast-path dedupe)', async () => {
+describe('GitHub_kb delivery idempotency (AC3: replay → ON CONFLICT no-op)', () => {
+  test('a re-land of the SAME record is a no-op (source_id, source_record_id, version collide)', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const deliveryId = `dup-delivery-${Math.random()}`;
-    // First delivery: lands one candidate.
-    const first = githubConnector.normalize({ ...issueEdited, __deliveryId: deliveryId }, SRC);
-    expect(first).toHaveLength(1);
-    await landRecords(engine, 'src-gh', githubConnector, first);
-    expect(inserts).toHaveLength(1);
-
-    // Exact redelivery (same delivery id) short-circuits in normalize → no record built.
-    const replay = githubConnector.normalize({ ...issueEdited, __deliveryId: deliveryId }, SRC);
-    expect(replay).toHaveLength(0);
-  });
-
-  test('even without delivery tracking, a re-land of the SAME record is a no-op (ON CONFLICT)', async () => {
-    const { engine, inserts } = makeFakeEngine();
+    // A replayed GitHub delivery carries the same issue/PR id → the same source_record_id, so
+    // the second land collides on the candidate UNIQUE and writes nothing. This is the durable,
+    // content-keyed idempotency guarantee — there is no in-body delivery-id LRU (the generic
+    // receiver hands normalize the parsed JSON body, not the X-GitHub-Delivery HTTP header, so
+    // an in-body check would be inert).
     const records = githubConnector.normalize(issueEdited, SRC);
     await landRecords(engine, 'src-gh', githubConnector, records);
     const firstCount = inserts.length;
+    expect(firstCount).toBe(1);
     const second = await landRecords(engine, 'src-gh', githubConnector, records);
-    expect(second.written).toBe(0); // (source, source_record_id, version) collides
+    expect(second.written).toBe(0);
     expect(inserts.length).toBe(firstCount);
   });
 });
@@ -502,8 +487,40 @@ describe('GitHub App auth (AC2: RS256 JWT → installation token, NOT user OAuth
     expect(() => mintAppJwt('-----BEGIN RSA PRIVATE KEY-----\nx\n-----END RSA PRIVATE KEY-----', APP_ID)).toThrow(/PKCS#8/);
   });
 
+  test('mintAppJwt leaves a clock-skew margin: exp is not pinned to the 600s ceiling (F2)', () => {
+    const before = Math.floor(Date.now() / 1000);
+    const jwt = mintAppJwt(APP_PRIVATE_KEY_PEM, APP_ID);
+    const after = Math.floor(Date.now() / 1000);
+    const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'));
+    // exp must clear a margin under GitHub's 600s ceiling so a host clock a few seconds ahead
+    // of GitHub's (or in-flight latency) cannot push the observed exp past the ceiling → 401.
+    expect(payload.exp - before).toBeLessThanOrEqual(600);
+    expect(payload.exp - after).toBeLessThanOrEqual(540);
+    expect(payload.iat).toBeLessThanOrEqual(before);
+    expect(payload.exp).toBeGreaterThan(payload.iat);
+  });
+
   test('the connector does NOT register an OAuth provider (App auth is not user OAuth)', async () => {
     const { getOAuthProvider } = await import('../src/core/connectors/credentials.ts');
     expect(getOAuthProvider('github_kb')).toBeUndefined();
+  });
+});
+
+// ── F4: repo full_name validated before it reaches the issues-list URL path ─────────
+
+describe('GitHub_kb config validation (F4: repo owner/name shape)', () => {
+  test('readRepoFullName accepts a valid owner/name', () => {
+    const src: ConnectorSource = { id: 's', config: { connectors: { github_kb: { repo: 'acme/widgets' } } } };
+    expect(readRepoFullName(src)).toBe('acme/widgets');
+  });
+
+  test('readRepoFullName throws on a malformed repo (path-injection-shaped value)', () => {
+    const src: ConnectorSource = { id: 's', config: { connectors: { github_kb: { repo: '../../etc?x=1' } } } };
+    expect(() => readRepoFullName(src)).toThrow(/owner\/name/);
+  });
+
+  test('readRepoFullName returns null when neither repo nor account is set', () => {
+    const src: ConnectorSource = { id: 's', config: { connectors: { github_kb: {} } } };
+    expect(readRepoFullName(src)).toBeNull();
   });
 });

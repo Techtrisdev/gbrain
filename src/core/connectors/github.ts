@@ -40,10 +40,11 @@
  * `X-Hub-Signature-256` = `sha256=` + HMAC-SHA256(secret, rawBody). verifyWebhook strips
  * the `sha256=` prefix and constant-time-compares via hmacSha256Verify (the same prefix
  * discipline the git-sync route uses — Buffer.from('sha256=...', 'hex') would silently
- * truncate at the 's'). PLUS an `X-GitHub-Delivery` idempotency layer: the candidate
- * source_record_id + ON CONFLICT already dedupes a replayed event's CONTENT, but a recent
- * delivery-id set additionally short-circuits a literal redelivery of the same delivery id
- * (a bounded in-process LRU; single-instance, see the note on the set).
+ * truncate at the 's'). Idempotency rests on the candidate (source_id, source_record_id,
+ * version) ON CONFLICT: a replayed delivery carries the same issue/PR id → the same
+ * source_record_id → a no-op insert. (No delivery-id LRU: the generic receiver hands
+ * normalize the parsed JSON body, not the X-GitHub-Delivery HTTP header, so any in-body
+ * delivery-id check would be inert — the content-keyed ON CONFLICT is the real guarantee.)
  *
  * ── Backfill (AC4) ──────────────────────────────────────────────────────────────────
  *
@@ -115,7 +116,6 @@ export interface GitHubWebhookPayload {
 
 const PROVIDER = 'github_kb';
 const SIGNATURE_HEADER = 'x-hub-signature-256'; // lowercase — Node lowercases header keys
-const DELIVERY_HEADER = 'x-github-delivery';
 /** GitHub's signature scheme prefix on X-Hub-Signature-256. */
 const SIGNATURE_PREFIX = 'sha256=';
 /** `code` source class — drops bodies, allowlists repo/number/author/state/url/labels. */
@@ -141,31 +141,6 @@ const USER_AGENT = 'gbrain-github-kb-connector';
 /** App-auth env. The private key is PKCS#8 PEM; the App id is numeric. */
 const APP_PRIVATE_KEY_ENV = 'GBRAIN_GITHUB_APP_PRIVATE_KEY';
 const APP_ID_ENV = 'GBRAIN_GITHUB_APP_ID';
-
-/**
- * Bounded recent-delivery LRU for X-GitHub-Delivery replay short-circuit. SINGLE-INSTANCE
- * (in-process) — gbrain runs single-instance today; a multi-instance deployment would rely
- * on the candidate ON CONFLICT (content-keyed) as the durable dedupe, with this set as a
- * per-instance fast path. Bounded so an attacker replaying distinct ids can't grow it
- * without limit.
- */
-const RECENT_DELIVERY_LIMIT = 2048;
-const recentDeliveries = new Set<string>();
-
-/**
- * Record a delivery id; return true if it was ALREADY seen (a replay). Evicts the oldest
- * entry when the bound is exceeded (Set preserves insertion order, so the first key is the
- * oldest). Exported for tests.
- */
-export function markDelivery(deliveryId: string): boolean {
-  if (recentDeliveries.has(deliveryId)) return true;
-  recentDeliveries.add(deliveryId);
-  if (recentDeliveries.size > RECENT_DELIVERY_LIMIT) {
-    const oldest = recentDeliveries.values().next().value as string | undefined;
-    if (oldest !== undefined) recentDeliveries.delete(oldest);
-  }
-  return false;
-}
 
 // ── Helpers: payload field access (defensive against unknown) ────────────────────
 
@@ -198,10 +173,13 @@ function base64url(input: Buffer | string): string {
 }
 
 /**
- * Mint a short-lived (10 min) RS256 App JWT signed with the App private key (PKCS#8 PEM).
+ * Mint a short-lived (9 min) RS256 App JWT signed with the App private key (PKCS#8 PEM).
  * `iss` is the App id; `iat` is backdated 60s for clock-skew tolerance (GitHub's
- * recommendation). Pure crypto, no network. Throws loud on a missing/invalid key so a
- * misconfig surfaces rather than silently producing an unsigned token.
+ * recommendation). `exp` is `now + 540` — a 60s haircut off GitHub's 10-minute ceiling so a
+ * host clock running a few seconds ahead of GitHub's (normal NTP drift) or in-flight latency
+ * can't push the observed exp past the ceiling and earn an intermittent 401 on token mint.
+ * Pure crypto, no network. Throws loud on a missing/invalid key so a misconfig surfaces
+ * rather than silently producing an unsigned token.
  */
 export function mintAppJwt(privateKeyPem: string, appId: string): string {
   if (privateKeyPem.includes('BEGIN RSA PRIVATE KEY')) {
@@ -212,7 +190,10 @@ export function mintAppJwt(privateKeyPem: string, appId: string): string {
   }
   const now = Math.floor(Date.now() / 1000);
   const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const payload = base64url(JSON.stringify({ iat: now - 60, exp: now + 600, iss: appId }));
+  // exp = now + 540 (9 min), NOT now + 600: GitHub rejects an App JWT whose exp is > 600s
+  // ahead of ITS clock, so pinning the ceiling means a host clock a few seconds fast (or
+  // in-flight + validation latency) intermittently 401s. The 60s margin absorbs that.
+  const payload = base64url(JSON.stringify({ iat: now - 60, exp: now + 540, iss: appId }));
   const signingInput = `${header}.${payload}`;
   const signature = createSign('RSA-SHA256').update(signingInput).sign(privateKeyPem);
   return `${signingInput}.${base64url(signature)}`;
@@ -369,10 +350,9 @@ export const githubConnector: SaaSConnector = {
    * hmacSha256Verify (the framework primitive). Fail-closed on a missing header or a
    * missing/wrong prefix.
    *
-   * The X-GitHub-Delivery replay short-circuit is NOT here (verifyWebhook is pure over
-   * rawBody + headers + secret and is reused by tests without side effects). The receiver
-   * calls normalize after a successful verify; the delivery dedupe rides in normalize's
-   * idempotency layer + the candidate ON CONFLICT.
+   * Idempotency is NOT here (verifyWebhook is pure over rawBody + headers + secret). The
+   * receiver calls normalize after a successful verify; a replayed delivery dedupes at the
+   * candidate (source_id, source_record_id, version) ON CONFLICT write boundary.
    */
   verifyWebhook(rawBody, headers, secret): boolean {
     const signature = headers[SIGNATURE_HEADER];
@@ -397,23 +377,17 @@ export const githubConnector: SaaSConnector = {
 
   /**
    * AC4: an issues/pull_request webhook (open / edit / close / label / field change) → a
-   * single high-confidence metadata candidate (NO raw body). The delivery-id replay
-   * short-circuit (`X-GitHub-Delivery`) drops a literal redelivery before any record is
-   * built (the candidate ON CONFLICT is the durable backstop; this is the fast path). Other
-   * event shapes (ping, push, etc.) carry no issue/PR object → return [] (the receiver
-   * 202-acks an empty land).
+   * single high-confidence metadata candidate (NO raw body). A replayed delivery is a safe
+   * no-op: the same issue/PR id yields the same source_record_id, so the candidate
+   * (source_id, source_record_id, version) ON CONFLICT drops the duplicate at the write
+   * boundary. Other event shapes (ping, push, etc.) carry no issue/PR object → return []
+   * (the receiver 202-acks an empty land).
    *
    * `_source` is accepted (interface contract) but ignored — GitHub_kb ingests every
    * issue/PR on the connected repo (no per-source allowlist beyond the source mapping).
    */
   normalize(payload, _source): NormalizedRecord[] {
-    const p = (asRecord(payload) ?? {}) as GitHubWebhookPayload & { __deliveryId?: string };
-
-    // X-GitHub-Delivery replay short-circuit. The receiver does not pass headers into
-    // normalize, so the delivery id (when present) rides on a non-enumerable-ish private
-    // field the receiver can stamp; absent that, dedupe rests on the candidate ON CONFLICT.
-    const deliveryId = str(p.__deliveryId);
-    if (deliveryId && markDelivery(deliveryId)) return [];
+    const p = (asRecord(payload) ?? {}) as GitHubWebhookPayload;
 
     // The webhook routing key determines the kind directly: an `issues` event carries
     // `issue`; a `pull_request` event carries `pull_request`. (A PR webhook object does NOT
@@ -482,8 +456,14 @@ export const githubConnector: SaaSConnector = {
       // `pull_request` marker, so kind is inferred from the row here (no routing key).
       const record = recordForItem(item, kindFromIssuesRow(item));
       if (record) records.push(record);
+      // Only advance the watermark on a PARSEABLE RFC3339 updated_at: an empty/garbage value
+      // that sorts lexically highest would otherwise become the next `since` cursor and earn a
+      // 422 that wedges this source's backfill. A row with an unparseable timestamp still lands
+      // as a candidate (above) — it just doesn't move the cursor.
       const u = str(item.updated_at);
-      if (u && (!newestUpdatedAt || u > newestUpdatedAt)) newestUpdatedAt = u;
+      if (u && Number.isFinite(Date.parse(u)) && (!newestUpdatedAt || u > newestUpdatedAt)) {
+        newestUpdatedAt = u;
+      }
     }
     const result = await landRecords(_engine, source.id, this, records);
 
@@ -524,10 +504,23 @@ export function readInstallationId(source: ConnectorSource): string | null {
   return null;
 }
 
-/** The repo to back-fill, as "owner/name" (config.connectors.github_kb.repo or .account). */
+/** Valid GitHub "owner/name" shape — alphanumerics plus . _ - in each of the two segments. */
+const REPO_FULL_NAME_RE = /^[\w.-]+\/[\w.-]+$/;
+
+/** The repo to back-fill, as "owner/name" (config.connectors.github_kb.repo or .account).
+ *  Validated against the owner/name shape: the value is interpolated into the issues-list URL
+ *  path, so a config typo carrying `?`, `#`, or `../` would mangle the request (or traverse
+ *  the API path) rather than fail cleanly. An operator misconfig throws loud here. */
 export function readRepoFullName(source: ConnectorSource): string | null {
   const cfg = githubConfig(source);
-  return str(cfg?.repo) ?? str(cfg?.account) ?? null;
+  const repo = str(cfg?.repo) ?? str(cfg?.account) ?? null;
+  if (repo !== null && !REPO_FULL_NAME_RE.test(repo)) {
+    throw new Error(
+      `github_kb: repo '${repo}' is not a valid "owner/name" for source '${source.id}' ` +
+        `(config.connectors.github_kb.repo/account)`,
+    );
+  }
+  return repo;
 }
 
 /** Read the persisted `updated_at` watermark, or null on first run. */
@@ -588,8 +581,8 @@ interface GitHubIssuesPage {
  * Modified` returns `{ items: [], notModified: true }` (no candidate landed). Pure HTTP via
  * fetch (mockable in tests).
  *
- * NOTE: `repo` is "owner/name"; both segments are URL-path components already validated by
- * being a config-supplied full_name, so they are interpolated directly (a single path).
+ * NOTE: `repo` is "owner/name", validated against REPO_FULL_NAME_RE at read time
+ * (readRepoFullName), so its two path segments are safe to interpolate directly.
  */
 export async function fetchIssuesPage(
   token: string,
