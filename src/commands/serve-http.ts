@@ -44,6 +44,7 @@ import {
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
+import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -2065,6 +2066,101 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
     },
   );
+
+  // ---------------------------------------------------------------------------
+  // /admin/api/connectors/:provider/connect + /callback — outbound OAuth (TECH-2033)
+  // ---------------------------------------------------------------------------
+  // The custody layer (src/core/connectors/credentials.ts) owns encryption,
+  // refresh-rotation, and the connector_tokens store. These two routes only
+  // drive a registered provider's OAuth dance and hand the resulting grant to
+  // storeToken — provider specifics (authorizeUrl/exchangeCode/refresh) live in
+  // the connector module, not here. An unregistered provider → 404.
+  //
+  // CSRF: /connect mints an opaque `state` bound to (source, provider) in a
+  // short-lived in-memory map; /callback rejects any state it didn't mint
+  // (constant-time compare) and consumes it single-use. The connect route is
+  // admin-gated (it provisions a credential for a source); the callback is the
+  // provider's redirect target and is gated by the unguessable state instead.
+  const connectorOAuthBase = (publicUrl || `http://localhost:${port}`).replace(/\/+$/, '');
+  const CONNECTOR_STATE_TTL_MS = 10 * 60 * 1000;
+  const connectorOAuthStates = new Map<string, { sourceId: string; provider: string; expiresAt: number }>();
+
+  function connectorRedirectUri(provider: string): string {
+    return `${connectorOAuthBase}/admin/api/connectors/${encodeURIComponent(provider)}/callback`;
+  }
+  function sweepConnectorStates(): void {
+    const now = Date.now();
+    for (const [k, v] of connectorOAuthStates) if (v.expiresAt <= now) connectorOAuthStates.delete(k);
+  }
+
+  // POST /admin/api/connectors/:provider/connect — begin the grant.
+  // Body: { sourceId }. Returns { authorizeUrl } the operator opens in a browser.
+  app.post('/admin/api/connectors/:provider/connect', requireAdmin, express.json(), (req: Request, res: Response) => {
+    const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+    const cfg = getOAuthProvider(provider);
+    if (!cfg) {
+      res.status(404).json({ error: 'unknown_provider', provider });
+      return;
+    }
+    const sourceId = (req.body as Record<string, unknown>)?.sourceId;
+    if (!sourceId || typeof sourceId !== 'string') {
+      res.status(400).json({ error: 'sourceId required' });
+      return;
+    }
+    sweepConnectorStates();
+    const state = randomBytes(32).toString('hex');
+    connectorOAuthStates.set(state, { sourceId, provider, expiresAt: Date.now() + CONNECTOR_STATE_TTL_MS });
+    const redirectUri = connectorRedirectUri(provider);
+    let authorizeUrl: string;
+    try {
+      authorizeUrl = cfg.authorizeUrl(state, redirectUri);
+    } catch (e) {
+      connectorOAuthStates.delete(state);
+      res.status(500).json({ error: 'authorize_url_failed', message: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+    res.json({ authorizeUrl, redirectUri, state, expiresIn: CONNECTOR_STATE_TTL_MS / 1000 });
+  });
+
+  // GET /admin/api/connectors/:provider/callback — provider redirect target.
+  // Query: { code, state }. Exchanges the code, encrypts + persists the grant.
+  app.get('/admin/api/connectors/:provider/callback', async (req: Request, res: Response) => {
+    const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+    const cfg = getOAuthProvider(provider);
+    if (!cfg) {
+      res.status(404).json({ error: 'unknown_provider', provider });
+      return;
+    }
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    if (!code || !state) {
+      res.status(400).json({ error: 'missing_code_or_state' });
+      return;
+    }
+    sweepConnectorStates();
+    // Constant-time lookup: find the matching minted state (and confirm provider).
+    let matched: { key: string; sourceId: string } | null = null;
+    for (const [k, v] of connectorOAuthStates) {
+      if (v.provider === provider && safeStateEqual(k, state)) {
+        matched = { key: k, sourceId: v.sourceId };
+        break;
+      }
+    }
+    if (!matched) {
+      res.status(400).json({ error: 'invalid_state' });
+      return;
+    }
+    connectorOAuthStates.delete(matched.key); // single-use
+    try {
+      const token = await cfg.exchangeCode(code, connectorRedirectUri(provider));
+      await storeToken(engine, matched.sourceId, provider, token);
+      res.json({ status: 'connected', source_id: matched.sourceId, provider, account: token.account });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('connector oauth callback: exchange/store error:', msg);
+      res.status(502).json({ error: 'code_exchange_failed', message: msg });
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Start server

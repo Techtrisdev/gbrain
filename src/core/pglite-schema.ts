@@ -795,6 +795,33 @@ CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
   ON connector_candidates (source_id, status, proposed_at DESC);
 
 -- ============================================================
+-- connector_tokens (TECH-2033): encrypted outbound-OAuth credential custody.
+-- PGLite parity with src/schema.sql. No RLS block (PGLite has no role system).
+-- See schema.sql for design rationale. Neon stores ciphertext only; the AES
+-- master key (GBRAIN_CONNECTOR_MASTER_KEY) never touches the DB.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS connector_tokens (
+  id            BIGSERIAL     PRIMARY KEY,
+  source_id     TEXT          NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  provider      TEXT          NOT NULL,
+  account       TEXT          NOT NULL,
+  kid           TEXT          NOT NULL,
+  iv            TEXT          NOT NULL,
+  ciphertext    TEXT          NOT NULL,
+  tag           TEXT          NOT NULL,
+  expires_at    TIMESTAMPTZ,
+  status        TEXT          NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active','needs_reauth','revoked')),
+  created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  CONSTRAINT connector_tokens_source_provider_account_unique
+    UNIQUE (source_id, provider, account)
+);
+
+CREATE INDEX IF NOT EXISTS connector_tokens_source_provider_idx
+  ON connector_tokens (source_id, provider);
+
+-- ============================================================
 -- access_tokens: legacy bearer tokens for remote MCP access
 -- ============================================================
 CREATE TABLE IF NOT EXISTS access_tokens (

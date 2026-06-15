@@ -4299,6 +4299,45 @@ export const MIGRATIONS: Migration[] = [
         ON connector_candidates (source_id, status, proposed_at DESC);
     `,
   },
+  {
+    version: 94,
+    name: 'connector_tokens_table',
+    // TECH-2033: encrypted outbound-OAuth credential custody store.
+    // Per-(source, provider, account) row holds an AES-256-GCM envelope
+    // ({kid, iv, ciphertext, tag}) sealed by a MASTER KEY from env
+    // (GBRAIN_CONNECTOR_MASTER_KEY) that NEVER touches the DB. Neon stores
+    // ciphertext only — no plaintext token in any column. status='needs_reauth'
+    // is the fail-closed terminal state on decrypt failure / refresh-reuse.
+    //
+    // RLS is NOT included here — Postgres RLS is auto-enabled by the v35 event
+    // trigger (fires on CREATE TABLE); PGLite has no RLS engine. Mirrors the
+    // v93 connector_candidates precedent.
+    //
+    // idempotent: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS connector_tokens (
+        id            BIGSERIAL     PRIMARY KEY,
+        source_id     TEXT          NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        provider      TEXT          NOT NULL,
+        account       TEXT          NOT NULL,
+        kid           TEXT          NOT NULL,
+        iv            TEXT          NOT NULL,
+        ciphertext    TEXT          NOT NULL,
+        tag           TEXT          NOT NULL,
+        expires_at    TIMESTAMPTZ,
+        status        TEXT          NOT NULL DEFAULT 'active'
+                                    CHECK (status IN ('active','needs_reauth','revoked')),
+        created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+        updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
+        CONSTRAINT connector_tokens_source_provider_account_unique
+          UNIQUE (source_id, provider, account)
+      );
+
+      CREATE INDEX IF NOT EXISTS connector_tokens_source_provider_idx
+        ON connector_tokens (source_id, provider);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
