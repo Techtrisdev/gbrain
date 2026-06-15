@@ -463,7 +463,10 @@ export const calendarConnector: SaaSConnector = {
  * (Single-instance assumption — see the withInProcessLock note in credentials.ts.)
  */
 export async function incrementalSync(engine: BrainEngine, source: ConnectorSource): Promise<number> {
-  return withInProcessLock(source.id, PROVIDER, () => incrementalSyncLocked(engine, source));
+  // Use a DISTINCT lock key from getValidAccessToken's (source.id, PROVIDER): incrementalSyncLocked
+  // calls getValidAccessToken, which takes the (source.id, PROVIDER) lock — sharing it here would
+  // re-enter and DEADLOCK. The `:sync` suffix serializes concurrent syncs without colliding.
+  return withInProcessLock(source.id, `${PROVIDER}:sync`, () => incrementalSyncLocked(engine, source));
 }
 
 /** The read-list-write body, run under the single-flight mutex by incrementalSync. */
