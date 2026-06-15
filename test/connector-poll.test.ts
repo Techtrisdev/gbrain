@@ -20,6 +20,8 @@ import {
   connectorAutomationDisabled,
   computeTombstoneCandidates,
   runConnectorPoll,
+  connectorPollBreakerTripped,
+  CONNECTOR_POLL_BREAKER_THRESHOLD,
   readConnectorsConfig,
   parseSourceConfigObject,
   TOMBSTONE_VERSION_SUFFIX,
@@ -157,15 +159,20 @@ describe('kill-switch — AC4: disables ALL connector automation', () => {
 /** A fake engine: routes the source-row SELECT, the known-record-ids SELECT, and
  *  the connector_candidates INSERT/SELECT through canned returns; records calls. */
 function makeFakeEngine(opts: {
-  sourceRow?: { id: string; config: Record<string, unknown> | string } | null;
+  sourceRow?: { id: string; config: Record<string, unknown> | string; archived?: boolean } | null;
   knownRecordIds?: string[];
   conflict?: boolean;
+  /** Status history (most-recent first) the breaker query returns. */
+  breakerHistory?: string[];
 }) {
   const calls: { sql: string; params: unknown[] }[] = [];
   const engine = {
     kind: 'postgres' as const,
     executeRaw: async (sql: string, params?: unknown[]) => {
       calls.push({ sql, params: params ?? [] });
+      if (/FROM minion_jobs/.test(sql)) {
+        return (opts.breakerHistory ?? []).map((status) => ({ status }));
+      }
       if (/FROM sources WHERE id/.test(sql)) {
         return opts.sourceRow === null ? [] : [opts.sourceRow ?? { id: 's1', config: {} }];
       }
@@ -207,7 +214,7 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     const { engine } = makeFakeEngine({
       sourceRow: { id: 's1', config: withConnector('poll-probe-a', true) },
     });
-    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-probe-a' });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-probe-a' }, NO_ENV);
     expect(result.landed).toBe(7);
     expect(result.tombstoned).toBe(0);
     expect(result.skippedReason).toBeUndefined();
@@ -221,7 +228,7 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     const { engine } = makeFakeEngine({
       sourceRow: { id: 's1', config: withConnector('poll-probe-b', false) },
     });
-    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-probe-b' });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-probe-b' }, NO_ENV);
     expect(result.skippedReason).toBe('connector_not_enabled');
     expect(result.landed).toBe(0);
     expect(backfillCalls).toHaveLength(0);
@@ -230,7 +237,7 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
   test('a missing source short-circuits before touching the connector', async () => {
     const { backfillCalls } = makeStubConnector('poll-probe-c', 1);
     const { engine } = makeFakeEngine({ sourceRow: null });
-    const result = await runConnectorPoll(engine, { sourceId: 'gone', provider: 'poll-probe-c' });
+    const result = await runConnectorPoll(engine, { sourceId: 'gone', provider: 'poll-probe-c' }, NO_ENV);
     expect(result.skippedReason).toBe('source_not_found');
     expect(backfillCalls).toHaveLength(0);
   });
@@ -239,8 +246,50 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     const { engine } = makeFakeEngine({
       sourceRow: { id: 's1', config: withConnector('no-such-provider-xyz', true) },
     });
-    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'no-such-provider-xyz' });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'no-such-provider-xyz' }, NO_ENV);
     expect(result.skippedReason).toBe('connector_not_registered');
+  });
+
+  // ── Fix #1 (kill-switch gates RUN time) ──────────────────────────────────────
+  test('REVIEW#1: kill-switch (env) at RUN time skips before backfill', async () => {
+    const { backfillCalls } = makeStubConnector('poll-killsw-a', 9);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-killsw-a', true) },
+    });
+    // Connector is ENABLED, but the kill-switch is tripped in the injected env.
+    const result = await runConnectorPoll(
+      engine,
+      { sourceId: 's1', provider: 'poll-killsw-a' },
+      { GBRAIN_CONNECTORS_KILLSWITCH: '1' },
+    );
+    expect(result.skippedReason).toBe('killswitch_tripped');
+    expect(result.landed).toBe(0);
+    // The whole point: NO outbound backfill fired for an in-flight job.
+    expect(backfillCalls).toHaveLength(0);
+  });
+
+  test('REVIEW#1: kill-switch (per-source config flag) at RUN time skips before backfill', async () => {
+    const { backfillCalls } = makeStubConnector('poll-killsw-b', 4);
+    const { engine } = makeFakeEngine({
+      sourceRow: {
+        id: 's1',
+        config: { ...withConnector('poll-killsw-b', true), connectors_killswitch: true },
+      },
+    });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-killsw-b' }, NO_ENV);
+    expect(result.skippedReason).toBe('killswitch_tripped');
+    expect(backfillCalls).toHaveLength(0);
+  });
+
+  // ── Fix #5 (run-time archived re-check) ──────────────────────────────────────
+  test('REVIEW#5: an archived source skips at RUN time before backfill', async () => {
+    const { backfillCalls } = makeStubConnector('poll-arch-a', 6);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-arch-a', true), archived: true },
+    });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-arch-a' }, NO_ENV);
+    expect(result.skippedReason).toBe('source_archived');
+    expect(backfillCalls).toHaveLength(0);
   });
 });
 
@@ -306,7 +355,7 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
       sourceId: 's1',
       provider: 'poll-recon-a',
       seenRecordIds: ['rec-1'], // rec-2 vanished
-    });
+    }, NO_ENV);
     expect(result.tombstoned).toBe(1);
 
     // A tombstone INSERT into connector_candidates was issued for rec-2.
@@ -331,7 +380,7 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
       sourceId: 's1',
       provider: 'poll-recon-b',
       seenRecordIds: ['rec-1'],
-    });
+    }, NO_ENV);
     expect(result.tombstoned).toBe(0); // ON CONFLICT DO NOTHING → no new write
   });
 
@@ -341,12 +390,47 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
       sourceRow: { id: 's1', config: withConnector('poll-recon-c', true) },
       knownRecordIds: ['rec-1', 'rec-2'],
     });
-    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-recon-c' });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-recon-c' }, NO_ENV);
     expect(result.landed).toBe(3);
     expect(result.tombstoned).toBe(0);
     // The known-record-ids reconciliation query is NOT issued.
     const reconQuery = calls.find((c) => /DISTINCT source_record_id/.test(c.sql));
     expect(reconQuery).toBeUndefined();
+  });
+
+  // ── Fix #3 (empty seen set must NOT mass-tombstone) ──────────────────────────
+  test('REVIEW#3: seenRecordIds:[] with a non-empty known set tombstones NOTHING', async () => {
+    makeStubConnector('poll-recon-empty', 0);
+    const { engine, calls } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-recon-empty', true) },
+      knownRecordIds: ['rec-1', 'rec-2', 'rec-3'], // would ALL be tombstoned if [] were honored
+    });
+    const result = await runConnectorPoll(engine, {
+      sourceId: 's1',
+      provider: 'poll-recon-empty',
+      seenRecordIds: [], // transient zero-record poll — must be treated as "no signal"
+    }, NO_ENV);
+    expect(result.tombstoned).toBe(0);
+    // Reconciliation is skipped entirely: no known-id query, no INSERT.
+    expect(calls.find((c) => /DISTINCT source_record_id/.test(c.sql))).toBeUndefined();
+    expect(calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql))).toBeUndefined();
+  });
+
+  test('REVIEW#3: confirmedEmpty:true is the EXPLICIT signal that DOES tombstone all known', async () => {
+    makeStubConnector('poll-recon-confirmed', 0);
+    const { engine, calls } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-recon-confirmed', true) },
+      knownRecordIds: ['rec-1', 'rec-2'],
+    });
+    const result = await runConnectorPoll(engine, {
+      sourceId: 's1',
+      provider: 'poll-recon-confirmed',
+      confirmedEmpty: true, // connector authoritatively saw zero current records
+    }, NO_ENV);
+    expect(result.tombstoned).toBe(2);
+    // Still tombstones via INSERT, never a delete.
+    expect(calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql))).toBeDefined();
+    expect(calls.find((c) => /DELETE\s+FROM/i.test(c.sql))).toBeUndefined();
   });
 });
 
@@ -368,5 +452,145 @@ describe('config parsing helpers', () => {
     expect(readConnectorsConfig({})).toEqual({});
     expect(readConnectorsConfig({ connectors: 'not-an-object' })).toEqual({});
     expect(readConnectorsConfig(null)).toEqual({});
+  });
+});
+
+// ── Fix #2: dispatch fan-out must NOT coalesce targets ───────────────────────
+//
+// The autopilot connector branch submits one connector_poll per (source, provider)
+// target with a distinct idempotency_key and NO maxWaiting. maxWaiting is keyed on
+// (name, queue) — shared across every target — so maxWaiting:1 would coalesce all N
+// targets into one waiting job and starve the rest on an idle worker. This test
+// replicates the dispatch submission shape against a stub queue (the inline loop in
+// autopilot.ts isn't a separately-exported function) and asserts every target
+// survives with a unique key and no coalescing knob. Mirrors the autopilot-fanout
+// "MUST NOT pass maxWaiting" regression guard.
+
+describe('connector dispatch fan-out — REVIEW#2 no maxWaiting coalescing', () => {
+  type Added = { name: string; data: Record<string, unknown>; opts: Record<string, unknown> };
+
+  /** Replicate the autopilot branch's per-target submission for the selected targets. */
+  async function simulateDispatch(sources: ConnectorSourceRow[], slot: string) {
+    const added: Added[] = [];
+    let nextId = 1;
+    const queue = {
+      add: async (name: string, data: Record<string, unknown>, opts: Record<string, unknown>) => {
+        added.push({ name, data, opts });
+        return { id: nextId++ };
+      },
+    };
+    const targets = selectEnabledConnectorSources(sources, NO_ENV);
+    for (const target of targets) {
+      await queue.add(
+        'connector_poll',
+        { sourceId: target.sourceId, provider: target.provider },
+        {
+          queue: 'default',
+          idempotency_key: `connector-poll:${target.sourceId}:${target.provider}:${slot}`,
+          max_attempts: 2,
+          timeout_ms: 600_000,
+          // NB: intentionally no maxWaiting (the fix).
+        },
+      );
+    }
+    return { added, targets };
+  }
+
+  test('N distinct targets → N jobs, each with a UNIQUE idempotency key', async () => {
+    const sources = [
+      connectorSource('s1', { connectors: { linear: { enabled: true }, slack: { enabled: true } } }),
+      connectorSource('s2', withConnector('notion', true)),
+    ];
+    const { added, targets } = await simulateDispatch(sources, 'SLOT-1');
+    // All three targets survive — none coalesced away.
+    expect(added.length).toBe(3);
+    expect(targets.length).toBe(3);
+    const keys = added.map((j) => j.opts.idempotency_key as string);
+    expect(new Set(keys).size).toBe(3); // all distinct
+    expect(keys.sort()).toEqual([
+      'connector-poll:s1:linear:SLOT-1',
+      'connector-poll:s1:slack:SLOT-1',
+      'connector-poll:s2:notion:SLOT-1',
+    ]);
+  });
+
+  test('NO submission carries maxWaiting (the coalescing trap)', async () => {
+    const sources = [
+      connectorSource('s1', withConnector('linear', true)),
+      connectorSource('s2', withConnector('slack', true)),
+      connectorSource('s3', withConnector('notion', true)),
+    ];
+    const { added } = await simulateDispatch(sources, 'SLOT-2');
+    expect(added.length).toBe(3);
+    for (const job of added) {
+      expect(job.opts.maxWaiting).toBeUndefined();
+    }
+  });
+});
+
+// ── Fix #4: circuit breaker on consecutive dead-letters ──────────────────────
+
+describe('connectorPollBreakerTripped — REVIEW#4 circuit breaker', () => {
+  /** A minimal engine returning a canned minion_jobs status history. */
+  function breakerEngine(history: string[], opts: { throws?: boolean } = {}) {
+    const calls: { sql: string; params: unknown[] }[] = [];
+    const engine = {
+      kind: 'postgres' as const,
+      executeRaw: async (sql: string, params?: unknown[]) => {
+        calls.push({ sql, params: params ?? [] });
+        if (opts.throws) throw new Error('minion_jobs query failed');
+        return history.map((status) => ({ status }));
+      },
+    } as unknown as BrainEngine;
+    return { engine, calls };
+  }
+
+  test('threshold consecutive dead-letters trips the breaker', async () => {
+    const history = Array(CONNECTOR_POLL_BREAKER_THRESHOLD).fill('dead');
+    const { engine } = breakerEngine(history);
+    const r = await connectorPollBreakerTripped(engine, 's1', 'linear');
+    expect(r.tripped).toBe(true);
+    expect(r.consecutiveDead).toBe(CONNECTOR_POLL_BREAKER_THRESHOLD);
+  });
+
+  test('a recent success at the head resets the streak — NOT tripped', async () => {
+    // Most-recent-first: a completed job followed by many dead ones.
+    const history = ['completed', 'dead', 'dead', 'dead', 'dead', 'dead', 'dead'];
+    const { engine } = breakerEngine(history);
+    const r = await connectorPollBreakerTripped(engine, 's1', 'linear');
+    expect(r.tripped).toBe(false);
+    expect(r.consecutiveDead).toBe(0);
+  });
+
+  test('below-threshold dead streak does not trip', async () => {
+    const history = Array(CONNECTOR_POLL_BREAKER_THRESHOLD - 1).fill('dead');
+    const { engine } = breakerEngine(history);
+    const r = await connectorPollBreakerTripped(engine, 's1', 'linear');
+    expect(r.tripped).toBe(false);
+  });
+
+  test('the leading dead streak is counted up to the first non-dead terminal', async () => {
+    const history = ['dead', 'dead', 'completed', 'dead', 'dead']; // streak = 2
+    const { engine } = breakerEngine(history);
+    const r = await connectorPollBreakerTripped(engine, 's1', 'linear', 2);
+    expect(r.consecutiveDead).toBe(2);
+    expect(r.tripped).toBe(true); // threshold lowered to 2 for this case
+  });
+
+  test('empty history (never polled) does not trip', async () => {
+    const { engine } = breakerEngine([]);
+    const r = await connectorPollBreakerTripped(engine, 's1', 'linear');
+    expect(r.tripped).toBe(false);
+    expect(r.consecutiveDead).toBe(0);
+  });
+
+  test('breaker query filters by (sourceId, provider) via the data JSONB', async () => {
+    const { engine, calls } = breakerEngine(['dead']);
+    await connectorPollBreakerTripped(engine, 'src-x', 'prov-y');
+    const q = calls[0];
+    expect(q.sql).toMatch(/data->>'sourceId'/);
+    expect(q.sql).toMatch(/data->>'provider'/);
+    expect(q.params).toContain('src-x');
+    expect(q.params).toContain('prov-y');
   });
 });

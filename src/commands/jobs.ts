@@ -1457,10 +1457,26 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
         `connector_poll: requires string sourceId + provider in params (got sourceId=${JSON.stringify(job.data.sourceId)}, provider=${JSON.stringify(job.data.provider)})`,
       );
     }
-    const seenRecordIds = Array.isArray(job.data.seenRecordIds)
-      ? (job.data.seenRecordIds as unknown[]).filter((s): s is string => typeof s === 'string')
-      : undefined;
-    return await runConnectorPoll(engine, { sourceId, provider, seenRecordIds });
+    // seenRecordIds is the reconciliation set. Fail LOUD on a malformed array
+    // (any non-string element) rather than silently filtering it to a shorter set —
+    // a silently-shrunk seen set would mark legitimately-present records "vanished"
+    // and tombstone them. A non-array seenRecordIds → undefined (no reconciliation).
+    // An EMPTY array is NOT a "zero records" signal (poll.ts skips reconciliation on
+    // it); a connector that authoritatively saw zero records passes confirmedEmpty.
+    let seenRecordIds: string[] | undefined;
+    if (Array.isArray(job.data.seenRecordIds)) {
+      const raw = job.data.seenRecordIds as unknown[];
+      if (!raw.every((s): s is string => typeof s === 'string')) {
+        throw new Error(
+          `connector_poll: seenRecordIds must be an array of strings (got a non-string element). ` +
+          `Refusing to proceed with a filtered/shrunk set — a connector that saw zero records ` +
+          `must pass { confirmedEmpty: true }, not a malformed id array.`,
+        );
+      }
+      seenRecordIds = raw as string[];
+    }
+    const confirmedEmpty = job.data.confirmedEmpty === true;
+    return await runConnectorPoll(engine, { sourceId, provider, seenRecordIds, confirmedEmpty });
   });
 
   process.stderr.write('[minion worker] brain-health-100 handlers registered (11 ops, 3 protected) + embed-backfill (v0.40) + connector_poll (TECH-2038)\n');

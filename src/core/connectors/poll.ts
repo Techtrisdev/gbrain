@@ -187,9 +187,17 @@ export function selectEnabledConnectorSources(
 
 // ── Reconciliation — tombstone candidates for vanished upstream records ───────
 
-/** Marks a tombstone candidate in its redactions trail + a deterministic suffix on
- *  the version so it never collides with the live record's candidate row. */
+/** The RESERVED sentinel that namespaces a tombstone candidate's version. The
+ *  tombstone version is the FIXED string `1:tombstone` (NOT `<recordVersion>:tombstone`):
+ *  the `:tombstone` suffix is a reserved namespace that (a) cannot collide with any live
+ *  candidate version (live candidates default to `'1'` and never carry the suffix), and
+ *  (b) is excluded from `readKnownRecordIds` via `version NOT LIKE '%:tombstone'`, so a
+ *  tombstone's own row never re-qualifies its record id as "known but vanished" and
+ *  resurrects itself on the next poll. A single tombstone per record id is sufficient —
+ *  re-running the poll re-emits the same fixed key and ON CONFLICT DO NOTHING makes it a
+ *  safe no-op. */
 export const TOMBSTONE_VERSION_SUFFIX = 'tombstone';
+const TOMBSTONE_VERSION = `1:${TOMBSTONE_VERSION_SUFFIX}`;
 const TOMBSTONE_REDACTION = { field: 'record', action: 'tombstone' } as const;
 
 /**
@@ -199,9 +207,10 @@ const TOMBSTONE_REDACTION = { field: 'record', action: 'tombstone' } as const;
  * result through `toRow` (the redaction choke point) — NEVER a direct delete.
  *
  * A tombstone is a normal `connector_candidate` whose:
- *   - version is `<recordVersion>:tombstone` so it cannot collide with the live
- *     candidate's (source, record, version) key — both rows coexist, and the
- *     promotion bridge later reads the tombstone as "this record went away",
+ *   - version is the FIXED reserved sentinel `1:tombstone` (see TOMBSTONE_VERSION_SUFFIX)
+ *     — it cannot collide with the live candidate's (source, record, version) key (live
+ *     rows default to '1'), both rows coexist, and the promotion bridge later reads the
+ *     tombstone as "this record went away",
  *   - proposed_markdown is a short structural note (no body — there is no upstream
  *     body to carry, the record is gone),
  *   - redactions trail carries a `record:tombstone` marker.
@@ -209,6 +218,12 @@ const TOMBSTONE_REDACTION = { field: 'record', action: 'tombstone' } as const;
  * `seenRecordIds` and `knownRecordIds` are compared as sets; a known id absent from
  * the seen set is a vanish. Ids present in `seen` but not `known` are NEW records —
  * backfill already landed them, so they are not this function's concern.
+ *
+ * SAFETY: the caller MUST NOT invoke this with an empty `seenRecordIds` derived from a
+ * transient zero-record poll — an empty seen set would mark EVERY known record vanished
+ * and mass-tombstone the source in one pass. `runConnectorPoll` gates on a non-empty
+ * seen set (or an explicit `confirmedEmpty` signal); this function itself stays pure and
+ * trusts its caller's gate.
  */
 export function computeTombstoneCandidates(args: {
   sourceId: string;
@@ -226,7 +241,7 @@ export function computeTombstoneCandidates(args: {
     tombstones.push({
       source_id: args.sourceId,
       source_record_id: recordId,
-      version: `1:${TOMBSTONE_VERSION_SUFFIX}`,
+      version: TOMBSTONE_VERSION,
       provider: args.provider,
       proposed_slug: `${args.provider}-tombstone-${recordId}`,
       // Structural note only — the upstream record is GONE, so there is no body to
@@ -250,8 +265,22 @@ export interface ConnectorPollParams {
    * Upstream record ids the caller observed THIS poll, used for reconciliation.
    * When omitted, reconciliation is skipped (backfill-only) — a connector that
    * cannot enumerate its full current set must not emit spurious tombstones.
+   *
+   * SAFETY: an EMPTY array is NOT a valid "zero records upstream" signal here. A
+   * transient API hiccup (or a non-string-id array filtered to empty) returning zero
+   * records would, if treated as the full current set, mass-tombstone every previously
+   * landed record. So `runConnectorPoll` only reconciles when this array is NON-EMPTY.
+   * A connector that legitimately observed zero current records must pass
+   * `confirmedEmpty: true` instead — the explicit, distinct signal.
    */
   seenRecordIds?: string[];
+  /**
+   * Explicit "the connector authoritatively observed ZERO current upstream records"
+   * signal. ONLY this flag (never an empty `seenRecordIds`) lets reconciliation run
+   * against an empty seen set, tombstoning every known record. Default false: a missing
+   * flag with an empty/absent `seenRecordIds` skips reconciliation entirely.
+   */
+  confirmedEmpty?: boolean;
 }
 
 export interface ConnectorPollResult {
@@ -261,42 +290,77 @@ export interface ConnectorPollResult {
   landed: number;
   /** Number of tombstone candidates written for vanished records. */
   tombstoned: number;
-  /** Set when the poll short-circuited (no source, no connector, no backfill). */
+  /** Set when the poll short-circuited (no source, archived, kill-switch, no
+   *  connector, disabled, or no backfill). */
   skippedReason?:
     | 'source_not_found'
+    | 'source_archived'
+    | 'killswitch_tripped'
     | 'connector_not_registered'
     | 'connector_not_enabled'
     | 'backfill_unsupported';
 }
 
 /**
- * Run one `connector_poll`. Idempotent + safe to re-run (AC1):
- *   1. Load the source row; bail cleanly if gone (queue replay against a deleted source).
- *   2. Resolve the connector by provider; bail if unregistered.
- *   3. Verify the connector is still ENABLED for this source (config.connectors.<p>.enabled).
+ * Run one `connector_poll`. Idempotent + safe to re-run (AC1). Every gate below
+ * runs at RUN time (not just dispatch time), so a job queued before the operator
+ * changed state still respects the current state when it finally executes:
+ *   1. Load the source row (with `archived`); bail if gone (deleted source) or archived.
+ *   2. Kill-switch re-check: a poll queued before the operator tripped
+ *      GBRAIN_CONNECTORS_KILLSWITCH (or set config.connectors_killswitch) must NOT make
+ *      its outbound backfill call — "stop everything NOW" must stop in-flight traffic.
+ *   3. Resolve the connector by provider; bail if unregistered.
+ *   4. Verify the connector is still ENABLED for this source (config.connectors.<p>.enabled).
  *      A poll for a since-disabled connector is a clean no-op, not a failure.
- *   4. Call `connector.backfill(engine, source)` — the connector lands candidates via
+ *   5. Call `connector.backfill(engine, source)` — the connector lands candidates via
  *      the framework's landRecords redaction path; ON CONFLICT makes a re-fetch a no-op.
- *   5. Reconciliation: if the caller supplied `seenRecordIds`, diff against the known
- *      candidate record ids for (source, provider) and write a TOMBSTONE candidate for
+ *   6. Reconciliation: ONLY when `seenRecordIds` is NON-EMPTY (or `confirmedEmpty` is
+ *      true). An empty/absent seen set without `confirmedEmpty` skips reconciliation —
+ *      a transient zero-record poll must never mass-tombstone the source. When it runs,
+ *      diff against the known candidate record ids and write a TOMBSTONE candidate for
  *      each vanished id (never a delete).
  *
+ * `env` is injected (defaults to process.env) so the kill-switch re-check is testable.
  * Throws only on an unexpected engine/connector error (so the Minion worker retries
  * with backoff); expected "nothing to do" cases return a `skippedReason`.
  */
 export async function runConnectorPoll(
   engine: BrainEngine,
   params: ConnectorPollParams,
+  env: Record<string, string | undefined> = process.env,
 ): Promise<ConnectorPollResult> {
   const { sourceId, provider } = params;
   const base: ConnectorPollResult = { sourceId, provider, landed: 0, tombstoned: 0 };
 
-  const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string }>(
-    `SELECT id, config FROM sources WHERE id = $1`,
-    [sourceId],
-  );
-  const row = rows[0];
+  // Run-time archived re-check mirrors dispatch selection (loadAllSources excludes
+  // archived). Tolerate pre-v0.26.5 brains without the `archived` column (42703).
+  let row: { id: string; config: Record<string, unknown> | string; archived?: boolean | null } | undefined;
+  try {
+    const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string; archived: boolean | null }>(
+      `SELECT id, config, archived FROM sources WHERE id = $1`,
+      [sourceId],
+    );
+    row = rows[0];
+  } catch (err) {
+    if (isUndefinedColumnError(err)) {
+      const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string }>(
+        `SELECT id, config FROM sources WHERE id = $1`,
+        [sourceId],
+      );
+      row = rows[0];
+    } else {
+      throw err;
+    }
+  }
   if (!row) return { ...base, skippedReason: 'source_not_found' };
+  if (row.archived === true) return { ...base, skippedReason: 'source_archived' };
+
+  // Kill-switch re-check at RUN time: a poll already queued before the operator
+  // tripped the switch must NOT fire its outbound backfill. This is the gate that
+  // makes "stop everything NOW" actually stop in-flight traffic, not just dispatch.
+  if (connectorAutomationDisabled(row, env)) {
+    return { ...base, skippedReason: 'killswitch_tripped' };
+  }
 
   const connector = getConnector(provider);
   if (!connector) return { ...base, skippedReason: 'connector_not_registered' };
@@ -313,14 +377,23 @@ export async function runConnectorPoll(
   const source: ConnectorSource = { id: row.id, config: row.config };
   const landed = await connector.backfill(engine, source);
 
+  // Reconciliation gate (anti-mass-tombstone): run ONLY when we have an authoritative,
+  // non-empty current set, OR the connector explicitly confirmed zero records. An empty
+  // `seenRecordIds` without `confirmedEmpty` is treated as "no reliable signal" and
+  // skipped — never as "everything vanished".
+  const reconcile =
+    (params.seenRecordIds !== undefined && params.seenRecordIds.length > 0) ||
+    params.confirmedEmpty === true;
+
   let tombstoned = 0;
-  if (params.seenRecordIds !== undefined) {
+  if (reconcile) {
     const known = await readKnownRecordIds(engine, sourceId, provider);
     const tombstones = computeTombstoneCandidates({
       sourceId,
       provider,
       knownRecordIds: known,
-      seenRecordIds: params.seenRecordIds,
+      // confirmedEmpty with no ids → empty seen set → every known record is a vanish.
+      seenRecordIds: params.seenRecordIds ?? [],
     });
     for (const t of tombstones) {
       // toRow is the single redaction + table-only write boundary (never a page,
@@ -331,6 +404,67 @@ export async function runConnectorPoll(
   }
 
   return { ...base, landed, tombstoned };
+}
+
+/** Driver-tolerant 42703 (undefined_column) detector. Mirrors sources-load.ts. */
+function isUndefinedColumnError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: string; message?: string };
+  if (e.code === '42703') return true;
+  return typeof e.message === 'string' && /column .* does not exist/i.test(e.message);
+}
+
+// ── Circuit breaker — suppress a chronically-failing (source, provider) ───────
+
+/**
+ * Consecutive dead-letter threshold after which the autopilot branch STOPS
+ * dispatching a (source, provider) target. A connector with revoked upstream creds
+ * fails `max_attempts` times → dead-letters → re-dispatches every slot forever,
+ * burning ~2 failing outbound calls/slot unattended. After K consecutive dead-letters
+ * with no intervening success, the breaker trips and the operator must intervene
+ * (re-auth, then the next success clears the streak).
+ */
+export const CONNECTOR_POLL_BREAKER_THRESHOLD = 5;
+
+/**
+ * Should the autopilot branch SUPPRESS dispatch for this (source, provider) because
+ * it has dead-lettered K+ times in a row with no intervening success?
+ *
+ * Reads the recent `connector_poll` job history for this exact (source, provider) —
+ * most-recent first — and counts the leading run of `dead` jobs. A `completed` (or any
+ * non-dead terminal) job at the head means the last attempt did NOT dead-letter, so the
+ * streak is 0 and dispatch proceeds. Fail-OPEN: any query error returns false (never
+ * wedge dispatch on a breaker-bookkeeping failure) and is surfaced to the caller's log.
+ *
+ * Engine-agnostic: filters on `name`, `status`, and the `data` JSONB (`->>` works on
+ * both Postgres and PGLite). Bounded LIMIT keeps it O(1) per tick.
+ */
+export async function connectorPollBreakerTripped(
+  engine: BrainEngine,
+  sourceId: string,
+  provider: string,
+  threshold = CONNECTOR_POLL_BREAKER_THRESHOLD,
+): Promise<{ tripped: boolean; consecutiveDead: number }> {
+  // Look back over a window comfortably larger than the threshold so a single
+  // success anywhere in the recent streak resets the count.
+  const lookback = Math.max(threshold * 3, 15);
+  const rows = await engine.executeRaw<{ status: string }>(
+    `SELECT status
+       FROM minion_jobs
+      WHERE name = 'connector_poll'
+        AND data->>'sourceId' = $1
+        AND data->>'provider' = $2
+        AND status IN ('completed', 'failed', 'dead', 'cancelled')
+      ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+      LIMIT $3`,
+    [sourceId, provider, lookback],
+  );
+  let consecutiveDead = 0;
+  for (const r of rows) {
+    if (r.status === 'dead') consecutiveDead += 1;
+    else break; // first non-dead terminal job ends the leading streak
+  }
+  return { tripped: consecutiveDead >= threshold, consecutiveDead };
 }
 
 /**

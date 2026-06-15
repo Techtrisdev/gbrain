@@ -497,15 +497,50 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         // Each enabled provider on each eligible source is submitted as one
         // `connector_poll` job, coalesced per (source, provider, slot) via the
         // idempotency key so repeated ticks don't stack duplicate polls.
+        //
+        // DELIBERATELY no `maxWaiting` here: maxWaiting is keyed on (name, queue),
+        // NOT (source, provider). With name='connector_poll' shared across every
+        // target, maxWaiting:1 would coalesce ALL N per-(source,provider) jobs into
+        // ONE waiting job per tick — on an idle worker only the first-claimed target
+        // would ever poll and the rest would silently starve. The per-target
+        // idempotency_key is the correct coalescing primitive (exactly one job per
+        // (source, provider, slot), regardless of how many ticks fire). Same trap +
+        // fix as the autopilot-fanout per-source path.
         try {
           const { loadAllSources } = await import('../core/sources-load.ts');
-          const { selectEnabledConnectorSources } = await import('../core/connectors/poll.ts');
+          const { selectEnabledConnectorSources, connectorPollBreakerTripped } =
+            await import('../core/connectors/poll.ts');
           const allSources = await loadAllSources(engine);
           const targets = selectEnabledConnectorSources(
             allSources.map((s) => ({ id: s.id, local_path: s.local_path, config: s.config })),
           );
           for (const target of targets) {
             try {
+              // Circuit breaker: a target that has dead-lettered K times in a row
+              // (e.g. revoked upstream creds) stops being dispatched until a human
+              // re-auths. Fail-OPEN — a breaker-query error never suppresses dispatch.
+              try {
+                const breaker = await connectorPollBreakerTripped(engine, target.sourceId, target.provider);
+                if (breaker.tripped) {
+                  const line = `[autopilot] connector_poll circuit OPEN for ${target.sourceId}/${target.provider}: ` +
+                    `${breaker.consecutiveDead} consecutive dead-letters. Skipping dispatch until a ` +
+                    `successful poll clears the streak (check upstream creds / 'gbrain jobs list --status dead').`;
+                  if (jsonMode) {
+                    process.stderr.write(JSON.stringify({
+                      event: 'connector_poll_circuit_open',
+                      source_id: target.sourceId, provider: target.provider,
+                      consecutive_dead: breaker.consecutiveDead,
+                    }) + '\n');
+                  } else {
+                    console.error(line);
+                  }
+                  logError('dispatch.connector-breaker', new Error(line));
+                  continue;
+                }
+              } catch (be) {
+                // Fail-open: breaker bookkeeping must never block a real poll.
+                logError('dispatch.connector-breaker-probe', be);
+              }
               const job = await queue.add(
                 'connector_poll',
                 { sourceId: target.sourceId, provider: target.provider },
@@ -514,7 +549,6 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
                   idempotency_key: `connector-poll:${target.sourceId}:${target.provider}:${slot}`,
                   max_attempts: 2,
                   timeout_ms: timeoutMs,
-                  maxWaiting: 1,
                 },
               );
               if (jsonMode) {
