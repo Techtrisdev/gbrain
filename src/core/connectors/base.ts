@@ -96,6 +96,17 @@ export interface SaaSConnector {
   /** Outbound backfill (initial/periodic sync). Declared here; implemented per-connector
    *  once connector_tokens / OAuth (TECH-2033) lands. Uses the same landRecords path. */
   backfill?(engine: BrainEngine, source: ConnectorSource): Promise<number>;
+  /** Optional post-connect hook, invoked by the OAuth /callback AFTER storeToken
+   *  persists the grant (TECH-2040). A connector whose inbound trigger requires
+   *  provider-side setup beyond the token grant (e.g. Google Calendar's
+   *  events.watch push channel — which must be created with the fresh token and
+   *  whose channel-id + channel-token must be persisted into the source config so
+   *  the dedicated /webhooks/calendar route can resolve + authenticate later
+   *  deliveries) implements this. Connectors with a self-contained webhook (linear,
+   *  slack — the provider already knows the endpoint + secret) omit it. Optional, so
+   *  adding it is non-breaking. The callback awaits it and surfaces a failure as a
+   *  502, so a watch-creation error does not silently leave the push path dead. */
+  onConnect?(engine: BrainEngine, sourceId: string, account: string): Promise<void>;
 }
 
 // ── Registry ────────────────────────────────────────────────────────────────────

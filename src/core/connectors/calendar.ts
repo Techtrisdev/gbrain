@@ -34,22 +34,38 @@
  * The dedicated route (src/commands/serve-http.ts `/webhooks/calendar`) therefore:
  *   1. rate-limits (mirrors the github/connector limiters),
  *   2. reads X-Goog-Channel-ID + X-Goog-Channel-Token from headers,
- *   3. resolves the source by channel-id (stored in config.connectors.calendar.channel_id
- *      when the watch was created),
+ *   3. resolves the source by channel-id with a DB query (stored in
+ *      config.connectors.calendar.channel_id when the watch was created),
  *   4. constant-time-compares the channel token to config.connectors.calendar.secret,
  *   5. on X-Goog-Resource-State: 'exists', runs incrementalSync (events.list with the
  *      stored syncToken; a 410 Gone drops the syncToken and does a full resync),
  *   6. normalizes each event to a metadata-only candidate via landRecords.
  *
+ * AUTH ORDERING (no pre-DB-auth gate — do not claim one): unlike a body-HMAC scheme, the
+ * channel token authenticates a CHANNEL, not a request body, and the channel is resolved
+ * by the channel-id header. So the source-lookup DB query (step 3) + config parse run
+ * BEFORE the constant-time token compare (step 4). An unauthenticated probe therefore
+ * DOES touch the DB (one indexed lookup), exactly as the /webhooks/github precedent does;
+ * the rate limiter is the probe-traffic backstop. This is inherent to header-routed push.
+ *
  * The connector still implements the full SaaSConnector shape — verifyWebhook (channel
  * token compare, reused by the dedicated route), normalize/toCandidate (event → metadata
- * candidate), and backfill (initial events.list) — so the OAuth flow and the periodic
- * poll job work through the same primitives. Only the INBOUND trigger differs.
+ * candidate), backfill (initial events.list), and onConnect (events.watch channel
+ * creation + channel-id/secret persistence — the wiring that makes the inbound push live
+ * end-to-end) — so the OAuth flow and the periodic poll job work through the same
+ * primitives. Only the INBOUND trigger differs.
  *
  * OAuth (AC2): Google OAuth with scope `calendar.readonly`, registered with the custody
  * module (TECH-2033) at module load. getValidAccessToken returns a BARE token; this
- * module prepends `Bearer `.
+ * module prepends `Bearer `. After the OAuth /callback persists the grant via storeToken,
+ * it invokes calendar.onConnect, which creates the events.watch push channel and writes
+ * its channel-id + a freshly-generated high-entropy channel token (the per-source push
+ * secret) into the source config — the row the dedicated route's channel-id lookup
+ * matches. Without this hook nothing would write channel_id/secret and the route's
+ * `WHERE …channel_id=$1` lookup could never match (the push path would be dead in prod).
  */
+
+import { randomBytes } from 'node:crypto';
 
 import {
   registerConnector,
@@ -63,6 +79,7 @@ import {
   getValidAccessToken,
   registerOAuthProvider,
   safeStateEqual,
+  withInProcessLock,
   type StoredToken,
 } from './credentials.ts';
 
@@ -113,6 +130,15 @@ const GOOGLE_TOKEN_TTL_MS = 60 * 60 * 1000;
 const LIST_PAGE_SIZE = 250;
 /** A kept title/name is a structural LABEL, not free content — cap it (mirrors linear). */
 const MAX_TITLE_LEN = 200;
+/**
+ * The public base URL the events.watch push channel posts back to. Google requires an
+ * HTTPS, publicly-reachable, domain-verified address, so this MUST be the brain's public
+ * URL (env GBRAIN_PUBLIC_URL). onConnect refuses to create a watch if it is unset or not
+ * https — a watch pointed at localhost would silently never deliver.
+ */
+const PUBLIC_URL_ENV = 'GBRAIN_PUBLIC_URL';
+/** The dedicated push receiver path (must match the route in serve-http.ts). */
+const CALENDAR_WEBHOOK_PATH = '/webhooks/calendar';
 
 // ── OAuth provider registration (scope calendar.readonly, refresh-token grant) ───
 
@@ -238,11 +264,16 @@ function summaryForEvent(ev: CalendarEvent): string {
 }
 
 /** The metadata we keep — only structural fields the `calendar` profile allowlists.
- *  organizer is the display name/email, attendee_count is a NUMBER (never the list). */
+ *  attendee_count is a NUMBER (never the attendee list). */
 function metadataForEvent(ev: CalendarEvent): Record<string, unknown> {
   const md: Record<string, unknown> = {};
   if (ev.id) md.event_id = ev.id;
-  const organizer = ev.organizer?.displayName ?? ev.organizer?.email;
+  // organizer: use the EMAIL only, never the displayName. A real person's NAME is
+  // outside redact's v1 regex boundary, so a displayName would survive into the
+  // candidate verbatim (review finding 4). An email, by contrast, IS scrubbed to
+  // [REDACTED] by strip() in the landing path — so emitting the email keeps a structural
+  // anchor while guaranteeing the personal identifier is masked, not leaked.
+  const organizer = ev.organizer?.email;
   if (organizer) md.organizer = organizer;
   const start = str(ev.start?.dateTime) ?? str(ev.start?.date);
   if (start) md.start = start;
@@ -367,6 +398,51 @@ export const calendarConnector: SaaSConnector = {
     if (syncToken) await writeSyncToken(engine, source, syncToken);
     return landed;
   },
+
+  /**
+   * TECH-2040 review fix (finding 1): make the inbound push live END-TO-END. The OAuth
+   * /callback invokes this AFTER storeToken persists the grant. Nothing else writes
+   * channel_id/secret, so without this the route's `WHERE …channel_id=$1` lookup could
+   * never match and the push path would be dead in prod.
+   *
+   * Steps:
+   *   1. mint a FRESH high-entropy channel id + channel token (32 random bytes hex each).
+   *      The token is the per-source push secret — the ONLY thing authenticating inbound
+   *      deliveries (weaker than HMAC; see module header). A fresh value per connect means
+   *      a reconnect rotates it.
+   *   2. events.watch the calendar, pointing the channel at <GBRAIN_PUBLIC_URL>/webhooks/
+   *      calendar with that token. Google requires https + a domain-verified public host;
+   *      we refuse (throw) on a missing/non-https public URL so a misconfig surfaces as a
+   *      502 at /callback rather than a silently-dead push.
+   *   3. persist channel_id + secret (+ resource_id/expiration for later channel renewal)
+   *      into config.connectors.calendar via a surgical jsonb_set, leaving sibling keys
+   *      (enabled/account/sync_token) intact.
+   *
+   * Fail-loud: any error propagates to the /callback, which returns 502. The grant is
+   * already stored, so an operator can retry the watch without re-authing.
+   */
+  async onConnect(engine: BrainEngine, sourceId: string, account: string): Promise<void> {
+    const publicUrl = (process.env[PUBLIC_URL_ENV] ?? '').trim().replace(/\/+$/, '');
+    if (!publicUrl || !/^https:\/\//i.test(publicUrl)) {
+      throw new Error(
+        `calendar onConnect: ${PUBLIC_URL_ENV} must be an https public URL to receive Google ` +
+          `Calendar push (events.watch rejects non-https / non-public addresses)`,
+      );
+    }
+    const token = await getValidAccessToken(engine, sourceId, PROVIDER);
+    const calendarId = account || 'primary';
+    const channelId = randomBytes(32).toString('hex');
+    const channelToken = randomBytes(32).toString('hex');
+    const address = `${publicUrl}${CALENDAR_WEBHOOK_PATH}`;
+
+    const watch = await watchEvents(token, calendarId, { channelId, channelToken, address });
+    await writeWatchChannel(engine, sourceId, {
+      channelId,
+      channelToken,
+      resourceId: watch.resourceId,
+      expiration: watch.expiration,
+    });
+  },
 };
 
 // ── Incremental sync (driven by the dedicated /webhooks/calendar route) ──────────
@@ -377,8 +453,21 @@ export const calendarConnector: SaaSConnector = {
  * expired (Google's documented signal): we DROP the stored syncToken and do a FULL
  * resync (backfill) to re-establish a fresh token. Returns the number of candidates
  * landed. Exposed (not a connector method) because the dedicated route calls it directly.
+ *
+ * SERIALIZATION (review finding 2): the read-list-write of the syncToken cursor runs
+ * under the SAME per-(source,provider) in-process single-flight mutex `getValidAccessToken`
+ * uses (`withInProcessLock`). Without it, two concurrent Google pushes for one source
+ * could interleave their read→list→write and REGRESS the cursor — silently dropping a
+ * change Google later expires (ON CONFLICT heals duplicate writes but NOT a cursor that
+ * moves backwards). The mutex makes each source's cursor advance strictly sequential.
+ * (Single-instance assumption — see the withInProcessLock note in credentials.ts.)
  */
 export async function incrementalSync(engine: BrainEngine, source: ConnectorSource): Promise<number> {
+  return withInProcessLock(source.id, PROVIDER, () => incrementalSyncLocked(engine, source));
+}
+
+/** The read-list-write body, run under the single-flight mutex by incrementalSync. */
+async function incrementalSyncLocked(engine: BrainEngine, source: ConnectorSource): Promise<number> {
   const { landRecords } = await import('./base.ts');
   const token = await getValidAccessToken(engine, source.id, PROVIDER);
   const calendarId = readCalendarId(source);
@@ -532,6 +621,43 @@ export async function writeSyncToken(
         SET config = jsonb_set(config, '{connectors,calendar,sync_token}', to_jsonb($1::text), true)
       WHERE id = $2`,
     [syncToken, source.id],
+  );
+}
+
+/**
+ * Persist the events.watch channel binding (review finding 1). Merges channel_id +
+ * secret (+ resource_id/expiration) INTO config.connectors.calendar with the jsonb `||`
+ * concat operator, which is a shallow merge that PRESERVES existing keys (enabled,
+ * account, sync_token) and overwrites only the channel fields — so a reconnect rotates
+ * the channel without clobbering siblings. `jsonb_set(..., true)` first guarantees the
+ * connectors.calendar object exists before the merge (coalescing a null/absent path to
+ * '{}'), then `||` writes the channel fields onto it.
+ *
+ * NOTE: secret is written server-side here and never logged. It IS a high-entropy random
+ * value (randomBytes(32) hex), so it is not PII/secret-shaped that strip() would mask —
+ * and it must round-trip verbatim (the route constant-time-compares it), so it is stored
+ * raw in config exactly like the github webhook_secret.
+ */
+export async function writeWatchChannel(
+  engine: BrainEngine,
+  sourceId: string,
+  channel: { channelId: string; channelToken: string; resourceId?: string; expiration?: string },
+): Promise<void> {
+  const patch: Record<string, unknown> = {
+    channel_id: channel.channelId,
+    secret: channel.channelToken,
+  };
+  if (channel.resourceId) patch.resource_id = channel.resourceId;
+  if (channel.expiration) patch.channel_expiration = channel.expiration;
+  await engine.executeRaw(
+    `UPDATE sources
+        SET config = jsonb_set(
+              COALESCE(config, '{}'::jsonb),
+              '{connectors,calendar}',
+              COALESCE(config->'connectors'->'calendar', '{}'::jsonb) || $1::jsonb,
+              true)
+      WHERE id = $2`,
+    [JSON.stringify(patch), sourceId],
   );
 }
 

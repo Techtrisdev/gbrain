@@ -2007,6 +2007,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // 410 Gone drops the token + full-resyncs). Each event lands as a METADATA-ONLY
   // candidate via landRecords (description/notes stripped — AC3). The source is
   // resolved by channel-id, NOT by a payload account (there is no payload).
+  //
+  // AUTH ORDERING — NO pre-DB-auth gate (do not claim one): only the header-PRESENCE
+  // check is pre-DB. Because the channel token authenticates a CHANNEL (resolved by the
+  // channel-id header), the source-lookup DB query + config parse necessarily run BEFORE
+  // the constant-time token compare. An unauthenticated probe carrying a channel-id thus
+  // performs ONE indexed source lookup — exactly as /webhooks/github does (it looks up
+  // the source by repo before the HMAC compare). The rate limiter is the probe backstop.
   // ---------------------------------------------------------------------------
   const calendarWebhookLimiter = rateLimit({
     windowMs: 60_000,
@@ -2022,8 +2029,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // Consume (and discard) the empty body so downstream middleware doesn't hang.
     express.raw({ type: '*/*', limit: '64kb' }),
     async (req: Request, res: Response) => {
-      // (1) Pre-DB short-circuit: a delivery without the channel-id / token headers
-      //     is not a real Google push. Reject before any source lookup.
+      // (1) Header-PRESENCE short-circuit (the ONLY pre-DB gate): a delivery missing the
+      //     channel-id / token headers is not a real Google push. Reject before the
+      //     source lookup. NOTE: the token VALUE compare is NOT here — it happens in (4),
+      //     AFTER the channel-id resolves the source (the secret is per-source). So an
+      //     unauth'd probe with a channel-id still costs one indexed lookup; that matches
+      //     the /webhooks/github precedent and is backstopped by the rate limiter.
       const channelId = req.header(CHANNEL_ID_HEADER);
       const channelToken = req.header(calendarConnector.signatureHeader);
       if (!channelId) {
@@ -2345,6 +2356,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     try {
       const token = await cfg.exchangeCode(code, connectorRedirectUri(provider));
       await storeToken(engine, matched.sourceId, provider, token);
+      // TECH-2040: optional post-connect provider setup, AFTER the grant is durably
+      // stored. A connector whose inbound trigger needs provider-side wiring beyond the
+      // token grant implements onConnect — e.g. the Calendar connector creates the
+      // events.watch push channel and persists its channel-id + secret so the dedicated
+      // /webhooks/calendar route can resolve + authenticate later deliveries. Without
+      // this the push path would be dead (nothing writes channel_id). onConnect is
+      // optional (linear/slack omit it — non-breaking) and runs with the token already
+      // persisted, so a watch-creation failure surfaces as a 502 without losing the grant.
+      await getConnector(provider)?.onConnect?.(engine, matched.sourceId, token.account);
       res.json({ status: 'connected', source_id: matched.sourceId, provider, account: token.account });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
