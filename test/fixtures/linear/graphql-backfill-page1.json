@@ -1,0 +1,35 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "issue-uuid-100",
+          "identifier": "ENG-100",
+          "title": "First backfilled issue",
+          "description": "Body of issue 100.",
+          "url": "https://linear.app/acme/issue/ENG-100",
+          "priority": 1,
+          "createdAt": "2026-06-10T08:00:00.000Z",
+          "updatedAt": "2026-06-12T09:00:00.000Z",
+          "state": { "name": "In Progress", "type": "started" },
+          "assignee": { "name": "Sam", "displayName": "Sam P." },
+          "labelIds": ["label-a"]
+        },
+        {
+          "id": "issue-uuid-101",
+          "identifier": "ENG-101",
+          "title": "Second backfilled issue",
+          "description": "Body of issue 101.",
+          "url": "https://linear.app/acme/issue/ENG-101",
+          "priority": 3,
+          "createdAt": "2026-06-11T08:00:00.000Z",
+          "updatedAt": "2026-06-13T09:00:00.000Z",
+          "state": { "name": "Todo", "type": "unstarted" },
+          "assignee": null,
+          "labelIds": []
+        }
+      ],
+      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-page-1" }
+    }
+  }
+}

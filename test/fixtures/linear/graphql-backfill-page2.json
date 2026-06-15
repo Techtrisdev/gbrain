@@ -1,0 +1,22 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {
+          "id": "issue-uuid-102",
+          "identifier": "ENG-102",
+          "title": "Third backfilled issue",
+          "description": "Body of issue 102.",
+          "url": "https://linear.app/acme/issue/ENG-102",
+          "priority": 2,
+          "createdAt": "2026-06-12T08:00:00.000Z",
+          "updatedAt": "2026-06-14T09:00:00.000Z",
+          "state": { "name": "Done", "type": "completed" },
+          "assignee": { "name": "Lee", "displayName": "Lee Q." },
+          "labelIds": ["label-b"]
+        }
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-page-2" }
+    }
+  }
+}
