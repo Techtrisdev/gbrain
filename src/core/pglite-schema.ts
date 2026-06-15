@@ -814,8 +814,10 @@ CREATE TABLE IF NOT EXISTS connector_tokens (
                               CHECK (status IN ('active','needs_reauth','revoked')),
   created_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
-  CONSTRAINT connector_tokens_source_provider_account_unique
-    UNIQUE (source_id, provider, account)
+  -- Identity is (source_id, provider) — ONE account per (source, provider).
+  -- See src/schema.sql for the full rationale.
+  CONSTRAINT connector_tokens_source_provider_unique
+    UNIQUE (source_id, provider)
 );
 
 CREATE INDEX IF NOT EXISTS connector_tokens_source_provider_idx

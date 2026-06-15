@@ -92,6 +92,45 @@ export function resolveBootstrapToken(
   return { kind: 'ok', token: trimmed, fromEnv: true };
 }
 
+/**
+ * A minted, not-yet-consumed connector OAuth `state` binding (TECH-2033).
+ * `expiresAt` is epoch ms.
+ */
+export interface ConnectorOAuthState {
+  sourceId: string;
+  provider: string;
+  expiresAt: number;
+}
+
+/**
+ * Pure validation of a connector OAuth `/callback` state against the in-memory
+ * mint store. Extracted so the forged/expired/wrong-provider rejection logic is
+ * unit-testable without booting Express (matching this module's probe-helper
+ * convention). The route is a thin wrapper that consumes (deletes) the matched
+ * key on success.
+ *
+ * Returns `{ ok: true, key, sourceId }` only when a minted state for THIS
+ * provider matches `state` via a constant-time compare AND has not expired.
+ * Otherwise `{ ok: false, reason }`. An unminted/forged state, a state minted
+ * for a different provider, and an expired state all fail closed.
+ */
+export function resolveConnectorCallbackState(
+  states: Map<string, ConnectorOAuthState>,
+  provider: string,
+  state: string,
+  now: number,
+  constantTimeEqual: (a: string, b: string) => boolean,
+): { ok: true; key: string; sourceId: string } | { ok: false; reason: 'invalid_state' } {
+  for (const [key, v] of states) {
+    if (v.provider !== provider) continue;
+    if (v.expiresAt <= now) continue; // expired → not a match
+    if (constantTimeEqual(key, state)) {
+      return { ok: true, key, sourceId: v.sourceId };
+    }
+  }
+  return { ok: false, reason: 'invalid_state' };
+}
+
 export type ProbeHealthResult =
   | { ok: true; status: 200; body: { status: 'ok'; version: string; engine: string; [k: string]: unknown } }
   | { ok: false; status: 503; body: { error: 'service_unavailable'; error_description: string } };
@@ -2081,9 +2120,19 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (constant-time compare) and consumes it single-use. The connect route is
   // admin-gated (it provisions a credential for a source); the callback is the
   // provider's redirect target and is gated by the unguessable state instead.
+  //
+  // SINGLE-INSTANCE ASSUMPTION (TECH-2033): `connectorOAuthStates` is in-process,
+  // so a /callback that lands on a DIFFERENT Node instance than the /connect
+  // that minted the state (multi-instance behind a load balancer, or a process
+  // restart between connect and callback) would 400 invalid_state. gbrain runs
+  // single-instance today, so this is correct as-is. Multi-instance support
+  // would replace this Map with a short-TTL `connector_oauth_states` DB table
+  // (mint on connect, consume+delete on callback) — and the refresh single-flight
+  // would then rest solely on the Postgres advisory lock as the cross-instance
+  // serializer (see credentials.ts `refreshLocks` note). Not built now.
   const connectorOAuthBase = (publicUrl || `http://localhost:${port}`).replace(/\/+$/, '');
   const CONNECTOR_STATE_TTL_MS = 10 * 60 * 1000;
-  const connectorOAuthStates = new Map<string, { sourceId: string; provider: string; expiresAt: number }>();
+  const connectorOAuthStates = new Map<string, ConnectorOAuthState>();
 
   function connectorRedirectUri(provider: string): string {
     return `${connectorOAuthBase}/admin/api/connectors/${encodeURIComponent(provider)}/callback`;
@@ -2139,15 +2188,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
     sweepConnectorStates();
     // Constant-time lookup: find the matching minted state (and confirm provider).
-    let matched: { key: string; sourceId: string } | null = null;
-    for (const [k, v] of connectorOAuthStates) {
-      if (v.provider === provider && safeStateEqual(k, state)) {
-        matched = { key: k, sourceId: v.sourceId };
-        break;
-      }
-    }
-    if (!matched) {
-      res.status(400).json({ error: 'invalid_state' });
+    // Pure helper so the forged/expired/wrong-provider rejection is unit-tested.
+    const matched = resolveConnectorCallbackState(
+      connectorOAuthStates, provider, state, Date.now(), safeStateEqual,
+    );
+    if (!matched.ok) {
+      res.status(400).json({ error: matched.reason });
       return;
     }
     connectorOAuthStates.delete(matched.key); // single-use

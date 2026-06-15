@@ -88,14 +88,33 @@ export interface TokenEnvelope {
 
 const MASTER_KEY_ENV = 'GBRAIN_CONNECTOR_MASTER_KEY';
 const IV_BYTES = 12;
-/** Default kid for the current master key. Bump on a real key rotation. */
+/**
+ * kid of the CURRENT master key — what every fresh `sealToken` stamps. The `kid`
+ * column is real and load-bearing on READ: `openToken` resolves the key BY the
+ * envelope's kid (via `keyForKid`) and fails closed on an unknown kid, so a
+ * future rotation is a forward-compatible extension — add the new key under a
+ * new kid to `keyForKid`, bump CURRENT_KID, and old rows still decrypt under
+ * their own kid until re-wrapped. TODAY only one key (`v1`) is configured via
+ * env; there is intentionally no multi-key map until a rotation actually ships.
+ */
 const CURRENT_KID = 'v1';
 
 /**
- * Resolve the 32-byte master key from env (hex). Fails LOUD — a misconfigured
- * key must never silently degrade to a weaker or absent encryption path.
+ * Resolve the 32-byte master key for a given kid (hex from env). Fails LOUD — a
+ * misconfigured key, or an envelope stamped with a kid we don't have a key for,
+ * must never silently degrade to a weaker/absent path. An unknown kid is a
+ * decrypt failure (→ caller marks needs_reauth), not a fall-through to a
+ * default key.
+ *
+ * Single-key today: only CURRENT_KID maps to GBRAIN_CONNECTOR_MASTER_KEY. To
+ * rotate later, register additional kid→env-var pairs here.
  */
-function masterKey(): Buffer {
+function keyForKid(kid: string): Buffer {
+  if (kid !== CURRENT_KID) {
+    throw new ConnectorAuthError(
+      `no master key registered for kid='${kid}' (current kid='${CURRENT_KID}')`,
+    );
+  }
   const hex = process.env[MASTER_KEY_ENV];
   if (!hex) {
     throw new ConnectorAuthError(
@@ -117,11 +136,12 @@ function masterKey(): Buffer {
 }
 
 /**
- * Seal a StoredToken into an envelope. A fresh random 12-byte IV per call (GCM
- * nonce-reuse under a fixed key is catastrophic, so never derive it).
+ * Seal a StoredToken into an envelope under the CURRENT kid. A fresh random
+ * 12-byte IV per call (GCM nonce-reuse under a fixed key is catastrophic, so
+ * never derive it).
  */
 export function sealToken(token: StoredToken): TokenEnvelope {
-  const key = masterKey();
+  const key = keyForKid(CURRENT_KID);
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const plaintext = Buffer.from(JSON.stringify(serializeToken(token)), 'utf8');
@@ -136,12 +156,13 @@ export function sealToken(token: StoredToken): TokenEnvelope {
 }
 
 /**
- * Open an envelope back to a StoredToken. Throws on any tamper / wrong key
- * (GCM auth-tag failure) — the caller treats a throw as decrypt failure and
- * marks the row needs_reauth (fail-closed).
+ * Open an envelope back to a StoredToken. Resolves the key by the envelope's own
+ * kid. Throws on an unknown kid, on any tamper, or on a wrong key (GCM auth-tag
+ * failure) — the caller treats a throw as decrypt failure and marks the row
+ * needs_reauth (fail-closed).
  */
 export function openToken(env: TokenEnvelope): StoredToken {
-  const key = masterKey();
+  const key = keyForKid(env.kid);
   const iv = Buffer.from(env.iv, 'hex');
   const ciphertext = Buffer.from(env.ciphertext, 'hex');
   const tag = Buffer.from(env.tag, 'hex');
@@ -193,18 +214,33 @@ const REFRESH_SKEW_MS = 60_000;
 // ── In-process single-flight mutex (per source:provider) ─────────────────────
 
 /**
- * On the postgres engine, `pg_advisory_xact_lock` serializes refresh across
- * separate backends (multi-VM / multi-process). On the pglite test engine the
- * advisory lock is a NO-OP for concurrency (single WASM backend; two concurrent
- * JS transactions interleave) — so an in-process async mutex is the ONLY thing
- * that gives the single-flight guarantee there. We hold the mutex on BOTH
- * engines: it's the in-process serializer everywhere, and the advisory lock is
- * the cross-process serializer on postgres. Cheap, correct, belt-and-suspenders.
+ * Two complementary serializers, by scope:
+ *
+ *   - In-process async mutex (`withInProcessLock`): the ONLY in-process guard on
+ *     REAL Postgres, where `engine.transaction()` opens a SEPARATE pooled
+ *     backend per concurrent caller — those backends genuinely interleave, so
+ *     without this mutex two same-process callers could both read, both refresh,
+ *     and double-burn the single-use refresh token. (On PGlite the engine
+ *     additionally serializes every transaction through its own internal mutex,
+ *     so there the in-process mutex is belt-and-suspenders, not load-bearing —
+ *     but it must stay, because Postgres is the real target.)
+ *
+ *   - Postgres advisory xact lock (`takeAdvisoryLock`): the CROSS-process /
+ *     cross-instance guard. `pg_advisory_xact_lock` held inside the transaction
+ *     serializes refresh across separate backends on different VMs. No-op on
+ *     PGlite (it has no separate-backend concurrency to guard).
+ *
+ * SINGLE-INSTANCE ASSUMPTION (TECH-2033): `refreshLocks` is per-Node-process.
+ * gbrain runs single-instance today, so the in-process mutex covers every
+ * in-process caller and the advisory lock covers the (currently absent)
+ * multi-instance case. A future multi-instance deployment relies on the
+ * advisory lock as the SOLE cross-instance single-flight — which is correct,
+ * but means the in-process mutex no longer sees peers on other instances.
  */
 const refreshLocks = new Map<string, Promise<unknown>>();
 
 function lockKey(sourceId: string, provider: string): string {
-  return `${sourceId} ${provider}`;
+  return `${sourceId} ${provider}`;
 }
 
 /** Run `fn` under the per-(source,provider) in-process mutex. */
@@ -223,11 +259,34 @@ async function withInProcessLock<T>(sourceId: string, provider: string, fn: () =
   }
 }
 
+/** Postgres SQLSTATE for `undefined_function` — the ONLY legitimate fail-open. */
+const SQLSTATE_UNDEFINED_FUNCTION = '42883';
+
+/** Read a SQLSTATE code off a thrown DB error (postgres.js + PGlite both set `.code`). */
+function sqlState(err: unknown): string | undefined {
+  if (err && typeof err === 'object' && 'code' in err) {
+    const c = (err as { code?: unknown }).code;
+    if (typeof c === 'string') return c;
+  }
+  return undefined;
+}
+
 /**
  * Take the postgres advisory transaction lock keyed by a stable hash of
- * source:provider. No-op on pglite (the in-process mutex covers it). The lock
- * is xact-scoped: it releases automatically when the surrounding
- * `engine.transaction()` commits or rolls back.
+ * source:provider. No-op on pglite. The lock is xact-scoped: it releases
+ * automatically when the surrounding `engine.transaction()` commits or rolls
+ * back.
+ *
+ * FAIL-CLOSED on acquisition error. `pg_advisory_xact_lock` + `hashtextextended`
+ * are core Postgres builtins, so on the real target the only errors are
+ * TRANSIENT (pooler blip, statement_timeout). Swallowing them and proceeding
+ * lock-less would let two processes both refresh and double-burn the single-use
+ * refresh token → RFC 9700 reuse-revocation kills the connection. Aborting (the
+ * caller fails loud and retries) is strictly safer than a silent double-burn.
+ * The ONLY tolerated case is SQLSTATE 42883 (undefined_function) — which cannot
+ * occur on either engine (both have the builtins), but is handled for safety so
+ * a hypothetical builtin-less server degrades to in-process-mutex-only rather
+ * than wedging all token reads.
  */
 async function takeAdvisoryLock(engine: BrainEngine, sourceId: string, provider: string): Promise<void> {
   if (engine.kind !== 'postgres') return;
@@ -236,10 +295,9 @@ async function takeAdvisoryLock(engine: BrainEngine, sourceId: string, provider:
       `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
       [`connector_tokens:${sourceId}:${provider}`],
     );
-  } catch {
-    // Fail-open on the lock acquisition itself — the in-process mutex still
-    // serializes within this process. A DB without the function (shouldn't
-    // happen on postgres) must not wedge token reads.
+  } catch (err) {
+    if (sqlState(err) === SQLSTATE_UNDEFINED_FUNCTION) return; // legitimate fail-open
+    throw err; // transient/other → abort the refresh; never proceed lock-less
   }
 }
 
@@ -278,10 +336,12 @@ function toExpiry(v: Date | string | null): Date | null {
 // ── storeToken: encrypt + persist (merge-preserving upsert) ──────────────────
 
 /**
- * Encrypt `token` and persist it for (source, provider, account). Used after a
+ * Encrypt `token` and persist it for (source, provider). Used after a
  * connect/callback code exchange or after a refresh. Re-activates the row
- * (status → 'active'). Identity is (source_id, provider, account); a re-store
- * for the same identity replaces the envelope in place.
+ * (status → 'active'). Identity is (source_id, provider) — ONE account per
+ * (source, provider); the account is stored as an attribute and the upsert
+ * replaces the envelope (and account) in place. ON CONFLICT therefore targets
+ * (source_id, provider), matching the unique constraint.
  */
 export async function storeToken(
   engine: BrainEngine,
@@ -295,7 +355,8 @@ export async function storeToken(
     `INSERT INTO connector_tokens
        (source_id, provider, account, kid, iv, ciphertext, tag, expires_at, status, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', now())
-     ON CONFLICT (source_id, provider, account) DO UPDATE SET
+     ON CONFLICT (source_id, provider) DO UPDATE SET
+       account    = EXCLUDED.account,
        kid        = EXCLUDED.kid,
        iv         = EXCLUDED.iv,
        ciphertext = EXCLUDED.ciphertext,
