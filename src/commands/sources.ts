@@ -780,6 +780,194 @@ async function runWebhookClear(engine: BrainEngine, args: string[]): Promise<voi
   console.log(`Webhook configuration cleared for source "${id}".`);
 }
 
+// ── v0.41 sources connector (TECH-2034) ─────────────────────
+//
+// Per-source SaaS-connector config lives under
+// sources.config.connectors[provider] = { enabled, secret, account }. The
+// /webhooks/:provider receiver looks a source up by
+// config.connectors[provider].account, verifies the per-source HMAC secret,
+// then redacts → table-only connector_candidates. `enabled` defaults FALSE — a
+// configured-but-not-enabled connector is inert (every webhook is rejected)
+// until `gbrain sources connector enable`. Mirrors the `sources webhook` shape.
+// (The plan's `sources <provider> set` is realized as the verb-first
+// `sources connector set --provider <p>` so it slots into the existing
+// switch dispatcher without treating arbitrary provider names as subcommands.)
+
+const PROVIDER_RE = /^[a-z][a-z0-9_-]{0,30}$/;
+
+/** Value following `flag` in argv, or undefined. */
+function flagValue(args: string[], flag: string): string | undefined {
+  return args.find((a, i) => args[i - 1] === flag);
+}
+
+/** Read sources.config.connectors as a mutable record (defensive against non-object). */
+function readConnectorsMap(cfg: Record<string, unknown>): Record<string, Record<string, unknown>> {
+  const c = cfg.connectors;
+  return c && typeof c === 'object' && !Array.isArray(c) ? (c as Record<string, Record<string, unknown>>) : {};
+}
+
+async function runConnector(engine: BrainEngine, args: string[]): Promise<void> {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'set':     return runConnectorSet(engine, rest);
+    case 'show':    return runConnectorShow(engine, rest);
+    case 'enable':  return runConnectorToggle(engine, rest, true);
+    case 'disable': return runConnectorToggle(engine, rest, false);
+    case 'clear':   return runConnectorClear(engine, rest);
+    case undefined:
+    case '--help':
+    case '-h':
+      console.log(`Usage: gbrain sources connector <subcommand> <source-id> --provider <p> [options]
+
+Subcommands:
+  set <id> --provider <p> --account <acct> [--secret VAL]   Configure (enabled=false); one-time secret reveal
+  show <id> [--provider <p>]                                List configured connectors (secret masked)
+  enable <id> --provider <p>                                Activate webhook acceptance
+  disable <id> --provider <p>                               Deactivate (config retained)
+  clear <id> --provider <p>                                 Remove the connector config`);
+      return;
+    default:
+      console.error(`Unknown connector subcommand: ${sub}`);
+      process.exit(2);
+  }
+}
+
+async function runConnectorSet(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  const provider = flagValue(args, '--provider');
+  const account = flagValue(args, '--account');
+  const explicitSecret = flagValue(args, '--secret');
+  if (!id || !provider) {
+    console.error('Usage: gbrain sources connector set <id> --provider <p> --account <acct> [--secret VAL]');
+    process.exit(2);
+  }
+  if (!PROVIDER_RE.test(provider)) {
+    console.error(`Invalid --provider "${provider}". Lowercase alnum/-/_ , 1-31 chars (e.g. "slack", "linear").`);
+    process.exit(2);
+  }
+  if (!account) {
+    console.error('--account <acct> is required — the provider workspace/account id the /webhooks/:provider receiver matches against.');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const { randomBytes } = await import('node:crypto');
+  const secret = explicitSecret ?? randomBytes(32).toString('hex');
+  const cfg = parseConfig(src.config);
+  const connectors = readConnectorsMap(cfg);
+  connectors[provider] = { enabled: false, secret, account };
+  cfg.connectors = connectors;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+
+  console.log(`Connector "${provider}" configured for source "${id}" (enabled=false):`);
+  console.log(`  account: ${account}`);
+  console.log(`  secret:  ${secret}`);
+  console.log('');
+  console.log(`--- Configure the ${provider} webhook ---`);
+  console.log(`  Payload URL: <your gbrain serve --http URL>/webhooks/${provider}`);
+  console.log(`  Secret:      ${secret}`);
+  console.log('');
+  console.log(`Activate with: gbrain sources connector enable ${id} --provider ${provider}`);
+  console.log('⚠ This secret is shown ONCE. Save it now; `connector show` will NOT display it.');
+}
+
+async function runConnectorShow(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) {
+    console.error('Usage: gbrain sources connector show <id> [--provider <p>]');
+    process.exit(2);
+  }
+  const filterProvider = flagValue(args, '--provider');
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const connectors = readConnectorsMap(parseConfig(src.config));
+  const names = Object.keys(connectors).filter((p) => !filterProvider || p === filterProvider);
+  if (names.length === 0) {
+    console.log(filterProvider
+      ? `No connector "${filterProvider}" configured for source "${id}".`
+      : `No connectors configured for source "${id}".`);
+    return;
+  }
+  console.log(`Connectors for source "${id}":`);
+  for (const p of names) {
+    const c = connectors[p] ?? {};
+    const secretSet = typeof c.secret === 'string' && (c.secret as string).length > 0;
+    console.log(`  ${p}:`);
+    console.log(`    enabled: ${c.enabled === true}`);
+    console.log(`    account: ${typeof c.account === 'string' ? c.account : '(not set)'}`);
+    console.log(`    secret:  ${secretSet ? '<set — use `connector set` to rotate>' : '(not set)'}`);
+  }
+}
+
+async function runConnectorToggle(engine: BrainEngine, args: string[], value: boolean): Promise<void> {
+  const id = args[0];
+  const provider = flagValue(args, '--provider');
+  if (!id || !provider) {
+    console.error(`Usage: gbrain sources connector ${value ? 'enable' : 'disable'} <id> --provider <p>`);
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const cfg = parseConfig(src.config);
+  const connectors = readConnectorsMap(cfg);
+  const c = connectors[provider];
+  if (!c) {
+    console.error(`No connector "${provider}" configured for source "${id}". Run: gbrain sources connector set ${id} --provider ${provider} --account <acct>`);
+    process.exit(1);
+  }
+  if (value && (typeof c.secret !== 'string' || (c.secret as string).length === 0)) {
+    console.error(`Cannot enable "${provider}": no secret configured. Re-run: gbrain sources connector set ${id} --provider ${provider} --account <acct>`);
+    process.exit(1);
+  }
+  c.enabled = value;
+  cfg.connectors = connectors;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+  console.log(`Connector "${provider}" for source "${id}" is now ${value ? `ENABLED — webhooks accepted at /webhooks/${provider}` : 'DISABLED — webhooks rejected (config retained)'}.`);
+}
+
+async function runConnectorClear(engine: BrainEngine, args: string[]): Promise<void> {
+  const id = args[0];
+  const provider = flagValue(args, '--provider');
+  if (!id || !provider) {
+    console.error('Usage: gbrain sources connector clear <id> --provider <p>');
+    process.exit(2);
+  }
+  const src = await fetchSource(engine, id);
+  if (!src) {
+    console.error(`Source "${id}" not found.`);
+    process.exit(1);
+  }
+  const cfg = parseConfig(src.config);
+  const connectors = readConnectorsMap(cfg);
+  if (!(provider in connectors)) {
+    console.log(`No connector "${provider}" configured for source "${id}" (nothing to clear).`);
+    return;
+  }
+  delete connectors[provider];
+  cfg.connectors = connectors;
+  await engine.executeRaw(
+    `UPDATE sources SET config = $1::jsonb WHERE id = $2`,
+    [JSON.stringify(cfg), id],
+  );
+  console.log(`Connector "${provider}" configuration cleared for source "${id}".`);
+}
+
 // ── v0.40 sources tracked-branch (D20) ──────────────────────
 async function runTrackedBranch(engine: BrainEngine, args: string[]): Promise<void> {
   const id = args[0];
@@ -914,6 +1102,7 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     // a superset.
     case 'status':     return runStatus(engine, rest);
     case 'webhook':    return runWebhook(engine, rest);
+    case 'connector':  return runConnector(engine, rest);
     case 'tracked-branch': return runTrackedBranch(engine, rest);
     // v0.40.3.0 contextual retrieval (from master)
     case 'set-cr-mode': return runSetCrMode(engine, rest);

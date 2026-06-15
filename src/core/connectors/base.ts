@@ -18,10 +18,12 @@ import { minimize, strip, type RawConnectorItem } from './redact.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
-/** A source row carrying this connector's per-source config under config.connectors[provider]. */
+/** A source row carrying this connector's per-source config under config.connectors[provider].
+ *  `config` may arrive as a parsed object or a JSON string (the DB column is jsonb but
+ *  some engine paths hand it back stringified — readConnectorConfig tolerates both). */
 export interface ConnectorSource {
   id: string;
-  config: Record<string, unknown>;
+  config: Record<string, unknown> | string;
 }
 
 /** Per-source connector configuration (sources.config.connectors[provider]). */
@@ -53,6 +55,10 @@ export interface NormalizedRecord {
 export interface SaaSConnector {
   /** Provider key — matches the :provider route param and config.connectors[provider]. */
   readonly provider: string;
+  /** Primary signature header name, for the receiver's pre-DB presence short-circuit
+   *  (mirrors github's `X-Hub-Signature-256` D3 gate). A request without it is rejected
+   *  401 before any source lookup, so probe traffic never touches the DB. */
+  readonly signatureHeader: string;
   /** Constant-time webhook signature verification against the per-source secret. */
   verifyWebhook(rawBody: Buffer, headers: Record<string, string | undefined>, secret: string): boolean;
   /** Extract the account/workspace id from a parsed payload, used to resolve the source. */
