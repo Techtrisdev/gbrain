@@ -93,13 +93,14 @@ function tokenFromOAuthResponse(json: Record<string, unknown>): StoredToken {
   const refreshToken = typeof json.refresh_token === 'string' ? json.refresh_token : undefined;
   const expiresInSec = typeof json.expires_in === 'number' ? json.expires_in : LINEAR_TOKEN_TTL_MS / 1000;
   const scope = typeof json.scope === 'string' ? json.scope : LINEAR_OAUTH_SCOPE;
-  const tokenType = typeof json.token_type === 'string' ? json.token_type : 'Bearer';
   return {
     accessToken,
     refreshToken,
-    expiresAt: Date.now() + expiresInSec * 1000,
+    expiresAt: new Date(Date.now() + expiresInSec * 1000),
     scope,
-    tokenType,
+    // account is set by exchangeCode (viewer query) on first connect; on refresh it is
+    // left empty and the custody layer merge-preserves the existing workspace id.
+    account: '',
   };
 }
 
@@ -123,34 +124,57 @@ async function postTokenForm(body: Record<string, string>): Promise<StoredToken>
  */
 export function registerLinearOAuth(): void {
   registerOAuthProvider(PROVIDER, {
-    authorizeUrl: ({ state, redirectUri, scope }) => {
+    authorizeUrl: (state, redirectUri) => {
       const params = new URLSearchParams({
         client_id: process.env.LINEAR_CLIENT_ID ?? '',
         redirect_uri: redirectUri,
         response_type: 'code',
-        scope: scope ?? LINEAR_OAUTH_SCOPE,
+        scope: LINEAR_OAUTH_SCOPE,
         state,
         // actor=app: the integration acts as itself, not on behalf of a user.
         actor: 'app',
       });
       return `${LINEAR_OAUTH_AUTHORIZE_URL}?${params.toString()}`;
     },
-    exchangeCode: ({ code, redirectUri }) =>
-      postTokenForm({
+    exchangeCode: async (code, redirectUri) => {
+      const token = await postTokenForm({
         grant_type: 'authorization_code',
         code,
         redirect_uri: redirectUri,
         client_id: process.env.LINEAR_CLIENT_ID ?? '',
         client_secret: process.env.LINEAR_CLIENT_SECRET ?? '',
-      }),
-    refresh: (token) =>
+      });
+      // First connect: resolve the workspace id (the token row's account attribute) via
+      // the viewer. Later refreshes leave account empty and the custody layer merge-
+      // preserves it (account is informational — getValidAccessToken keys on source+provider).
+      return { ...token, account: await linearViewerOrgId(token.accessToken) };
+    },
+    refresh: (refreshToken) =>
       postTokenForm({
         grant_type: 'refresh_token',
-        refresh_token: token.refreshToken ?? '',
+        refresh_token: refreshToken,
         client_id: process.env.LINEAR_CLIENT_ID ?? '',
         client_secret: process.env.LINEAR_CLIENT_SECRET ?? '',
       }),
   });
+}
+
+/** Resolve the Linear workspace (organization) id for the connected token — stored as the
+ *  connector_tokens.account attribute. Best-effort: returns '' on any failure (account is
+ *  informational; getValidAccessToken keys on source_id+provider, not account). */
+async function linearViewerOrgId(accessToken: string): Promise<string> {
+  try {
+    const res = await fetch(LINEAR_GRAPHQL_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ query: '{ viewer { organization { id } } }' }),
+    });
+    if (!res.ok) return '';
+    const json = (await res.json()) as { data?: { viewer?: { organization?: { id?: string } } } };
+    return json.data?.viewer?.organization?.id ?? '';
+  } catch {
+    return '';
+  }
 }
 
 async function safeText(res: Response): Promise<string> {
@@ -260,8 +284,15 @@ function ownerOf(data: Record<string, unknown>): string {
  * e.g. "Comment on <issueId>" — never any body-derived text. Only the structural
  * title/name fields (which are not free-form prose) flow into the kept summary.
  */
+/** A kept title/name is a structural LABEL, not free content — cap it. This bounds any
+ *  attempt by a holder of the per-source signing secret to smuggle prose via title/name
+ *  (strip() already masks regex-detectable PII/secrets; the cap bounds the residual surface
+ *  strip() can't see — names/addresses/deal terms). */
+const MAX_TITLE_LEN = 200;
+
 function summaryFor(type: string | undefined, data: Record<string, unknown>): string {
-  const title = str(data.title) ?? str(data.name);
+  const rawTitle = str(data.title) ?? str(data.name);
+  const title = rawTitle ? rawTitle.slice(0, MAX_TITLE_LEN) : undefined;
   const identifier = str(data.identifier);
   const label = identifier ? `${identifier}` : (type ?? 'record');
   if (title) return `${label}: ${title}`;
