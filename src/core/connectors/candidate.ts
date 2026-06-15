@@ -15,6 +15,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { strip } from './redact.ts';
 
 // ── Input type ────────────────────────────────────────────────────────────────
 
@@ -114,20 +115,28 @@ function renderCandidateMarkdown(item: ConnectorCandidateItem): string {
 function buildCandidateRow(
   item: ConnectorCandidateItem,
 ): Omit<ConnectorCandidateRow, 'id' | 'proposed_at'> {
+  // Redaction is ENFORCED HERE, at the write boundary — toRow is the last gate
+  // before connector_candidates and must not trust its callers (the framework's
+  // landRecords today, the future promotion bridge, or any other). The
+  // page-body-bound string fields — the ones that can become a served page body,
+  // a slug, or a citation — are stripped of PII/secrets. The stub is rendered
+  // FIRST and then stripped, so a secret embedded in proposed_slug cannot survive
+  // by being re-materialised into the generated markdown. strip() is idempotent,
+  // so re-stripping already-redacted input (e.g. from landRecords) is a no-op.
+  const proposedMarkdown = item.proposed_markdown ?? renderCandidateMarkdown(item);
   return {
     source_id: item.source_id,
     source_record_id: item.source_record_id,
-    version: item.version ?? '1',
+    version: strip(item.version ?? '1'),
     source_record_ids: item.source_record_ids ? [...item.source_record_ids] : [],
-    provider: item.provider ?? null,
-    proposed_slug: item.proposed_slug ?? null,
-    // Use caller-supplied markdown if provided; otherwise render a stub.
-    proposed_markdown: item.proposed_markdown ?? renderCandidateMarkdown(item),
+    provider: item.provider != null ? strip(item.provider) : null,
+    proposed_slug: item.proposed_slug != null ? strip(item.proposed_slug) : null,
+    proposed_markdown: strip(proposedMarkdown),
     confidence: item.confidence ?? null,
     redactions: item.redactions ? [...item.redactions] : [],
     expires_at: item.expires_at ?? null,
     as_of: item.as_of ?? null,
-    rationale_ref: item.rationale_ref ?? null,
+    rationale_ref: item.rationale_ref != null ? strip(item.rationale_ref) : null,
     status: 'pending',
     status_reason: null,
     acted_by: null,

@@ -21,12 +21,14 @@
  * Both are idempotent: [REDACTED] matches no PII/secret pattern, dropped fields
  * stay dropped, and a re-run of either yields byte-identical content.
  *
- * WIRING CONTRACT (hard dependency for the connector framework, TECH-2034): this is
- * a primitive — it is NOT yet called by candidate.ts::toRow. The framework MUST run
- * strip()/minimize() over EVERY field that flows into a candidate, including
- * `proposed_markdown` (which can become the served page body) and every metadata
- * value, BEFORE toRow. A wiring that strips summary/metadata but forgets
- * proposed_markdown bypasses this module entirely.
+ * WIRING CONTRACT (TECH-2034): redaction of candidate OUTPUT fields is ENFORCED at
+ * the single write boundary — candidate.ts::toRow (via buildCandidateRow) strip()s
+ * proposed_markdown (incl. the generated stub), proposed_slug, rationale_ref,
+ * provider, and version before the INSERT. Every caller (the connector framework's
+ * landRecords, the future promotion bridge) therefore inherits redaction and cannot
+ * smuggle an un-redacted output field past it. landRecords additionally minimize()s
+ * the inbound record (drops bodies, allowlists metadata) before handing it on. Do NOT
+ * reintroduce a pre-toRow strip in landRecords — toRow is the single, authoritative gate.
  *
  * Out of scope (later): NER-model enrichment, plus the regex-uncoverable shapes
  * documented on strip().

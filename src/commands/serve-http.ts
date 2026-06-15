@@ -43,6 +43,7 @@ import {
   type IngestionContentType,
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
+import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -1928,6 +1929,139 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
         res.status(500).json({ error: 'queue_submission_failed', message: msg });
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // POST /webhooks/:provider — generic SaaS-connector ingestion (TECH-2034)
+  // ---------------------------------------------------------------------------
+  // The provider-agnostic sibling of /webhooks/github. A registered
+  // SaaSConnector (src/core/connectors/) verifies the signature and normalizes
+  // the payload; the framework's landRecords() redacts and writes table-only
+  // connector_candidates rows — NEVER pages. Registered AFTER /webhooks/github
+  // so that specific route still wins; an empty registry (no connectors wired
+  // yet, as in this framework-only ticket) returns 404 for every provider.
+  //
+  // Cheap in-memory rejections happen BEFORE the source-lookup DB query (mirrors
+  // github's D3 pre-DB short-circuit): unknown provider → 404, missing signature
+  // header → 401, malformed body → 400, unresolvable account → 400. The full
+  // HTTP path is covered by a DATABASE_URL-gated E2E
+  // (test/e2e/webhook-connector.test.ts) filed as a follow-up — matching the
+  // /webhooks/github precedent. The framework primitives (HMAC verify, config
+  // read, the landRecords redaction choke-point) are unit-pinned in
+  // test/connector-base.test.ts.
+  // ---------------------------------------------------------------------------
+  const connectorWebhookLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 60,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'rate_limit_exceeded', message: 'too many connector webhook requests' },
+  });
+
+  app.post(
+    '/webhooks/:provider',
+    connectorWebhookLimiter,
+    express.raw({ type: '*/*', limit: '1mb' }),
+    async (req: Request, res: Response) => {
+      // (1) Resolve the connector from the in-memory registry. Unknown provider
+      //     ends here — no DB touched. (req.params is typed string|string[]; a
+      //     single :provider segment is always a string at runtime.)
+      const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+      const connector = getConnector(provider);
+      if (!connector) {
+        res.status(404).json({ error: 'unknown_provider', provider });
+        return;
+      }
+
+      // (2) Pre-DB signature-presence short-circuit (D3). Probe traffic without
+      //     the provider's signature header never reaches the source lookup.
+      const sigHeader = req.header(connector.signatureHeader);
+      if (!sigHeader) {
+        res.status(401).json({ error: 'missing_signature', message: `${connector.signatureHeader} header is required` });
+        return;
+      }
+
+      const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body), 'utf8');
+      if (payload.length === 0) {
+        res.status(400).json({ error: 'empty_body' });
+        return;
+      }
+
+      // (3) Parse + resolve the account (both in-memory) before any DB query.
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(payload.toString('utf8'));
+      } catch {
+        res.status(400).json({ error: 'malformed_json' });
+        return;
+      }
+      const account = connector.accountFromPayload(parsed);
+      if (!account) {
+        res.status(400).json({ error: 'missing_account', message: 'could not resolve a source account from the payload' });
+        return;
+      }
+
+      // (4) Source lookup by config.connectors[provider].account. NO LIMIT 1:
+      //     provider+account is not guaranteed unique across sources, and silently
+      //     picking one (non-deterministic without ORDER BY) would misroute ingested
+      //     data into the wrong source. >1 match → fail closed with 409.
+      let rows: { id: string; config: Record<string, unknown> | string }[];
+      try {
+        rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string }>(
+          `SELECT id, config FROM sources WHERE config->'connectors'->$1->>'account' = $2`,
+          [provider, account],
+        );
+      } catch (err) {
+        console.error('connector webhook: source lookup error:', err);
+        res.status(500).json({ error: 'lookup_failed' });
+        return;
+      }
+      if (rows.length > 1) {
+        console.error(`connector webhook: ambiguous account '${account}' for provider '${provider}' — ${rows.length} sources claim it`);
+        res.status(409).json({ error: 'ambiguous_account', message: `multiple sources claim this ${provider} account; resolve with 'gbrain sources connector clear'` });
+        return;
+      }
+      const source = rows[0] ?? null;
+      if (!source) {
+        res.status(404).json({ error: 'unknown_account', provider, account });
+        return;
+      }
+
+      // (5) Per-source connector config: must be enabled and carry a secret.
+      const connCfg = readConnectorConfig({ id: source.id, config: source.config }, provider);
+      // Strict `=== true`: a hand-edited/migrated config with a truthy non-boolean
+      // enabled (e.g. the string "false") must NOT accept webhooks — fail closed.
+      if (!connCfg || connCfg.enabled !== true) {
+        res.status(404).json({ error: 'connector_disabled', message: `connector '${provider}' is not enabled for source '${source.id}'` });
+        return;
+      }
+      if (!connCfg.secret || typeof connCfg.secret !== 'string') {
+        res.status(401).json({ error: 'connector_not_configured', message: `Run: gbrain sources connector set ${source.id} --provider ${provider}` });
+        return;
+      }
+
+      // (6) Provider-specific constant-time signature verification. Node lowercases
+      //     all header keys; connectors must read the signature header by its
+      //     lowercase name (documented on SaaSConnector.verifyWebhook).
+      const flatHeaders: Record<string, string | undefined> = {};
+      for (const [k, v] of Object.entries(req.headers)) flatHeaders[k] = Array.isArray(v) ? v[0] : v;
+      if (!connector.verifyWebhook(payload, flatHeaders, connCfg.secret)) {
+        res.status(401).json({ error: 'signature_mismatch' });
+        return;
+      }
+
+      // (7) Normalize → redact → table-only candidate. landRecords is the single
+      //     redaction choke point; it NEVER writes a page. 202 fast-ack.
+      try {
+        const records = connector.normalize(parsed);
+        const result = await landRecords(engine, source.id, connector, records);
+        res.status(202).json({ status: 'accepted', source_id: source.id, provider, written: result.written, total: result.total });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('connector webhook: landing error:', msg);
+        res.status(500).json({ error: 'landing_failed', message: msg });
       }
     },
   );
