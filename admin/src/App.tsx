@@ -4,13 +4,17 @@ import { DashboardPage } from './pages/Dashboard';
 import { AgentsPage } from './pages/Agents';
 import { RequestLogPage } from './pages/RequestLog';
 import { CalibrationPage } from './pages/Calibration';
+import { ConnectorsPage } from './pages/Connectors';
+import { ReviewQueuePage } from './pages/ReviewQueue';
 import { api } from './api';
 
-type Page = 'login' | 'dashboard' | 'agents' | 'log' | 'calibration';
+type Page = 'login' | 'dashboard' | 'agents' | 'log' | 'calibration' | 'connectors' | 'review';
+
+const PAGES: Page[] = ['login', 'dashboard', 'agents', 'log', 'calibration', 'connectors', 'review'];
 
 function getPage(): Page {
   const hash = window.location.hash.replace('#', '') || 'dashboard';
-  if (['login', 'dashboard', 'agents', 'log', 'calibration'].includes(hash)) return hash as Page;
+  if (PAGES.includes(hash as Page)) return hash as Page;
   return 'dashboard';
 }
 
@@ -57,6 +61,10 @@ export function App() {
              onClick={() => navigate('log')}>Request Log</a>
           <a className={`nav-item ${page === 'calibration' ? 'active' : ''}`}
              onClick={() => navigate('calibration')}>Calibration</a>
+          <a className={`nav-item ${page === 'connectors' ? 'active' : ''}`}
+             onClick={() => navigate('connectors')}>Connectors</a>
+          <a className={`nav-item ${page === 'review' ? 'active' : ''}`}
+             onClick={() => navigate('review')}>Review Queue</a>
         </div>
         <div style={{ marginTop: 'auto', padding: '16px 12px', borderTop: '1px solid var(--border)' }}>
           <button
@@ -82,6 +90,8 @@ export function App() {
         {page === 'agents' && <AgentsPage />}
         {page === 'log' && <RequestLogPage />}
         {page === 'calibration' && <CalibrationPage />}
+        {page === 'connectors' && <ConnectorsPage />}
+        {page === 'review' && <ReviewQueuePage />}
       </main>
     </div>
   );
