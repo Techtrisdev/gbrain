@@ -45,6 +45,12 @@ import {
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
+import {
+  calendarConnector,
+  incrementalSync,
+  CHANNEL_ID_HEADER,
+  RESOURCE_STATE_HEADER,
+} from '../core/connectors/calendar.ts';
 // Side-effect import: registers all SaaS connectors into the in-memory registry the
 // /webhooks/:provider receiver resolves against (TECH-2035). Without this the registry
 // is empty and every provider 404s.
@@ -1973,6 +1979,124 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
         res.status(500).json({ error: 'queue_submission_failed', message: msg });
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // POST /webhooks/calendar — DEDICATED Google Calendar push receiver (TECH-2040)
+  // ---------------------------------------------------------------------------
+  // Google Calendar push (events.watch) is STRUCTURALLY UNLIKE the HMAC-signed
+  // webhooks the generic /webhooks/:provider receiver handles, so it needs its
+  // own route — registered BEFORE /webhooks/:provider so this specific path wins
+  // (Express matches in registration order; `:provider` would otherwise capture
+  // 'calendar').
+  //
+  // The push body is EMPTY; the channel is identified ENTIRELY by headers:
+  //   X-Goog-Channel-ID    — resolves the source (stored on watch creation)
+  //   X-Goog-Channel-Token — the per-channel auth token (constant-time-compared
+  //                          to config.connectors.calendar.secret). This is WEAKER
+  //                          than HMAC: a static bearer string with no body binding,
+  //                          so a leaked token lets an attacker forge a "changed"
+  //                          ping (blast radius bounded — it only causes us to
+  //                          re-poll the real Google API with OUR token, never to
+  //                          inject data). Documented on calendarConnector.verifyWebhook.
+  //   X-Goog-Resource-State— 'sync' (channel handshake, ack-only) | 'exists' (poll)
+  //
+  // On 'exists' we run incrementalSync (events.list with the stored syncToken; a
+  // 410 Gone drops the token + full-resyncs). Each event lands as a METADATA-ONLY
+  // candidate via landRecords (description/notes stripped — AC3). The source is
+  // resolved by channel-id, NOT by a payload account (there is no payload).
+  // ---------------------------------------------------------------------------
+  const calendarWebhookLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 60,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'rate_limit_exceeded', message: 'too many calendar webhook requests' },
+  });
+
+  app.post(
+    '/webhooks/calendar',
+    calendarWebhookLimiter,
+    // Consume (and discard) the empty body so downstream middleware doesn't hang.
+    express.raw({ type: '*/*', limit: '64kb' }),
+    async (req: Request, res: Response) => {
+      // (1) Pre-DB short-circuit: a delivery without the channel-id / token headers
+      //     is not a real Google push. Reject before any source lookup.
+      const channelId = req.header(CHANNEL_ID_HEADER);
+      const channelToken = req.header(calendarConnector.signatureHeader);
+      if (!channelId) {
+        res.status(400).json({ error: 'missing_channel_id', message: `${CHANNEL_ID_HEADER} header is required` });
+        return;
+      }
+      if (!channelToken) {
+        res.status(401).json({ error: 'missing_channel_token', message: `${calendarConnector.signatureHeader} header is required` });
+        return;
+      }
+
+      // (2) Resolve the source by the stored channel id. NO LIMIT 1: a channel id
+      //     should be unique, but >1 match is a config error — fail closed (409)
+      //     rather than misroute (mirrors the generic receiver's account guard).
+      let rows: { id: string; config: Record<string, unknown> | string }[];
+      try {
+        rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string }>(
+          `SELECT id, config FROM sources WHERE config->'connectors'->'calendar'->>'channel_id' = $1`,
+          [channelId],
+        );
+      } catch (err) {
+        console.error('calendar webhook: source lookup error:', err);
+        res.status(500).json({ error: 'lookup_failed' });
+        return;
+      }
+      if (rows.length > 1) {
+        console.error(`calendar webhook: ambiguous channel_id '${channelId}' — ${rows.length} sources claim it`);
+        res.status(409).json({ error: 'ambiguous_channel', message: 'multiple sources claim this calendar channel' });
+        return;
+      }
+      const source = rows[0] ?? null;
+      if (!source) {
+        res.status(404).json({ error: 'unknown_channel', channel_id: channelId });
+        return;
+      }
+
+      // (3) Per-source config must be enabled and carry the channel secret.
+      const connCfg = readConnectorConfig({ id: source.id, config: source.config }, 'calendar');
+      if (!connCfg || connCfg.enabled !== true) {
+        res.status(404).json({ error: 'connector_disabled', message: `calendar connector is not enabled for source '${source.id}'` });
+        return;
+      }
+      if (!connCfg.secret || typeof connCfg.secret !== 'string') {
+        res.status(401).json({ error: 'connector_not_configured', message: `Run: gbrain sources connector set ${source.id} --provider calendar` });
+        return;
+      }
+
+      // (4) Constant-time channel-token compare (the only auth — no HMAC).
+      const flatHeaders: Record<string, string | undefined> = {};
+      for (const [k, v] of Object.entries(req.headers)) flatHeaders[k] = Array.isArray(v) ? v[0] : v;
+      // verifyWebhook ignores the (empty) body and compares X-Goog-Channel-Token.
+      if (!calendarConnector.verifyWebhook(Buffer.alloc(0), flatHeaders, connCfg.secret)) {
+        res.status(401).json({ error: 'channel_token_mismatch' });
+        return;
+      }
+
+      // (5) Resource-state routing. The first delivery after watch creation is a
+      //     'sync' handshake — ack it without polling. Only 'exists' means a change.
+      const resourceState = req.header(RESOURCE_STATE_HEADER) ?? '';
+      if (resourceState !== 'exists') {
+        res.status(202).json({ status: 'ignored', reason: `resource_state=${resourceState || '(missing)'}` });
+        return;
+      }
+
+      // (6) Incremental sync (events.list with the stored syncToken; 410 → full
+      //     resync). Each event lands as a metadata-only candidate. 202 fast-ack.
+      try {
+        const landed = await incrementalSync(engine, { id: source.id, config: source.config });
+        res.status(202).json({ status: 'accepted', source_id: source.id, provider: 'calendar', written: landed });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('calendar webhook: sync error:', msg);
+        res.status(500).json({ error: 'sync_failed', message: msg });
       }
     },
   );
