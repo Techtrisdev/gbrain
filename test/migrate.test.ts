@@ -2138,4 +2138,3 @@ describe('migrate v89 — round-trip on PGLite', () => {
     expect(LATEST_VERSION).toBeGreaterThanOrEqual(89);
   });
 });
-

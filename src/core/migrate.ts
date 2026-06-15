@@ -4257,6 +4257,48 @@ export const MIGRATIONS: Migration[] = [
         WHERE config ? 'github_repo';
     `,
   },
+  {
+    version: 93,
+    name: 'connector_candidates_table',
+    // TECH-2031: table-only connector output store.
+    // Candidates are never written as pages/content_chunks rows, so they
+    // are structurally invisible to every search path.
+    //
+    // RLS is NOT included here — Postgres RLS is auto-enabled by the v35
+    // event trigger (which fires on CREATE TABLE); PGLite has no RLS engine.
+    //
+    // idempotent: uses CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS connector_candidates (
+        id                 BIGSERIAL     PRIMARY KEY,
+        source_id          TEXT          NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        source_record_id   TEXT          NOT NULL,
+        version            TEXT          NOT NULL DEFAULT '1',
+        source_record_ids  TEXT[]        NOT NULL DEFAULT '{}',
+        provider           TEXT,
+        proposed_slug      TEXT,
+        proposed_markdown  TEXT,
+        confidence         REAL,
+        redactions         JSONB         NOT NULL DEFAULT '[]'::jsonb,
+        expires_at         TIMESTAMPTZ,
+        as_of              TIMESTAMPTZ,
+        rationale_ref      TEXT,
+        status             TEXT          NOT NULL DEFAULT 'pending'
+                                         CHECK (status IN ('pending','accepted','rejected')),
+        status_reason      TEXT,
+        acted_by           TEXT,
+        acted_at           TIMESTAMPTZ,
+        superseded_by      BIGINT        REFERENCES connector_candidates(id) ON DELETE SET NULL,
+        proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
+        CONSTRAINT connector_candidates_source_record_version_unique
+          UNIQUE (source_id, source_record_id, version)
+      );
+
+      CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
+        ON connector_candidates (source_id, status, proposed_at DESC);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

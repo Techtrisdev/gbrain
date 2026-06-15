@@ -1132,6 +1132,63 @@ CREATE TABLE IF NOT EXISTS think_ab_results (
 CREATE INDEX IF NOT EXISTS think_ab_results_recent_idx
   ON think_ab_results (source_id, ran_at DESC);
 
+-- ============================================================
+-- connector_candidates (TECH-2031): table-only connector output store.
+-- Candidates are never written as pages/content_chunks rows, so they
+-- are structurally invisible to every search path (searchKeyword,
+-- searchVector, searchKeywordChunks) which only query pages.
+--
+-- Idempotency: UNIQUE (source_id, source_record_id, version) so the
+-- builder's ON CONFLICT DO NOTHING is safe to call repeatedly.
+--
+-- Lifecycle columns (status, acted_by, acted_at, superseded_by) exist
+-- for a future promotion bridge; no promotion logic ships here.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS connector_candidates (
+  id                 BIGSERIAL     PRIMARY KEY,
+  -- source scoping
+  source_id          TEXT          NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  -- upstream record identity (singular idempotency anchor)
+  source_record_id   TEXT          NOT NULL,
+  -- upstream record version (string; '1', '2', ISO date, etc.)
+  version            TEXT          NOT NULL DEFAULT '1',
+  -- plural: the full set of upstream records this candidate summarizes
+  source_record_ids  TEXT[]        NOT NULL DEFAULT '{}',
+  -- provider that produced this candidate (e.g. 'crunchbase', 'apollo')
+  provider           TEXT,
+  -- proposed brain slug (never inserted into pages)
+  proposed_slug      TEXT,
+  -- proposed markdown body (table-only; never chunked)
+  proposed_markdown  TEXT,
+  -- LLM-assigned confidence 0..1
+  confidence         REAL,
+  -- private fields / PII tags pending redaction (JSONB array of objects)
+  redactions         JSONB         NOT NULL DEFAULT '[]'::jsonb,
+  -- TTL: when the candidate should be considered stale
+  expires_at         TIMESTAMPTZ,
+  -- as-of timestamp for the upstream data
+  as_of              TIMESTAMPTZ,
+  -- reference to a rationale document slug or URL
+  rationale_ref      TEXT,
+  -- review workflow
+  status             TEXT          NOT NULL DEFAULT 'pending'
+                                   CHECK (status IN ('pending','accepted','rejected')),
+  status_reason      TEXT,
+  acted_by           TEXT,
+  acted_at           TIMESTAMPTZ,
+  -- link to the row that supersedes this one after promotion
+  superseded_by      BIGINT        REFERENCES connector_candidates(id) ON DELETE SET NULL,
+  -- audit
+  proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
+  -- idempotency key: same upstream record + version never produces two rows
+  CONSTRAINT connector_candidates_source_record_version_unique
+    UNIQUE (source_id, source_record_id, version)
+);
+
+-- hot path: list pending candidates for a source, newest first
+CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
+  ON connector_candidates (source_id, status, proposed_at DESC);
+
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS $$
 BEGIN
@@ -1197,6 +1254,8 @@ BEGIN
     ALTER TABLE oauth_clients ENABLE ROW LEVEL SECURITY;
     ALTER TABLE oauth_tokens ENABLE ROW LEVEL SECURITY;
     ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
+    -- TECH-2031 connector candidates store
+    ALTER TABLE connector_candidates ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;
