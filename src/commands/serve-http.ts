@@ -2436,8 +2436,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.post('/admin/api/candidates/:id/reject', requireAdmin, express.json(), async (req: Request, res: Response) => {
     const id = parseCandidateId(req, res);
     if (id === null) return;
+    // AC3: a rejection is an audit record — it MUST carry a reason. Enforce server-side
+    // (not just in the UI) so the agent-direct path can't reject without one.
     const reasonRaw = (req.body as Record<string, unknown>)?.reason;
-    const reason = typeof reasonRaw === 'string' ? reasonRaw.slice(0, 2000) : null;
+    const reason = typeof reasonRaw === 'string' ? reasonRaw.trim().slice(0, 2000) : '';
+    if (!reason) {
+      res.status(400).json({ error: 'reason_required', message: 'a rejection reason is required' });
+      return;
+    }
     try {
       const row = await rejectCandidate(engine, id, adminActor(req), reason);
       if (!row) {
@@ -2547,10 +2553,36 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.status(400).json({ error: 'sourceId required' });
       return;
     }
-    const applied: string[] = [];
+    // Decide which fields to write BEFORE any DB work.
+    const wantsEnabled = typeof body.enabled === 'boolean';
+    const wantsSelection = body.selection !== undefined && body.selection !== null;
+    const wantsPolicy = body.policy !== undefined && body.policy !== null;
+    if (!wantsEnabled && !wantsSelection && !wantsPolicy) {
+      res.status(400).json({ error: 'no_fields', message: 'provide at least one of enabled, selection, policy' });
+      return;
+    }
     try {
+      const [src] = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE id = $1`, [sourceId]);
+      if (!src) {
+        res.status(404).json({ error: 'unknown_source', message: `no source '${sourceId}'` });
+        return;
+      }
+      // jsonb_set(create_missing) only creates the FINAL path element — an absent intermediate
+      // parent (config has no `connectors`, or no `connectors.<provider>`) makes every leaf write
+      // a silent no-op that still returns 200 (the TECH-2036 review's F1). Pre-create both parents
+      // with a COALESCE-merge so existing siblings (e.g. a webhook secret) are preserved, then the
+      // surgical leaf writes below actually persist.
+      await engine.executeRaw(
+        `UPDATE sources SET config = jsonb_set(
+           jsonb_set(config, '{connectors}', COALESCE(config->'connectors', '{}'::jsonb), true),
+           $2::text[], COALESCE(config #> $2, '{}'::jsonb), true
+         ) WHERE id = $1`,
+        [sourceId, ['connectors', provider]],
+      );
+
+      const applied: string[] = [];
       // enabled — typed boolean via to_jsonb($::boolean) (a plain bool bind, no JSON text).
-      if (typeof body.enabled === 'boolean') {
+      if (wantsEnabled) {
         await engine.executeRaw(
           `UPDATE sources SET config = jsonb_set(config, $2::text[], to_jsonb($3::boolean), true) WHERE id = $1`,
           [sourceId, ['connectors', provider, 'enabled'], body.enabled],
@@ -2569,10 +2601,6 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           );
           applied.push(key);
         }
-      }
-      if (applied.length === 0) {
-        res.status(400).json({ error: 'no_fields', message: 'provide at least one of enabled, selection, policy' });
-        return;
       }
       res.json({ status: 'updated', source_id: sourceId, provider, fields: applied });
     } catch (err) {

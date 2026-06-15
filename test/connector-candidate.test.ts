@@ -431,4 +431,35 @@ describe('connector config jsonb_set (route SQL primitive)', () => {
     expect(cfg.connectors.linear.selection).toEqual({ labels: ['bug', 'feature'] });
     expect(cfg.connectors.linear.account).toBe('acme'); // sibling preserved across both writes
   });
+
+  test('F1: config parent-ensure makes a leaf write persist on a source with NO connectors key', async () => {
+    // Without the parent-ensure, jsonb_set on a deep path is a SILENT no-op when the
+    // intermediate `connectors` object is absent — the route would return 200 'updated'
+    // having written nothing. Prove the COALESCE-merge pre-create fixes it, and that a
+    // pre-existing sibling (a secret) survives.
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config`,
+      ['src-fresh', 'fresh source', { webhook_secret: 'TOPSECRET' }],
+    );
+    // The route's parent-ensure pre-write (creates connectors + connectors.slack as {}).
+    await engine.executeRaw(
+      `UPDATE sources SET config = jsonb_set(
+         jsonb_set(config, '{connectors}', COALESCE(config->'connectors', '{}'::jsonb), true),
+         $2::text[], COALESCE(config #> $2, '{}'::jsonb), true
+       ) WHERE id = $1`,
+      ['src-fresh', ['connectors', 'slack']],
+    );
+    // The leaf write now persists (parent exists).
+    await engine.executeRaw(
+      `UPDATE sources SET config = jsonb_set(config, $2::text[], to_jsonb($3::boolean), true) WHERE id = $1`,
+      ['src-fresh', ['connectors', 'slack', 'enabled'], true],
+    );
+    const [row] = await engine.executeRaw<{ config: Record<string, unknown> | string }>(
+      `SELECT config FROM sources WHERE id = 'src-fresh'`,
+    );
+    const cfg = (typeof row.config === 'string' ? JSON.parse(row.config) : row.config) as any;
+    expect(cfg.connectors.slack.enabled).toBe(true); // the leaf actually persisted
+    expect(cfg.webhook_secret).toBe('TOPSECRET'); // pre-existing sibling preserved
+  });
 });
