@@ -382,3 +382,53 @@ describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retri
     expect(res.row).toBeNull();
   });
 });
+
+// ─────────────────────────────────────────────────────────────────
+// Connector-management route SQL (TECH-2036): jsonb_set path binding
+// Proves the exact statements /admin/api/connectors/:provider/{disconnect,config}
+// run — a JS array bound as $::text[] for the jsonb_set path, to_jsonb($::boolean)
+// for enabled, and $::jsonb for an object — work against the engine and are surgical
+// (a sibling key like the webhook secret is preserved, never clobbered).
+// ─────────────────────────────────────────────────────────────────
+describe('connector config jsonb_set (route SQL primitive)', () => {
+  beforeEach(async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config`,
+      ['src-cfg', 'cfg source', { connectors: { linear: { enabled: true, account: 'acme', secret: 'sek' } } }],
+    );
+  });
+
+  const readCfg = async () => {
+    const [row] = await engine.executeRaw<{ config: Record<string, unknown> | string }>(
+      `SELECT config FROM sources WHERE id = 'src-cfg'`,
+    );
+    return (typeof row.config === 'string' ? JSON.parse(row.config) : row.config) as any;
+  };
+
+  test('disconnect: jsonb_set on a text[]-bound path disables in place, preserving siblings', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET config = jsonb_set(config, $2::text[], 'false'::jsonb, true) WHERE id = $1`,
+      ['src-cfg', ['connectors', 'linear', 'enabled']],
+    );
+    const cfg = await readCfg();
+    expect(cfg.connectors.linear.enabled).toBe(false);
+    expect(cfg.connectors.linear.secret).toBe('sek'); // surgical — secret untouched
+    expect(cfg.connectors.linear.account).toBe('acme');
+  });
+
+  test('config: to_jsonb($::boolean) for enabled + $::jsonb for a selection object', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET config = jsonb_set(config, $2::text[], to_jsonb($3::boolean), true) WHERE id = $1`,
+      ['src-cfg', ['connectors', 'linear', 'enabled'], false],
+    );
+    await engine.executeRaw(
+      `UPDATE sources SET config = jsonb_set(config, $2::text[], $3::jsonb, true) WHERE id = $1`,
+      ['src-cfg', ['connectors', 'linear', 'selection'], { labels: ['bug', 'feature'] }],
+    );
+    const cfg = await readCfg();
+    expect(cfg.connectors.linear.enabled).toBe(false);
+    expect(cfg.connectors.linear.selection).toEqual({ labels: ['bug', 'feature'] });
+    expect(cfg.connectors.linear.account).toBe('acme'); // sibling preserved across both writes
+  });
+});
