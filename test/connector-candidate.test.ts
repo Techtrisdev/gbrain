@@ -184,13 +184,23 @@ describe('toRow: candidate is absent from all search paths', () => {
     const results = await engine.searchKeyword(DISTINCTIVE_TEXT, { sourceId: 'default' });
     const slugs = results.map(r => r.slug);
     expect(slugs).not.toContain(PROPOSED_SLUG);
+    // Also verify no result chunk_text contains the distinctive text
+    const chunks_b = results.map(r => r.chunk_text ?? '');
+    for (const chunk of chunks_b) {
+      expect(chunk).not.toContain(DISTINCTIVE_TEXT);
+    }
   });
 
   test('(c) broad federated-array search does not return the candidate', async () => {
-    // sourceIds: [] means "search all federated sources" — the broadest path.
+    // sourceIds: ['default'] searches all federated sources — the broadest path.
     const results = await engine.searchKeyword(DISTINCTIVE_TEXT, { sourceIds: ['default'] });
     const slugs = results.map(r => r.slug);
     expect(slugs).not.toContain(PROPOSED_SLUG);
+    // Also verify no result chunk_text contains the distinctive text
+    const chunks_c = results.map(r => r.chunk_text ?? '');
+    for (const chunk of chunks_c) {
+      expect(chunk).not.toContain(DISTINCTIVE_TEXT);
+    }
   });
 
   test('(d) federated-client-shaped search (sourceIds array) does not return the candidate', async () => {
