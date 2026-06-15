@@ -243,8 +243,16 @@ function lockKey(sourceId: string, provider: string): string {
   return `${sourceId} ${provider}`;
 }
 
-/** Run `fn` under the per-(source,provider) in-process mutex. */
-async function withInProcessLock<T>(sourceId: string, provider: string, fn: () => Promise<T>): Promise<T> {
+/**
+ * Run `fn` under the per-(source,provider) in-process mutex. Exported (TECH-2040) so
+ * connectors whose inbound path does a read-modify-write of source config — e.g. the
+ * Calendar connector's incremental-sync syncToken cursor — can serialize it under the
+ * SAME single-flight guard `getValidAccessToken` uses, preventing two concurrent pushes
+ * for one source from regressing the cursor. SINGLE-INSTANCE today (see refreshLocks
+ * note); a future multi-instance deployment must move config-cursor advances behind the
+ * Postgres advisory lock for cross-instance safety.
+ */
+export async function withInProcessLock<T>(sourceId: string, provider: string, fn: () => Promise<T>): Promise<T> {
   const key = lockKey(sourceId, provider);
   const prior = refreshLocks.get(key) ?? Promise.resolve();
   // Chain onto the prior holder; swallow its rejection so one failure doesn't
