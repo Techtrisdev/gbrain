@@ -46,10 +46,13 @@ const REDACTED = '[REDACTED]';
 const URL_USERINFO_RE = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s:@/]+:[^\s@/]+@/g;
 
 /**
- * Non-Bearer `Authorization:` schemes (Basic/Token/ApiKey/Digest/...). Bearer is
- * already covered by scrubPii. Keeps the header + scheme literal, masks the credential.
+ * `Authorization:` headers, anchored to the KNOWN scheme set. Bearer is already
+ * covered by scrubPii (included here only as a harmless backstop). Keeps the header +
+ * scheme literal, masks the credential. Anchoring to real schemes (not any word) so
+ * benign prose like "Authorization: Manager approval needed" is NOT over-redacted.
  */
-const AUTH_SCHEME_RE = /\b([Aa]uthorization:\s*[A-Za-z][A-Za-z-]*\s+)[A-Za-z0-9._~+/=-]{6,}=*/g;
+const AUTH_SCHEME_RE =
+  /\b(authorization:\s*(?:basic|bearer|token|apikey|digest|negotiate|ntlm)\s+)[A-Za-z0-9._~+/=-]{6,}=*/gi;
 
 /**
  * A secret value assigned to a secret-named key — AWS secret access key, Azure

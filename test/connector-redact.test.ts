@@ -129,6 +129,12 @@ describe('strip — hardened secret coverage (review fixes)', () => {
     expect(strip('Authorization: token abcdef0123456789')).not.toContain('abcdef0123456789');
   });
 
+  test('Authorization prose (capitalized non-scheme words) is NOT over-redacted', () => {
+    // Anchored to the known scheme set, so approval-comment phrasing survives intact.
+    expect(strip('Authorization: Manager approval needed first')).toBe('Authorization: Manager approval needed first');
+    expect(strip('Authorization: Pending review by the security team')).toBe('Authorization: Pending review by the security team');
+  });
+
   test('Google OAuth client secret + Azure AccountKey are masked', () => {
     expect(strip('client GOCSPX-' + 'a'.repeat(28))).toContain('[REDACTED]');
     expect(strip('AccountKey=' + 'a'.repeat(40) + '==;')).toContain('[REDACTED]');
