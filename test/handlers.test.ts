@@ -41,10 +41,37 @@ describe('registerBuiltinHandlers', () => {
     expect(names).toContain('extract');
     expect(names).toContain('backlinks');
     expect(names).toContain('autopilot-cycle');
+    // TECH-2038 — connector_poll
+    expect(names).toContain('connector_poll');
   });
 
   test('total handler count includes all 7 names', () => {
     expect(worker.registeredNames.length).toBeGreaterThanOrEqual(7);
+  });
+});
+
+describe('connector_poll handler — TECH-2038 param validation (REVIEW#3)', () => {
+  function callHandler(data: Record<string, unknown>) {
+    const handler = (worker as any).handlers.get('connector_poll');
+    expect(handler).toBeDefined();
+    return handler({ data, signal: { aborted: false } as any, job: { id: 1, name: 'connector_poll' } as any });
+  }
+
+  test('missing sourceId/provider throws (loud)', async () => {
+    await expect(callHandler({ provider: 'linear' })).rejects.toThrow(/requires string sourceId/);
+    await expect(callHandler({ sourceId: 's1' })).rejects.toThrow(/requires string sourceId/);
+  });
+
+  test('seenRecordIds with a non-string element throws — never silently shrinks the set', async () => {
+    await expect(
+      callHandler({ sourceId: 's1', provider: 'linear', seenRecordIds: ['rec-1', 42, 'rec-3'] }),
+    ).rejects.toThrow(/seenRecordIds must be an array of strings/);
+  });
+
+  test('unknown source is a clean skip (no throw) for a well-formed payload', async () => {
+    // 'gone' source does not exist in the fresh PGLite brain → source_not_found skip.
+    const result = await callHandler({ sourceId: 'gone-source-xyz', provider: 'linear' });
+    expect((result as any).skippedReason).toBe('source_not_found');
   });
 });
 

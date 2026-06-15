@@ -184,6 +184,10 @@ HANDLER TYPES (built in)
   extract           Extract links + timeline entries; '{"mode":"all"}'
   backlinks         Check or fix back-links; '{"action":"fix"}'
   autopilot-cycle   One autopilot pass (sync+extract+embed+backlinks)
+  connector_poll    Poll one SaaS connector source. Params:
+                    {sourceId, provider, seenRecordIds?}. Resolves the
+                    connector by provider, calls backfill (lands candidates),
+                    and tombstones vanished records when seenRecordIds is given.
   shell             Run a command or argv. Requires GBRAIN_ALLOW_SHELL_JOBS=1
                     on the worker. Params: {cmd?, argv?, cwd, env?}.
                     See: docs/guides/minions-shell-jobs.md
@@ -1437,7 +1441,45 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     return await makeEmbedBackfillHandler(engine)(job);
   });
 
-  process.stderr.write('[minion worker] brain-health-100 handlers registered (11 ops, 3 protected) + embed-backfill (v0.40)\n');
+  // TECH-2038 — connector_poll: poll one SaaS connector source. Resolves the
+  // connector by provider, calls backfill (lands candidates via the framework's
+  // landRecords redaction path), and tombstones vanished records when the caller
+  // supplies seenRecordIds. NOT in PROTECTED_JOB_NAMES — DB writes only, no LLM
+  // spend (the connector's own OAuth/credentials custody gates outbound calls).
+  // Idempotent + safe to re-run: backfill's ON CONFLICT and the tombstone's
+  // versioned ON CONFLICT both no-op on a re-fetch.
+  worker.register('connector_poll', async (job) => {
+    const { runConnectorPoll } = await import('../core/connectors/poll.ts');
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    const provider = typeof job.data.provider === 'string' ? job.data.provider : undefined;
+    if (!sourceId || !provider) {
+      throw new Error(
+        `connector_poll: requires string sourceId + provider in params (got sourceId=${JSON.stringify(job.data.sourceId)}, provider=${JSON.stringify(job.data.provider)})`,
+      );
+    }
+    // seenRecordIds is the reconciliation set. Fail LOUD on a malformed array
+    // (any non-string element) rather than silently filtering it to a shorter set —
+    // a silently-shrunk seen set would mark legitimately-present records "vanished"
+    // and tombstone them. A non-array seenRecordIds → undefined (no reconciliation).
+    // An EMPTY array is NOT a "zero records" signal (poll.ts skips reconciliation on
+    // it); a connector that authoritatively saw zero records passes confirmedEmpty.
+    let seenRecordIds: string[] | undefined;
+    if (Array.isArray(job.data.seenRecordIds)) {
+      const raw = job.data.seenRecordIds as unknown[];
+      if (!raw.every((s): s is string => typeof s === 'string')) {
+        throw new Error(
+          `connector_poll: seenRecordIds must be an array of strings (got a non-string element). ` +
+          `Refusing to proceed with a filtered/shrunk set — a connector that saw zero records ` +
+          `must pass { confirmedEmpty: true }, not a malformed id array.`,
+        );
+      }
+      seenRecordIds = raw as string[];
+    }
+    const confirmedEmpty = job.data.confirmedEmpty === true;
+    return await runConnectorPoll(engine, { sourceId, provider, seenRecordIds, confirmedEmpty });
+  });
+
+  process.stderr.write('[minion worker] brain-health-100 handlers registered (11 ops, 3 protected) + embed-backfill (v0.40) + connector_poll (TECH-2038)\n');
 
   // Plugin discovery — one line per discovered plugin (mirrors the
   // openclaw-seam startup line convention from v0.11+). Loaded
