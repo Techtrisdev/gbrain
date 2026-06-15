@@ -232,7 +232,7 @@ const eventWithSecret = {
 describe('Calendar normalize (AC3/AC4: metadata-only candidate)', () => {
   test('an event lands a high-confidence candidate; description/notes never reach a row', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const records = calendarConnector.normalize(eventWithSecret);
+    const records = calendarConnector.normalize(eventWithSecret, { id: 'src-cal', config: {} });
     expect(records).toHaveLength(1);
 
     const result = await landRecords(engine, 'src-cal', calendarConnector, records);
@@ -267,7 +267,7 @@ describe('Calendar normalize (AC3/AC4: metadata-only candidate)', () => {
   test('a secret in the event TITLE (kept→summary) is masked to [REDACTED]', async () => {
     const { engine, inserts } = makeFakeEngine();
     const ev = { id: 'event-titlesecret', summary: `urgent ${SECRET_MARKER} review`, start: { dateTime: '2026-06-20T15:00:00Z' } };
-    await landRecords(engine, 'src-cal', calendarConnector, calendarConnector.normalize(ev));
+    await landRecords(engine, 'src-cal', calendarConnector, calendarConnector.normalize(ev, { id: 'src-cal', config: {} }));
     const cand = inserts.find((r) => r.source_record_id === 'event-titlesecret')!;
     expect(cand.proposed_markdown).not.toContain(SECRET_MARKER);
     expect(cand.proposed_markdown).toContain('[REDACTED]');
@@ -275,7 +275,7 @@ describe('Calendar normalize (AC3/AC4: metadata-only candidate)', () => {
 
   test('an events.list page normalizes every item', () => {
     const page = { items: [{ id: 'e1', summary: 'A' }, { id: 'e2', summary: 'B' }, { /* no id */ summary: 'skip' }] };
-    const records = calendarConnector.normalize(page);
+    const records = calendarConnector.normalize(page, { id: 'src-cal', config: {} });
     expect(records.map((r) => r.sourceRecordId)).toEqual(['e1', 'e2']);
   });
 
@@ -453,7 +453,7 @@ describe('Calendar incrementalSync (AC2: 410 Gone → full resync)', () => {
 describe('Calendar metadata (finding 4: organizer name never leaks)', () => {
   function metaOf(ev: Record<string, unknown>): Record<string, unknown> {
     // metadataForEvent is not exported; read it off the normalized record's item.
-    const rec = calendarConnector.normalize(ev)[0];
+    const rec = calendarConnector.normalize(ev, { id: 'src-cal', config: {} })[0];
     return (rec.item.metadata ?? {}) as Record<string, unknown>;
   }
 

@@ -387,7 +387,7 @@ export const calendarConnector: SaaSConnector = {
 
     do {
       const page = await listEvents(token, calendarId, { pageToken });
-      const records = this.normalize(page);
+      const records = this.normalize(page, source);
       const result = await landRecords(engine, source.id, this, records);
       landed += result.written;
       pageToken = page.nextPageToken ?? null;
@@ -494,7 +494,7 @@ async function incrementalSyncLocked(engine: BrainEngine, source: ConnectorSourc
       }
       throw err;
     }
-    const records = calendarConnector.normalize(page);
+    const records = calendarConnector.normalize(page, source);
     const result = await landRecords(engine, source.id, calendarConnector, records);
     landed += result.written;
     pageToken = page.nextPageToken ?? null;
