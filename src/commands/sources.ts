@@ -855,6 +855,19 @@ async function runConnectorSet(engine: BrainEngine, args: string[]): Promise<voi
     console.error(`Source "${id}" not found.`);
     process.exit(1);
   }
+  // Reject if another source already claims this provider+account. The webhook
+  // receiver routes by (provider, account) and fails closed on ambiguity, so a
+  // duplicate claim would render BOTH sources unroutable. Enforce one-to-one here.
+  const collision = await engine.executeRaw<{ id: string }>(
+    `SELECT id FROM sources WHERE config->'connectors'->$1->>'account' = $2 AND id <> $3 LIMIT 1`,
+    [provider, account, id],
+  );
+  if (collision.length > 0) {
+    console.error(`Provider "${provider}" account "${account}" is already configured on source "${collision[0].id}".`);
+    console.error(`A provider+account must map to exactly one source. Clear it there first:`);
+    console.error(`  gbrain sources connector clear ${collision[0].id} --provider ${provider}`);
+    process.exit(1);
+  }
   const { randomBytes } = await import('node:crypto');
   const secret = explicitSecret ?? randomBytes(32).toString('hex');
   const cfg = parseConfig(src.config);

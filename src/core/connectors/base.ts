@@ -14,7 +14,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
 import { toRow, type ConnectorCandidateItem } from './candidate.ts';
-import { minimize, strip, type RawConnectorItem } from './redact.ts';
+import { minimize, type RawConnectorItem } from './redact.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
@@ -59,14 +59,22 @@ export interface SaaSConnector {
    *  (mirrors github's `X-Hub-Signature-256` D3 gate). A request without it is rejected
    *  401 before any source lookup, so probe traffic never touches the DB. */
   readonly signatureHeader: string;
-  /** Constant-time webhook signature verification against the per-source secret. */
+  /** Constant-time webhook signature verification against the per-source secret.
+   *  `headers` keys are LOWERCASE — Node lowercases all incoming header names, and the
+   *  receiver flattens them as-is. Read the signature header by its lowercase name
+   *  (e.g. `headers['x-slack-signature']`); a capitalized lookup returns undefined and
+   *  fails closed. Use `hmacSha256Verify` for the constant-time compare. */
   verifyWebhook(rawBody: Buffer, headers: Record<string, string | undefined>, secret: string): boolean;
   /** Extract the account/workspace id from a parsed payload, used to resolve the source. */
   accountFromPayload(payload: unknown): string | null;
   /** Normalize a verified payload into 0+ records (pre-redaction). */
   normalize(payload: unknown): NormalizedRecord[];
-  /** Map a (redacted) record to a candidate item. The framework calls this AFTER
-   *  redaction, so it only ever sees minimized/stripped fields. */
+  /** Map a (minimized) record to a candidate item. The framework forwards this to
+   *  toRow, which re-redacts the page-body-bound output fields (proposed_markdown,
+   *  proposed_slug, rationale_ref) at the write boundary. NOTE: if the returned item
+   *  sets `version`, it MUST be deterministic per upstream record — the idempotency
+   *  key is (source_id, source_record_id, version), so a non-deterministic version
+   *  (timestamp, delivery id) defeats duplicate-delivery dedupe. Omit it to default to '1'. */
   toCandidate(record: NormalizedRecord, sourceId: string): ConnectorCandidateItem;
   /** Outbound backfill (initial/periodic sync). Declared here; implemented per-connector
    *  once connector_tokens / OAuth (TECH-2033) lands. Uses the same landRecords path. */
@@ -136,23 +144,24 @@ export async function landRecords(
 ): Promise<LandResult> {
   let written = 0;
   for (const record of records) {
+    // Minimize the connector record: drop the body, keep only allowlisted +
+    // stripped metadata/summary. The candidate OUTPUT fields (proposed_markdown,
+    // proposed_slug, rationale_ref) are redacted authoritatively at the write
+    // boundary in candidate.ts::toRow — which every caller goes through — so a
+    // connector's toCandidate output cannot smuggle an un-redacted field past it.
     const min = minimize(record.item, record.profile);
     const redacted: NormalizedRecord = {
       sourceRecordId: record.sourceRecordId,
       profile: record.profile,
       item: { sourceRecordId: min.sourceRecordId, metadata: min.metadata, summary: min.summary },
-      proposedSlug: record.proposedSlug ? strip(record.proposedSlug) : undefined,
+      proposedSlug: record.proposedSlug,
     };
     const raw = connector.toCandidate(redacted, sourceId);
-    // Defense-in-depth: proposed_markdown is the field that could become a served page
-    // body, so strip it again here regardless of what the connector built.
     const candidate: ConnectorCandidateItem = {
       ...raw,
       source_id: sourceId,
       source_record_id: record.sourceRecordId,
       provider: raw.provider ?? connector.provider,
-      proposed_markdown:
-        raw.proposed_markdown !== undefined ? strip(raw.proposed_markdown) : raw.proposed_markdown,
       redactions: [...(raw.redactions ?? []), ...min.redactions],
     };
     const { written: didWrite } = await toRow(engine, candidate);

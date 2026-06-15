@@ -2003,19 +2003,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return;
       }
 
-      // (4) Source lookup by config.connectors[provider].account.
-      let source: { id: string; config: Record<string, unknown> | string } | null = null;
+      // (4) Source lookup by config.connectors[provider].account. NO LIMIT 1:
+      //     provider+account is not guaranteed unique across sources, and silently
+      //     picking one (non-deterministic without ORDER BY) would misroute ingested
+      //     data into the wrong source. >1 match → fail closed with 409.
+      let rows: { id: string; config: Record<string, unknown> | string }[];
       try {
-        const rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string }>(
-          `SELECT id, config FROM sources WHERE config->'connectors'->$1->>'account' = $2 LIMIT 1`,
+        rows = await engine.executeRaw<{ id: string; config: Record<string, unknown> | string }>(
+          `SELECT id, config FROM sources WHERE config->'connectors'->$1->>'account' = $2`,
           [provider, account],
         );
-        source = rows[0] ?? null;
       } catch (err) {
         console.error('connector webhook: source lookup error:', err);
         res.status(500).json({ error: 'lookup_failed' });
         return;
       }
+      if (rows.length > 1) {
+        console.error(`connector webhook: ambiguous account '${account}' for provider '${provider}' — ${rows.length} sources claim it`);
+        res.status(409).json({ error: 'ambiguous_account', message: `multiple sources claim this ${provider} account; resolve with 'gbrain sources connector clear'` });
+        return;
+      }
+      const source = rows[0] ?? null;
       if (!source) {
         res.status(404).json({ error: 'unknown_account', provider, account });
         return;
@@ -2023,7 +2031,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       // (5) Per-source connector config: must be enabled and carry a secret.
       const connCfg = readConnectorConfig({ id: source.id, config: source.config }, provider);
-      if (!connCfg || !connCfg.enabled) {
+      // Strict `=== true`: a hand-edited/migrated config with a truthy non-boolean
+      // enabled (e.g. the string "false") must NOT accept webhooks — fail closed.
+      if (!connCfg || connCfg.enabled !== true) {
         res.status(404).json({ error: 'connector_disabled', message: `connector '${provider}' is not enabled for source '${source.id}'` });
         return;
       }
@@ -2032,7 +2042,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return;
       }
 
-      // (6) Provider-specific constant-time signature verification.
+      // (6) Provider-specific constant-time signature verification. Node lowercases
+      //     all header keys; connectors must read the signature header by its
+      //     lowercase name (documented on SaaSConnector.verifyWebhook).
       const flatHeaders: Record<string, string | undefined> = {};
       for (const [k, v] of Object.entries(req.headers)) flatHeaders[k] = Array.isArray(v) ? v[0] : v;
       if (!connector.verifyWebhook(payload, flatHeaders, connCfg.secret)) {

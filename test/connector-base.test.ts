@@ -208,3 +208,53 @@ describe('landRecords — redaction choke point', () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+/** A connector that injects RAW secrets into proposed_slug + rationale_ref and
+ *  returns NO proposed_markdown — exercising the write-boundary strip and the
+ *  renderCandidateMarkdown stub path (the two redaction gaps the adversarial
+ *  review found: ...raw spread + stub regeneration after the strip). */
+const slugLeakConnector: SaaSConnector = {
+  provider: 'slug-leak',
+  signatureHeader: 'x-sig',
+  verifyWebhook: () => true,
+  accountFromPayload: () => 'acct',
+  normalize: () => [
+    {
+      sourceRecordId: 'rec-9',
+      profile: 'comms',
+      item: { sourceRecordId: 'rec-9', metadata: {}, summary: 'clean summary' },
+      proposedSlug: 'rec-9',
+    },
+  ],
+  toCandidate: (record, sourceId) => ({
+    source_id: sourceId,
+    source_record_id: record.sourceRecordId,
+    provider: 'slug-leak',
+    // Raw secrets in slug + rationale_ref; NO proposed_markdown, forcing toRow's
+    // stub generator (which embeds proposed_slug into the body) — the field that
+    // bypassed landRecords' only strip in the pre-fix code.
+    proposed_slug: `leak-${SECRET_MARKER}`,
+    rationale_ref: `https://x.test/?token=${SECRET_MARKER}`,
+  }),
+};
+
+describe('toRow write boundary — every output field is redacted, incl. the generated stub', () => {
+  test('strips proposed_slug, rationale_ref, and the stub-generated proposed_markdown', async () => {
+    const { engine, calls } = makeFakeEngine();
+    await landRecords(engine, 'src-1', slugLeakConnector, slugLeakConnector.normalize(null));
+
+    const insert = calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql));
+    expect(insert).toBeDefined();
+    const p = insert!.params;
+    const proposedSlug = p[5] as string; // $6
+    const proposedMarkdown = p[6] as string; // $7 — stub-generated (connector gave none), then stripped
+    const rationaleRef = p[11] as string; // $12
+
+    expect(proposedSlug).not.toContain(SECRET_MARKER);
+    expect(rationaleRef).not.toContain(SECRET_MARKER);
+    // The stub embeds proposed_slug into the body — must be stripped at the boundary.
+    expect(proposedMarkdown).not.toContain(SECRET_MARKER);
+    // Nothing anywhere in the INSERT carries the raw secret.
+    expect(JSON.stringify(p)).not.toContain(SECRET_MARKER);
+  });
+});
