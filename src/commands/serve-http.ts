@@ -45,6 +45,10 @@ import {
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
+// Side-effect import: registers all SaaS connectors into the in-memory registry the
+// /webhooks/:provider receiver resolves against (TECH-2035). Without this the registry
+// is empty and every provider 404s.
+import '../core/connectors/registry.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default

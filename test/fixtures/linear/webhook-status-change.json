@@ -1,0 +1,22 @@
+{
+  "action": "update",
+  "type": "Issue",
+  "organizationId": "org-acme-123",
+  "webhookId": "wh-delivery-0001",
+  "updatedFrom": {
+    "stateId": "state-todo"
+  },
+  "data": {
+    "id": "issue-uuid-1",
+    "identifier": "ENG-42",
+    "title": "Ship the Linear connector",
+    "description": "Implementation details and notes.",
+    "url": "https://linear.app/acme/issue/ENG-42",
+    "priority": 2,
+    "createdAt": "2026-06-01T10:00:00.000Z",
+    "updatedAt": "2026-06-14T12:00:00.000Z",
+    "state": { "name": "Done", "type": "completed" },
+    "assignee": { "name": "Jordan", "displayName": "Jordan R." },
+    "labelIds": ["label-feature"]
+  }
+}
