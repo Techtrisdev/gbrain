@@ -5,19 +5,20 @@
  * the TECH-2033 credentials module:
  *
  *   1. a message in a SELECTED public channel → a high-confidence summary candidate
- *      (NO raw body — the text never reaches the candidate verbatim).
- *   2. a DM event (channel_type `im`/`mpim`) → ignored (no candidate).
- *   3. a non-opt-in channel message → ignored (no candidate).
- *   4. verifyWebhook (the v0 signing scheme): valid → accept; bad signature → reject;
- *      stale/future/non-integer timestamp (the ±300s window) → reject; a missing `v0=`
- *      prefix → reject; a missing timestamp header → reject; a tampered body → reject.
- *   5. backfill: pages conversations.history per opt-in channel, advances the `ts`
- *      watermark, refreshes the token via custody (mocked), and masks a secret.
+ *      (NO raw body — the text never reaches the candidate verbatim). Exercised through
+ *      the REAL receiver-shape call `normalize(parsed, source)`.
+ *   2. a DM event (channel_type `im`/`mpim`) → ignored (no candidate); a non-opt-in
+ *      channel → ignored.
+ *   3. the v0 signing scheme: valid → accept; bad/stale/future/non-integer/edge timestamp
+ *      and missing `v0=` prefix / missing header / tampered body → reject.
+ *   4. the UNSIGNED url_verification handshake → echoes the challenge (no record).
+ *   5. backfill: per-channel cursor (no cross-channel skip), monotonic watermark (never
+ *      regresses under a replayed run), public-channel-class guard, token refresh, redaction.
  *
  * The credentials module (./credentials.ts) is mocked here so backfill exercises the
  * refresh-then-succeed flow against fixtures. fetch is stubbed to serve the recorded
- * history pages — no network. Candidate writes go through a fake engine that captures
- * the toRow INSERT params (mirrors test/connector-linear.test.ts).
+ * history pages — no network. Candidate writes + the per-channel monotonic jsonb_set
+ * watermark UPDATE go through a fake engine that captures params + models the SQL.
  */
 
 import { describe, test, expect, mock, afterEach } from 'bun:test';
@@ -46,7 +47,7 @@ mock.module('../src/core/connectors/credentials.ts', () => ({
 }));
 
 // Import AFTER the mock is registered so the connector binds the mocked symbols.
-const { slackConnector, fetchHistoryPage, readBackfillWatermark, readOptInChannels } = await import(
+const { slackConnector, fetchHistoryPage, readChannelWatermark, readBackfillCursors, readOptInChannels } = await import(
   '../src/core/connectors/slack.ts'
 );
 const { landRecords } = await import('../src/core/connectors/base.ts');
@@ -61,19 +62,34 @@ const selectedChannelEvent = loadFixture('event-message-selected-channel.json');
 const dmEvent = loadFixture('event-message-dm.json');
 const historyPage1 = loadFixture('history-page1.json');
 const historyPage2 = loadFixture('history-page2.json');
+const historyQuietChannel = loadFixture('history-quiet-channel.json');
 
 const SECRET_MARKER = 'AKIAIOSFODNN7EXAMPLE'; // AWS-key-shaped; strip() masks it
 const OPENAI_SECRET = 'sk-abcdefghijklmnopqrstuvwxyz012345'; // in the backfill fixture
 const SIGNING_SECRET = 'slack-signing-secret-abc';
-const OPT_IN_CHANNELS = ['C_ENG_GENERAL'];
+const BUSY_CHANNEL = 'C_ENG_GENERAL';
+const QUIET_CHANNEL = 'C_OPS_QUIET';
+const OPT_IN_CHANNELS = [BUSY_CHANNEL];
 
-// ── Fake engine: captures connector_candidates INSERTs + sources config UPDATEs ──
+/** Build the resolved-source shape the receiver passes to normalize/backfill. */
+function makeSource(opts: { channels?: string[]; backfill_cursor?: Record<string, string>; extra?: Record<string, unknown> } = {}): ConnectorSource {
+  const slack: Record<string, unknown> = {
+    enabled: true,
+    account: 'T_ACME_123',
+    channels: opts.channels ?? OPT_IN_CHANNELS,
+    ...(opts.backfill_cursor ? { backfill_cursor: opts.backfill_cursor } : {}),
+    ...(opts.extra ?? {}),
+  };
+  return { id: 'src-1', config: { connectors: { slack } } };
+}
+
+// ── Fake engine: captures candidate INSERTs + models the per-channel monotonic write ──
 
 function makeFakeEngine(opts: { initialConfig?: Record<string, Record<string, unknown>> } = {}) {
   const inserts: { source_record_id: string; provider: unknown; proposed_slug: unknown; proposed_markdown: string; confidence: unknown; redactions: unknown[]; status: unknown; allParams: unknown[] }[] = [];
-  const watermarkUpdates: { watermark: string; id: string }[] = [];
+  const watermarkUpdates: { channel: string; watermark: string; id: string }[] = [];
   const seenKeys = new Set<string>();
-  const configState: Record<string, Record<string, unknown>> = { ...(opts.initialConfig ?? {}) };
+  const configState: Record<string, Record<string, unknown>> = structuredClone(opts.initialConfig ?? {});
   const engine = {
     kind: 'pglite',
     executeRaw: async (sql: string, params?: unknown[]) => {
@@ -94,15 +110,23 @@ function makeFakeEngine(opts: { initialConfig?: Record<string, Record<string, un
         });
         return [{ id: inserts.length }];
       }
-      // Surgical watermark write: jsonb_set(config, '{connectors,slack,backfill_cursor}', …).
-      if (/UPDATE sources\s+SET config = jsonb_set/.test(sql)) {
-        const watermark = p[0] as string;
-        const id = p[1] as string;
-        watermarkUpdates.push({ watermark, id });
+      // Per-channel MONOTONIC watermark write. The connector SQL is:
+      //   UPDATE sources SET config = jsonb_set(jsonb_set(...backfill_cursor...), [...,$2], GREATEST(...,$3))
+      // params: [$1=source.id, $2=channel, $3=watermark]
+      if (/jsonb_set/.test(sql) && /backfill_cursor/.test(sql)) {
+        const id = p[0] as string;
+        const channel = p[1] as string;
+        const watermark = p[2] as string;
+        watermarkUpdates.push({ channel, watermark, id });
         const cfg = (configState[id] ??= {});
         const connectors = (cfg.connectors ??= {}) as Record<string, Record<string, unknown>>;
         const slack = (connectors.slack ??= {}) as Record<string, unknown>;
-        slack.backfill_cursor = watermark;
+        const cursor = (slack.backfill_cursor ??= {}) as Record<string, string>;
+        // Model GREATEST(existing, candidate) numerically — the write only advances.
+        const existing = cursor[channel];
+        if (existing === undefined || Number(watermark) > Number(existing)) {
+          cursor[channel] = watermark;
+        }
         return [];
       }
       // toRow's fetch-on-conflict SELECT
@@ -112,9 +136,8 @@ function makeFakeEngine(opts: { initialConfig?: Record<string, Record<string, un
   return { engine, inserts, watermarkUpdates, configState };
 }
 
-// ── Slack v0 signing helper ────────────────────────────────────────────────────
+// ── Slack v0 signing helpers ──────────────────────────────────────────────────────
 
-/** Build a correct `v0=` signature over `v0:{ts}:{rawBody}`. */
 function slackSign(rawBody: Buffer, tsSeconds: number, secret = SIGNING_SECRET): string {
   const base = Buffer.concat([Buffer.from(`v0:${tsSeconds}:`, 'utf8'), rawBody]);
   return `v0=${createHmac('sha256', secret).update(base).digest('hex')}`;
@@ -124,7 +147,6 @@ function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
 
-/** Headers for a correctly-signed delivery at `tsSeconds`. */
 function signedHeaders(rawBody: Buffer, tsSeconds: number, secret = SIGNING_SECRET): Record<string, string> {
   return {
     'x-slack-signature': slackSign(rawBody, tsSeconds, secret),
@@ -132,7 +154,7 @@ function signedHeaders(rawBody: Buffer, tsSeconds: number, secret = SIGNING_SECR
   };
 }
 
-// ── fetch stub for backfill (serves the recorded history pages) ──────────────────
+// ── fetch stub for backfill (serves recorded history pages, per-channel routing) ──
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -140,6 +162,7 @@ afterEach(() => {
   refreshCount = 0;
 });
 
+/** Sequential page stub (one channel): serves `pages` in order. */
 function stubHistoryFetch(pages: unknown[]): { calls: { body: URLSearchParams; auth: string | undefined }[] } {
   const calls: { body: URLSearchParams; auth: string | undefined }[] = [];
   let i = 0;
@@ -155,15 +178,35 @@ function stubHistoryFetch(pages: unknown[]): { calls: { body: URLSearchParams; a
   return { calls };
 }
 
-// ── 1. a message in a SELECTED public channel → a summary candidate ──────────────
+/** Per-channel page stub: routes each call to the right channel's page queue by `channel`. */
+function stubHistoryByChannel(byChannel: Record<string, unknown[]>): { calls: { channel: string; body: URLSearchParams }[] } {
+  const calls: { channel: string; body: URLSearchParams }[] = [];
+  const idx: Record<string, number> = {};
+  globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+    const bodyText = typeof init?.body === 'string' ? init.body : '';
+    const body = new URLSearchParams(bodyText);
+    const channel = body.get('channel') ?? '';
+    calls.push({ channel, body });
+    const queue = byChannel[channel] ?? [{ ok: true, messages: [], has_more: false, response_metadata: { next_cursor: '' } }];
+    const i = idx[channel] ?? 0;
+    idx[channel] = i + 1;
+    const page = queue[Math.min(i, queue.length - 1)];
+    return { ok: true, status: 200, json: async () => page, text: async () => '' } as unknown as Response;
+  }) as typeof fetch;
+  return { calls };
+}
+
+// ── 1. a SELECTED public-channel message → a candidate (RECEIVER-SHAPE call) ─────
 
 describe('Slack webhook: selected-channel message → candidate', () => {
-  test('emits a high-confidence pending summary candidate (NO raw body)', async () => {
+  test('THE KEYSTONE: normalize(parsed, source) for an enabled+opted-in source PRODUCES a candidate', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const records = slackConnector.normalize(selectedChannelEvent, OPT_IN_CHANNELS);
+    // Exactly the receiver's single call site: normalize(parsed, resolvedSource).
+    const source = makeSource({ channels: [BUSY_CHANNEL] });
+    const records = slackConnector.normalize(selectedChannelEvent, source);
     expect(records).toHaveLength(1);
 
-    const result = await landRecords(engine, 'src-1', slackConnector, records);
+    const result = await landRecords(engine, source.id, slackConnector, records);
     expect(result).toEqual({ written: 1, total: 1 });
 
     const candidate = inserts[0];
@@ -177,8 +220,20 @@ describe('Slack webhook: selected-channel message → candidate', () => {
     const blob = JSON.stringify(inserts);
     expect(blob).not.toContain('Decided to ship');
     expect(blob).not.toContain(SECRET_MARKER);
-    // A redaction-trail entry recorded the dropped body.
     expect(JSON.stringify(candidate.redactions)).toContain('body');
+  });
+
+  test('the summary label is capped at 200 chars', () => {
+    const longChannel = 'C_' + 'X'.repeat(400);
+    const event = {
+      type: 'event_callback',
+      team_id: 'T_ACME_123',
+      event: { type: 'message', channel: longChannel, channel_type: 'channel', user: 'U_J', text: 'hi', ts: '1700000000.000001' },
+    };
+    const source = makeSource({ channels: [longChannel] });
+    const records = slackConnector.normalize(event, source);
+    expect(records).toHaveLength(1);
+    expect(records[0].item.summary!.length).toBeLessThanOrEqual(200);
   });
 
   test('accountFromPayload resolves the team_id', () => {
@@ -186,21 +241,18 @@ describe('Slack webhook: selected-channel message → candidate', () => {
   });
 
   test('readOptInChannels reads sources.config.connectors.slack.channels[]', () => {
-    const source: ConnectorSource = {
-      id: 'src-1',
-      config: { connectors: { slack: { enabled: true, account: 'T_ACME_123', channels: ['C_ENG_GENERAL', 'C_OPS'] } } },
-    };
-    expect(readOptInChannels(source)).toEqual(['C_ENG_GENERAL', 'C_OPS']);
+    const source = makeSource({ channels: [BUSY_CHANNEL, QUIET_CHANNEL] });
+    expect(readOptInChannels(source)).toEqual([BUSY_CHANNEL, QUIET_CHANNEL]);
   });
 });
 
-// ── 2. a DM event → ignored (no candidate) ───────────────────────────────────────
+// ── 2. DM / non-opt-in exclusion (with the source passed) ────────────────────────
 
-describe('Slack webhook: DM events are always ignored', () => {
-  test('an im (DM) event yields NO candidate even if its channel were opted in', () => {
-    // Pass the DM channel id as opted-in to prove the DM gate wins regardless.
-    const records = slackConnector.normalize(dmEvent, ['D_PRIVATE_DM']);
-    expect(records).toHaveLength(0);
+describe('Slack webhook: DM and opt-in gating (source passed)', () => {
+  test('an im (DM) event yields NO candidate even if its channel id were opted in', () => {
+    // Opt the DM id in to prove the DM-class gate wins regardless.
+    const source = makeSource({ channels: ['D_PRIVATE_DM'] });
+    expect(slackConnector.normalize(dmEvent, source)).toHaveLength(0);
   });
 
   test('an mpim (group DM) event yields NO candidate', () => {
@@ -209,46 +261,44 @@ describe('Slack webhook: DM events are always ignored', () => {
       team_id: 'T_ACME_123',
       event: { type: 'message', channel: 'G_GROUP_DM', channel_type: 'mpim', user: 'U_X', text: 'hi', ts: '1700000000.000999' },
     };
-    expect(slackConnector.normalize(mpim, ['G_GROUP_DM'])).toHaveLength(0);
-  });
-});
-
-// ── 3. a non-opt-in channel message → ignored ───────────────────────────────────
-
-describe('Slack webhook: opt-in channel gating', () => {
-  test('a message in a NON-opt-in channel yields no candidate', () => {
-    expect(slackConnector.normalize(selectedChannelEvent, ['C_SOME_OTHER'])).toHaveLength(0);
+    expect(slackConnector.normalize(mpim, makeSource({ channels: ['G_GROUP_DM'] }))).toHaveLength(0);
   });
 
-  test('no opt-in list provided → fail-closed (no candidate)', () => {
-    expect(slackConnector.normalize(selectedChannelEvent)).toHaveLength(0);
+  test('a message in a NON-opt-in channel yields no candidate (source passed)', () => {
+    const source = makeSource({ channels: ['C_SOME_OTHER'] });
+    expect(slackConnector.normalize(selectedChannelEvent, source)).toHaveLength(0);
+  });
+
+  test('an empty opt-in list ingests nothing (fail-closed)', () => {
+    const source = makeSource({ channels: [] });
+    expect(slackConnector.normalize(selectedChannelEvent, source)).toHaveLength(0);
   });
 
   test('a message subtype (edit/join/bot noise) is ignored even in an opt-in channel', () => {
     const edited = {
       type: 'event_callback',
       team_id: 'T_ACME_123',
-      event: { type: 'message', subtype: 'message_changed', channel: 'C_ENG_GENERAL', channel_type: 'channel', user: 'U_JORDAN', text: 'edited', ts: '1700000000.000777' },
+      event: { type: 'message', subtype: 'message_changed', channel: BUSY_CHANNEL, channel_type: 'channel', user: 'U_JORDAN', text: 'edited', ts: '1700000000.000777' },
     };
-    expect(slackConnector.normalize(edited, OPT_IN_CHANNELS)).toHaveLength(0);
+    expect(slackConnector.normalize(edited, makeSource())).toHaveLength(0);
   });
 
   test('a non-message event (e.g. reaction_added) is ignored', () => {
     const reaction = {
       type: 'event_callback',
       team_id: 'T_ACME_123',
-      event: { type: 'reaction_added', channel: 'C_ENG_GENERAL', user: 'U_JORDAN', ts: '1700000000.000888' },
+      event: { type: 'reaction_added', channel: BUSY_CHANNEL, user: 'U_JORDAN', ts: '1700000000.000888' },
     };
-    expect(slackConnector.normalize(reaction, OPT_IN_CHANNELS)).toHaveLength(0);
+    expect(slackConnector.normalize(reaction, makeSource())).toHaveLength(0);
   });
 
-  test('a url_verification envelope is ignored (not an event_callback)', () => {
+  test('a url_verification envelope is NOT a normalize target (handled by handshake instead)', () => {
     const challenge = { type: 'url_verification', challenge: 'abc', token: 'xyz' };
-    expect(slackConnector.normalize(challenge, OPT_IN_CHANNELS)).toHaveLength(0);
+    expect(slackConnector.normalize(challenge, makeSource())).toHaveLength(0);
   });
 });
 
-// ── 4. verifyWebhook (AC3: v0 signing-secret + 300s window, constant-time) ───────
+// ── 3. verifyWebhook (AC3: v0 signing-secret + 300s window, constant-time) ───────
 
 describe('Slack verifyWebhook (AC3: v0 HMAC + 300s window)', () => {
   const body = Buffer.from(JSON.stringify(selectedChannelEvent), 'utf8');
@@ -260,8 +310,7 @@ describe('Slack verifyWebhook (AC3: v0 HMAC + 300s window)', () => {
 
   test('bad signature (wrong secret) → reject', () => {
     const ts = nowSeconds();
-    const headers = signedHeaders(body, ts, 'wrong-secret');
-    expect(slackConnector.verifyWebhook(body, headers, SIGNING_SECRET)).toBe(false);
+    expect(slackConnector.verifyWebhook(body, signedHeaders(body, ts, 'wrong-secret'), SIGNING_SECRET)).toBe(false);
   });
 
   test('tampered body → reject (HMAC over the verbatim body)', () => {
@@ -273,8 +322,7 @@ describe('Slack verifyWebhook (AC3: v0 HMAC + 300s window)', () => {
   });
 
   test('STALE timestamp (>300s old, replay) → reject', () => {
-    const ts = nowSeconds() - 400; // 400s old, outside the 300s window
-    // Signed correctly FOR that stale ts, so the rejection is the window's doing alone.
+    const ts = nowSeconds() - 400;
     expect(slackConnector.verifyWebhook(body, signedHeaders(body, ts), SIGNING_SECRET)).toBe(false);
   });
 
@@ -321,44 +369,79 @@ describe('Slack verifyWebhook (AC3: v0 HMAC + 300s window)', () => {
   });
 });
 
-// ── 5. backfill (AC2: conversations.history cursor + watermark, resume-safe) ──────
+// ── 4. url_verification handshake (AC1) ──────────────────────────────────────────
 
-describe('Slack backfill (AC2: conversations.history cursor + ts watermark)', () => {
-  function sourceWithChannels(extra: Record<string, unknown> = {}): ConnectorSource {
-    return {
-      id: 'src-1',
-      config: { connectors: { slack: { enabled: true, account: 'T_ACME_123', channels: OPT_IN_CHANNELS, ...extra } } },
-    };
-  }
+describe('Slack handshake (AC1: unsigned url_verification challenge)', () => {
+  test('a url_verification envelope returns the challenge to echo', () => {
+    const result = slackConnector.handshake!({ type: 'url_verification', challenge: 'nonce-xyz', token: 't' });
+    expect(result).toEqual({ challenge: 'nonce-xyz' });
+  });
 
-  test('pages through both fixtures, lands candidates, advances the ts watermark', async () => {
+  test('a normal event_callback is NOT a handshake (returns null → signed path proceeds)', () => {
+    expect(slackConnector.handshake!(selectedChannelEvent)).toBeNull();
+  });
+
+  test('a url_verification with no challenge string returns null (nothing to echo)', () => {
+    expect(slackConnector.handshake!({ type: 'url_verification' })).toBeNull();
+  });
+});
+
+// ── 5. backfill (AC2: per-channel cursor + monotonic watermark, resume-safe) ──────
+
+describe('Slack backfill (AC2: per-channel conversations.history cursor + ts watermark)', () => {
+  test('pages a busy channel through both fixtures, lands candidates, advances its watermark', async () => {
     const { engine, inserts, watermarkUpdates, configState } = makeFakeEngine();
     const { calls } = stubHistoryFetch([historyPage1, historyPage2]);
 
-    const landed = await slackConnector.backfill!(engine, sourceWithChannels());
+    const landed = await slackConnector.backfill!(engine, makeSource({ channels: [BUSY_CHANNEL] }));
 
-    // page1 has 2 plain messages; page2 has 1 plain + 1 channel_join subtype (skipped) → 3.
+    // page1: 2 plain; page2: 1 plain + 1 channel_join subtype (skipped) → 3.
     expect(landed).toBe(3);
     expect(inserts.some((r) => r.source_record_id === 'C_ENG_GENERAL:1700000100.000100')).toBe(true);
     expect(inserts.some((r) => r.source_record_id === 'C_ENG_GENERAL:1700000400.000100')).toBe(true);
-    // The channel_join subtype was skipped (no candidate for its ts).
     expect(inserts.some((r) => r.source_record_id === 'C_ENG_GENERAL:1700000300.000100')).toBe(false);
 
-    // Two fetch calls (page1 has_more=true → page2 has_more=false → stop).
     expect(calls).toHaveLength(2);
-    expect(calls[0].body.get('channel')).toBe('C_ENG_GENERAL');
-    expect(calls[0].body.get('cursor')).toBeNull(); // first page: no cursor
-    expect(calls[1].body.get('cursor')).toBe('cursor-page-1'); // second page uses page1's next_cursor
+    expect(calls[0].body.get('channel')).toBe(BUSY_CHANNEL);
+    expect(calls[0].body.get('cursor')).toBeNull();
+    expect(calls[1].body.get('cursor')).toBe('cursor-page-1');
 
-    // Watermark advanced to the newest message ts (1700000400.000100) via jsonb_set.
-    expect(watermarkUpdates).toHaveLength(1);
-    expect(watermarkUpdates[0].watermark).toBe('1700000400.000100');
-    expect((configState['src-1'].connectors as any).slack.backfill_cursor).toBe('1700000400.000100');
+    // Watermark advanced PER-CHANNEL to the newest ts.
+    expect(watermarkUpdates).toEqual([{ channel: BUSY_CHANNEL, watermark: '1700000400.000100', id: 'src-1' }]);
+    expect((configState['src-1'].connectors as any).slack.backfill_cursor).toEqual({ [BUSY_CHANNEL]: '1700000400.000100' });
   });
 
-  test('resume from the advanced watermark passes it as `oldest` and yields no duplicates', async () => {
-    const source = sourceWithChannels({ backfill_cursor: '1700000400.000100' });
-    expect(readBackfillWatermark(source)).toBe('1700000400.000100');
+  test('TWO channels with uneven activity: BOTH fully paged, the quiet channel is NOT skipped', async () => {
+    const { engine, inserts, configState } = makeFakeEngine();
+    const { calls } = stubHistoryByChannel({
+      [BUSY_CHANNEL]: [historyPage1, historyPage2],
+      [QUIET_CHANNEL]: [historyQuietChannel],
+    });
+
+    const landed = await slackConnector.backfill!(engine, makeSource({ channels: [BUSY_CHANNEL, QUIET_CHANNEL] }));
+
+    // busy: 3 plain; quiet: 1 plain → 4.
+    expect(landed).toBe(4);
+    // The quiet channel's single (older-than-busy's-newest) message landed — NOT skipped by
+    // the busy channel's higher watermark, because each channel has its own cursor.
+    expect(inserts.some((r) => r.source_record_id === 'C_OPS_QUIET:1700000150.000100')).toBe(true);
+
+    // Each channel paged from its OWN (initially empty) cursor — neither started at the
+    // other's watermark. The first call per channel has no `oldest`.
+    const busyFirst = calls.find((c) => c.channel === BUSY_CHANNEL)!;
+    const quietFirst = calls.find((c) => c.channel === QUIET_CHANNEL)!;
+    expect(busyFirst.body.get('oldest')).toBeNull();
+    expect(quietFirst.body.get('oldest')).toBeNull();
+
+    // Per-channel watermarks recorded independently.
+    const cursor = (configState['src-1'].connectors as any).slack.backfill_cursor;
+    expect(cursor[BUSY_CHANNEL]).toBe('1700000400.000100');
+    expect(cursor[QUIET_CHANNEL]).toBe('1700000150.000100');
+  });
+
+  test('resume passes the channel watermark as `oldest` (inclusive=false) and yields no duplicates', async () => {
+    const source = makeSource({ channels: [BUSY_CHANNEL], backfill_cursor: { [BUSY_CHANNEL]: '1700000400.000100' } });
+    expect(readChannelWatermark(source, BUSY_CHANNEL)).toBe('1700000400.000100');
 
     const emptyPage = { ok: true, messages: [], has_more: false, response_metadata: { next_cursor: '' } };
     const { engine, inserts } = makeFakeEngine();
@@ -367,20 +450,58 @@ describe('Slack backfill (AC2: conversations.history cursor + ts watermark)', ()
     const landed = await slackConnector.backfill!(engine, source);
     expect(landed).toBe(0);
     expect(inserts).toHaveLength(0);
-    // The watermark was passed as `oldest` with inclusive=false → only strictly-newer msgs.
     expect(calls[0].body.get('oldest')).toBe('1700000400.000100');
     expect(calls[0].body.get('inclusive')).toBe('false');
+  });
+
+  test('MONOTONIC: a replayed run observing an OLDER newestTs never regresses the stored cursor', async () => {
+    // Source already carries a NEWER watermark than the page this run will observe.
+    const { engine, configState } = makeFakeEngine({
+      initialConfig: {
+        'src-1': { connectors: { slack: { enabled: true, account: 'T_ACME_123', channels: [BUSY_CHANNEL], backfill_cursor: { [BUSY_CHANNEL]: '1700000400.000100' } } } },
+      },
+    });
+    // A stale/retried run re-fetches an OLDER page (its `oldest` filter is bypassed by the
+    // stub, simulating a races/replay where it sees an older message than the stored cursor).
+    const olderPage = {
+      ok: true,
+      messages: [{ type: 'message', user: 'U_OLD', text: 'older', ts: '1700000100.000100' }],
+      has_more: false,
+      response_metadata: { next_cursor: '' },
+    };
+    stubHistoryFetch([olderPage]);
+
+    // Feed the connector a STALE snapshot with no cursor, so its in-memory newestTs would be
+    // the older ts — the SERVER-SIDE GREATEST must still refuse to move the cursor back.
+    const staleSnapshot = makeSource({ channels: [BUSY_CHANNEL] });
+    await slackConnector.backfill!(engine, staleSnapshot);
+
+    const cursor = (configState['src-1'].connectors as any).slack.backfill_cursor;
+    // The stored cursor stayed at the NEWER value — never regressed to 1700000100.
+    expect(cursor[BUSY_CHANNEL]).toBe('1700000400.000100');
+  });
+
+  test('a DM/private channel id mis-curated into the opt-in list is REJECTED on backfill', async () => {
+    const { engine, inserts } = makeFakeEngine();
+    const { calls } = stubHistoryByChannel({});
+    // A private (G) and DM (D) id sneaked into the opt-in list alongside a real public one.
+    await slackConnector.backfill!(engine, makeSource({ channels: ['G_PRIVATE', 'D_DM', BUSY_CHANNEL] }));
+    // Only the public channel was ever fetched; the G/D ids were skipped pre-fetch.
+    const fetched = new Set(calls.map((c) => c.channel));
+    expect(fetched.has('G_PRIVATE')).toBe(false);
+    expect(fetched.has('D_DM')).toBe(false);
+    expect(fetched.has(BUSY_CHANNEL)).toBe(true);
+    expect(inserts.every((r) => r.source_record_id.startsWith('C'))).toBe(true);
   });
 
   test('backfill calls getValidAccessToken (custody refresh) and uses the fresh BARE token', async () => {
     const { engine } = makeFakeEngine();
     const { calls } = stubHistoryFetch([historyPage1, historyPage2]);
 
-    await slackConnector.backfill!(engine, sourceWithChannels());
+    await slackConnector.backfill!(engine, makeSource({ channels: [BUSY_CHANNEL] }));
 
     expect(getValidAccessTokenMock).toHaveBeenCalled();
     expect(refreshCount).toBeGreaterThanOrEqual(1);
-    // getValidAccessToken returns a BARE token; the connector prepends `Bearer `.
     expect(issuedToken).not.toContain('Bearer');
     expect(calls[0].auth).toBe(`Bearer ${issuedToken}`);
     expect(calls[0].auth).toContain('fresh-token');
@@ -388,22 +509,24 @@ describe('Slack backfill (AC2: conversations.history cursor + ts watermark)', ()
 
   test('a re-fetch of the SAME messages is a no-op (ON CONFLICT) — duplicate-delivery safe', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const records = slackConnector.normalize(selectedChannelEvent, OPT_IN_CHANNELS);
+    const records = slackConnector.normalize(selectedChannelEvent, makeSource({ channels: [BUSY_CHANNEL] }));
     await landRecords(engine, 'src-1', slackConnector, records);
     const firstCount = inserts.length;
     const second = await landRecords(engine, 'src-1', slackConnector, records);
-    expect(second.written).toBe(0); // ON CONFLICT DO NOTHING
+    expect(second.written).toBe(0);
     expect(inserts.length).toBe(firstCount);
   });
 
   test('a secret in a backfilled message body never reaches a candidate verbatim', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const { } = stubHistoryFetch([historyPage1, historyPage2]);
-    await slackConnector.backfill!(engine, sourceWithChannels());
+    stubHistoryFetch([historyPage1, historyPage2]);
+    await slackConnector.backfill!(engine, makeSource({ channels: [BUSY_CHANNEL] }));
     const blob = JSON.stringify(inserts);
-    // The body (text) is dropped by minimize — neither the OpenAI-shaped secret nor the
-    // surrounding prose appears on any candidate.
     expect(blob).not.toContain(OPENAI_SECRET);
     expect(blob).not.toContain('Second backfilled message');
+  });
+
+  test('readBackfillCursors returns {} on a never-backfilled source', () => {
+    expect(readBackfillCursors(makeSource())).toEqual({});
   });
 });

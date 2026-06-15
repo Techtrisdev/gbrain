@@ -150,6 +150,10 @@ const leakyConnector: SaaSConnector = {
   }),
 };
 
+/** A minimal resolved source for the receiver-shape `normalize(payload, source)` call.
+ *  These inline connectors ignore `source`; it satisfies the SaaSConnector signature. */
+const SRC: ConnectorSource = { id: 'src-1', config: {} };
+
 /** Fake engine that records executeRaw calls and simulates toRow's INSERT…RETURNING. */
 function makeFakeEngine(opts: { conflict?: boolean } = {}) {
   const calls: { sql: string; params: unknown[] }[] = [];
@@ -169,7 +173,7 @@ function makeFakeEngine(opts: { conflict?: boolean } = {}) {
 describe('landRecords — redaction choke point', () => {
   test('drops the body, masks secrets, and re-strips proposed_markdown', async () => {
     const { engine, calls } = makeFakeEngine();
-    const records = leakyConnector.normalize(null);
+    const records = leakyConnector.normalize(null, SRC);
     const result = await landRecords(engine, 'src-1', leakyConnector, records);
 
     expect(result).toEqual({ written: 1, total: 1 });
@@ -197,7 +201,7 @@ describe('landRecords — redaction choke point', () => {
 
   test('idempotent conflict surfaces written=0 but total=1', async () => {
     const { engine } = makeFakeEngine({ conflict: true });
-    const result = await landRecords(engine, 'src-1', leakyConnector, leakyConnector.normalize(null));
+    const result = await landRecords(engine, 'src-1', leakyConnector, leakyConnector.normalize(null, SRC));
     expect(result).toEqual({ written: 0, total: 1 });
   });
 
@@ -242,7 +246,7 @@ const slugLeakConnector: SaaSConnector = {
 describe('toRow write boundary — every output field is redacted, incl. the generated stub', () => {
   test('strips proposed_slug, rationale_ref, provider, version, and the stub-generated proposed_markdown', async () => {
     const { engine, calls } = makeFakeEngine();
-    await landRecords(engine, 'src-1', slugLeakConnector, slugLeakConnector.normalize(null));
+    await landRecords(engine, 'src-1', slugLeakConnector, slugLeakConnector.normalize(null, SRC));
 
     const insert = calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql));
     expect(insert).toBeDefined();

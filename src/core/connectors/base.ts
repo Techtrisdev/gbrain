@@ -67,8 +67,25 @@ export interface SaaSConnector {
   verifyWebhook(rawBody: Buffer, headers: Record<string, string | undefined>, secret: string): boolean;
   /** Extract the account/workspace id from a parsed payload, used to resolve the source. */
   accountFromPayload(payload: unknown): string | null;
-  /** Normalize a verified payload into 0+ records (pre-redaction). */
-  normalize(payload: unknown): NormalizedRecord[];
+  /**
+   * Optional UNSIGNED handshake hook, consulted by the receiver BEFORE the signature
+   * gate. Some providers (Slack's Events API `url_verification`) post an unsigned
+   * one-time challenge to prove endpoint ownership; that request carries no usable
+   * signature, so it must be answered before HMAC verification or the provider can
+   * never finish wiring the webhook. A connector returns `{ challenge }` to echo, or
+   * null/undefined when the payload is not a handshake (the normal signed path then
+   * proceeds). The receiver only ever echoes the challenge string — no DB touched, no
+   * record landed. Connectors WITHOUT a handshake omit this; the receiver skips it.
+   */
+  handshake?(payload: unknown): { challenge: string } | null;
+  /**
+   * Normalize a verified payload into 0+ records (pre-redaction). Receives the resolved
+   * `source` so a connector can apply per-source config (e.g. Slack's opt-in channel
+   * allowlist at config.connectors[provider].channels[]). The receiver passes the
+   * already-resolved source; connectors that ingest everything (e.g. Linear) simply
+   * ignore it.
+   */
+  normalize(payload: unknown, source: ConnectorSource): NormalizedRecord[];
   /** Map a (minimized) record to a candidate item. The framework forwards this to
    *  toRow, which re-redacts the page-body-bound output fields (proposed_markdown,
    *  proposed_slug, rationale_ref) at the write boundary. NOTE: if the returned item

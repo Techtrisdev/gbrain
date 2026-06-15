@@ -342,7 +342,9 @@ export const linearConnector: SaaSConnector = {
    * MATERIAL status/field change, ALSO emit a typed redacted rationale take as a
    * second record. Both flow through landRecords (minimize + redact + table-only).
    */
-  normalize(payload): NormalizedRecord[] {
+  normalize(payload, _source?): NormalizedRecord[] {
+    // Linear ingests ALL issues/comments — there is no per-source allowlist, so the
+    // resolved `source` is accepted (interface contract) but intentionally ignored.
     const p = (asRecord(payload) ?? {}) as LinearWebhookPayload;
     const data = asRecord(p.data);
     if (!data) return [];
@@ -435,12 +437,15 @@ export const linearConnector: SaaSConnector = {
       const page = await fetchIssuesPage(token, watermark, cursor);
       const records: NormalizedRecord[] = [];
       for (const issue of page.nodes) {
-        const norm = this.normalize({
-          type: 'Issue',
-          action: 'backfill',
-          data: issue,
-          organizationId: undefined,
-        });
+        const norm = this.normalize(
+          {
+            type: 'Issue',
+            action: 'backfill',
+            data: issue,
+            organizationId: undefined,
+          },
+          source,
+        );
         records.push(...norm);
         const u = str(issue.updatedAt);
         if (u && (!newestUpdatedAt || u > newestUpdatedAt)) newestUpdatedAt = u;

@@ -2019,21 +2019,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return;
       }
 
-      // (2) Pre-DB signature-presence short-circuit (D3). Probe traffic without
-      //     the provider's signature header never reaches the source lookup.
-      const sigHeader = req.header(connector.signatureHeader);
-      if (!sigHeader) {
-        res.status(401).json({ error: 'missing_signature', message: `${connector.signatureHeader} header is required` });
-        return;
-      }
-
       const payload = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body), 'utf8');
       if (payload.length === 0) {
         res.status(400).json({ error: 'empty_body' });
         return;
       }
 
-      // (3) Parse + resolve the account (both in-memory) before any DB query.
+      // (2) Parse the body BEFORE the signature gate so an UNSIGNED provider handshake
+      //     (Slack's url_verification challenge) can be answered. Slack's challenge
+      //     carries no usable signature, so checking it after the missing-signature
+      //     short-circuit would 401 it and the endpoint would never verify.
       let parsed: unknown;
       try {
         parsed = JSON.parse(payload.toString('utf8'));
@@ -2041,6 +2036,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         res.status(400).json({ error: 'malformed_json' });
         return;
       }
+
+      // (2a) Connector-opt-in handshake (NO DB, NO record landed). The connector decides
+      //      whether the parsed body is its provider's ownership-proof challenge; the
+      //      receiver only echoes the returned challenge string. Connectors without a
+      //      handshake hook skip this entirely.
+      const handshake = connector.handshake?.(parsed);
+      if (handshake) {
+        res.status(200).json({ challenge: handshake.challenge });
+        return;
+      }
+
+      // (3) Pre-DB signature-presence short-circuit (D3). Probe traffic without
+      //     the provider's signature header never reaches the source lookup.
+      const sigHeader = req.header(connector.signatureHeader);
+      if (!sigHeader) {
+        res.status(401).json({ error: 'missing_signature', message: `${connector.signatureHeader} header is required` });
+        return;
+      }
+
+      // (4) Resolve the account (in-memory) before any DB query.
       const account = connector.accountFromPayload(parsed);
       if (!account) {
         res.status(400).json({ error: 'missing_account', message: 'could not resolve a source account from the payload' });
@@ -2097,9 +2112,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       // (7) Normalize → redact → table-only candidate. landRecords is the single
-      //     redaction choke point; it NEVER writes a page. 202 fast-ack.
+      //     redaction choke point; it NEVER writes a page. 202 fast-ack. normalize
+      //     receives the resolved source so per-source config (e.g. Slack's opt-in
+      //     channel allowlist) is applied at the single, authoritative call site.
       try {
-        const records = connector.normalize(parsed);
+        const records = connector.normalize(parsed, { id: source.id, config: source.config });
         const result = await landRecords(engine, source.id, connector, records);
         res.status(202).json({ status: 'accepted', source_id: source.id, provider, written: result.written, total: result.total });
       } catch (err) {

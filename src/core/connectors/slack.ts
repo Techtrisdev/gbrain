@@ -21,13 +21,21 @@
  * per-source opt-in list at sources.config.connectors.slack.channels[]. DM events
  * (channel_type `im`/`mpim`) are ALWAYS ignored — no DM scopes are ever requested.
  *
+ * url_verification handshake (AC1): Slack proves endpoint ownership with an UNSIGNED
+ * `{type:'url_verification', challenge}` POST. That request carries no usable signature,
+ * so the connector exposes a `handshake(payload)` hook the generic receiver consults
+ * BEFORE the signature gate; we echo the challenge (no DB touched, no record landed). The
+ * normal signed `event_callback` path is unaffected (handshake returns null for it).
+ *
  * OAuth + backfill (AC2): granular bot scopes `channels:read`, `channels:history` on
  * opt-in public channels only (NO DM scopes), via Slack OAuth v2 (`oauth.v2.access`),
  * registered with the custody module (TECH-2033) at module load. backfill() pages
- * `conversations.history` with a cursor per opt-in channel, persisting the watermark
- * under sources.config.connectors.slack.backfill_cursor (newest message `ts` seen) so a
- * resumed run yields no duplicates (and landRecords' ON CONFLICT makes a re-fetch a safe
- * no-op).
+ * `conversations.history` with a cursor per opt-in channel, persisting a PER-CHANNEL
+ * watermark map under sources.config.connectors.slack.backfill_cursor
+ * ({ [channelId]: newestTs }) so a quiet channel's gap is never skipped by a louder
+ * sibling, and the write is MONOTONIC (GREATEST(existing, new)) so a concurrent/retried
+ * run can never move a cursor backward. A resumed run yields no duplicates (and
+ * landRecords' ON CONFLICT makes a re-fetch a safe no-op).
  *
  * Tests mock getValidAccessToken + the Slack Web API (recorded fixtures) — no real
  * custody module or network required.
@@ -99,6 +107,14 @@ const SIGNATURE_VERSION = 'v0';
 const TIMESTAMP_WINDOW_SECONDS = 300;
 /** comms source class — drops bodies, allowlists channel/author/ts/permalink/etc. */
 const PROFILE = 'comms';
+/**
+ * Cap the structural summary line length (mirrors linear.ts's MAX_TITLE_LEN). Bounds any
+ * residual surface a holder of the per-source signing secret could smuggle through the
+ * channel/author/ts fields the summary interpolates — strip() already masks
+ * regex-detectable PII/secrets; this cap bounds what strip() can't see. The summary is a
+ * structural label (channel + author + ts), never body-derived, so 200 is ample.
+ */
+const MAX_SUMMARY_LEN = 200;
 
 /** Slack OAuth v2 + Web API endpoints. */
 const SLACK_OAUTH_AUTHORIZE_URL = 'https://slack.com/oauth/v2/authorize';
@@ -247,7 +263,8 @@ function summaryForMessage(event: SlackMessageEvent): string {
   const author = str(event.user) ?? str(event.bot_id) ?? 'unknown';
   const ts = str(event.ts) ?? '';
   const threadMarker = event.thread_ts && event.thread_ts !== event.ts ? ' (thread reply)' : '';
-  return `Message in ${channel} by ${author}${threadMarker} @ ${ts}`;
+  // Cap the assembled label (MAX_SUMMARY_LEN) — see the constant's rationale.
+  return `Message in ${channel} by ${author}${threadMarker} @ ${ts}`.slice(0, MAX_SUMMARY_LEN);
 }
 
 /**
@@ -263,6 +280,16 @@ function recordForMessage(event: SlackMessageEvent): NormalizedRecord {
   // the channel+ts pair is globally stable (and deterministic — a duplicate delivery of
   // the same message yields the same key → ON CONFLICT no-op).
   const sourceRecordId = `${channel}:${ts}`;
+
+  // NOTE (copied from linear.ts, deliberately): structural metadata is intentionally NOT
+  // surfaced on the candidate. toCandidate emits only the redacted summary (as
+  // proposed_markdown) + provider / slug / confidence — it does not pass `item.metadata`
+  // through to a row. We deliberately do NOT build a metadata object here: a copycat
+  // connector must not assume metadata is written, or it would inherit the unstripped-array
+  // hole (minimize keeps allowlisted arrays verbatim — array elements are not run through
+  // strip()). If a future ticket surfaces metadata (e.g. a reactions[] / files[] array),
+  // it MUST add per-element string stripping first.
+
   return {
     sourceRecordId,
     profile: PROFILE,
@@ -281,6 +308,22 @@ function recordForMessage(event: SlackMessageEvent): NormalizedRecord {
 export const slackConnector: SaaSConnector = {
   provider: PROVIDER,
   signatureHeader: SIGNATURE_HEADER,
+
+  /**
+   * AC1: the UNSIGNED Events API ownership handshake. Slack POSTs
+   * `{type:'url_verification', challenge:'<nonce>'}` (no signature) when an operator first
+   * sets the request URL; the endpoint must echo `{challenge}` or Slack never marks it
+   * verified and NO events are ever delivered. The receiver consults this BEFORE the
+   * signature gate and only ever echoes the returned challenge string — no DB, no record.
+   * Returns null for every other payload (the normal signed `event_callback` path then
+   * proceeds), so this cannot be abused to bypass signing for real events.
+   */
+  handshake(payload): { challenge: string } | null {
+    const p = asRecord(payload);
+    if (!p || p.type !== 'url_verification') return null;
+    const challenge = str(p.challenge);
+    return challenge ? { challenge } : null;
+  },
 
   /**
    * AC3: Slack `v0` signing-secret verification. `X-Slack-Signature` is
@@ -331,15 +374,13 @@ export const slackConnector: SaaSConnector = {
    * (return []). Non-`message` events, message subtypes (edits/joins/bot noise), and
    * url_verification envelopes are also ignored — only a plain channel post is ingested.
    *
-   * The opt-in channel list is resolved from the SOURCE config, which normalize() does not
-   * receive — so normalize takes an OPTIONAL second arg carrying it. The framework's
-   * landRecords → toCandidate path calls normalize(payload) with one arg; for inbound
-   * webhooks the receiver must pass the opt-in list. Where the list is absent (the generic
-   * one-arg call), we fail CLOSED and ingest nothing, because an un-gated message could
-   * carry a non-opt-in channel. (Backfill calls normalizeMessage directly per opt-in
-   * channel, so it never relies on this path.)
+   * The opt-in channel allowlist is resolved from `source` (the framework's
+   * /webhooks/:provider receiver passes the already-resolved source to its SINGLE
+   * normalize call site). `readOptInChannels` reads
+   * sources.config.connectors.slack.channels[]; a channel absent from it is dropped
+   * (fail-closed: an empty/missing list ingests nothing).
    */
-  normalize(payload: unknown, optInChannels?: readonly string[]): NormalizedRecord[] {
+  normalize(payload: unknown, source: ConnectorSource): NormalizedRecord[] {
     const env = (asRecord(payload) ?? {}) as SlackEventEnvelope;
     if (env.type !== 'event_callback') return [];
     const event = env.event;
@@ -351,9 +392,8 @@ export const slackConnector: SaaSConnector = {
     const channel = str(event.channel);
     const ts = str(event.ts);
     if (!channel || !ts) return [];
-    // Opt-in gate: the channel MUST be in the per-source list. Fail-closed when the list
-    // is absent (generic one-arg call) — ingest nothing rather than an un-gated channel.
-    const allowed = optInChannels ?? [];
+    // Opt-in gate: the channel MUST be in the per-source allowlist resolved from `source`.
+    const allowed = readOptInChannels(source);
     if (!allowed.includes(channel)) return [];
 
     return [recordForMessage(event)];
@@ -377,26 +417,38 @@ export const slackConnector: SaaSConnector = {
   },
 
   /**
-   * AC2: outbound backfill. For each opt-in public channel, pages
-   * `conversations.history` with cursor pagination, landing each page through the SAME
-   * landRecords redaction path. Advances a single global watermark (the newest message
-   * `ts` seen across all channels) in sources.config.connectors.slack.backfill_cursor;
-   * `oldest` is set to it so a resumed run re-fetches nothing (and landRecords' ON
-   * CONFLICT makes any overlap a safe no-op).
+   * AC2: outbound backfill. For each opt-in public channel, pages `conversations.history`
+   * with cursor pagination, landing each page through the SAME landRecords redaction path.
+   *
+   * Each channel advances its OWN watermark (sources.config.connectors.slack.backfill_cursor
+   * is a `{ [channelId]: newestTs }` map), so a quiet channel's older-than-the-loudest
+   * messages are never skipped (the cross-channel-skip bug a single global cursor caused).
+   * `oldest` is the channel's own watermark with `inclusive=false`, so a resumed run
+   * re-fetches nothing (and landRecords' ON CONFLICT makes any overlap a safe no-op). The
+   * per-channel write is MONOTONIC (GREATEST(existing,new) inside jsonb_set) so a
+   * concurrent/retried run can never move a channel's cursor backward.
    */
   async backfill(engine: BrainEngine, source: ConnectorSource): Promise<number> {
     const { landRecords } = await import('./base.ts');
     const token = await getValidAccessToken(engine, source.id, PROVIDER);
     const channels = readOptInChannels(source);
-    const watermark = readBackfillWatermark(source);
+    const cursors = readBackfillCursors(source);
 
     let landed = 0;
-    let newestTs = watermark;
 
     for (const channel of channels) {
+      // Opt-in channels are operator-curated PUBLIC channels; a DM/group-DM id must never
+      // appear here (no DM scopes are ever granted). Re-assert the public-channel class on
+      // backfill so a mis-curated config can't pull a private conversation's history. Slack
+      // channel ids encode class in their leading char: C=public, G=private/legacy-group,
+      // D=DM. Skip anything not a public-channel id.
+      if (!isPublicChannelId(channel)) continue;
+
+      const channelWatermark = str(cursors[channel]) || null;
+      let newestTs = channelWatermark;
       let cursor: string | null = null;
       do {
-        const page = await fetchHistoryPage(token, channel, watermark, cursor);
+        const page = await fetchHistoryPage(token, channel, channelWatermark, cursor);
         const records: NormalizedRecord[] = [];
         for (const msg of page.messages) {
           // Skip subtypes (edits/joins/bot noise) on backfill too — only plain posts.
@@ -410,16 +462,23 @@ export const slackConnector: SaaSConnector = {
         landed += result.written;
         cursor = page.hasMore ? page.nextCursor : null;
       } while (cursor);
-    }
 
-    // Persist the advanced watermark so the next run resumes after the newest message.
-    if (newestTs && newestTs !== watermark) {
-      await writeBackfillWatermark(engine, source, newestTs);
+      // Persist this channel's advanced watermark MONOTONICALLY (the write only moves it
+      // forward), so a concurrent/retried run that observed an older `newestTs` can't
+      // regress the stored cursor.
+      if (newestTs && newestTs !== channelWatermark) {
+        await writeBackfillWatermark(engine, source, channel, newestTs);
+      }
     }
 
     return landed;
   },
 };
+
+/** Slack channel id class: C=public channel, G=private/group, D=DM. Only C ingested. */
+function isPublicChannelId(channelId: string): boolean {
+  return channelId.startsWith('C');
+}
 
 /**
  * Compare two Slack message `ts` values ("1700000000.000100"). They are decimal-string
@@ -436,31 +495,73 @@ function compareTs(a: string, b: string): number {
 
 // ── Backfill watermark persistence (sources.config.connectors.slack.*) ───────────
 
-/** Read the persisted `ts` watermark, or null on first run. */
-export function readBackfillWatermark(source: ConnectorSource): string | null {
+/**
+ * Read the persisted PER-CHANNEL watermark map ({ [channelId]: ts }), or {} on first run.
+ * Tolerates a string-encoded config. A legacy SCALAR backfill_cursor (from an earlier
+ * single-global-cursor build, if any) is ignored — it is not a map, so it reads as {} and
+ * the next run rebuilds per-channel cursors (re-fetching is a safe ON CONFLICT no-op).
+ */
+export function readBackfillCursors(source: ConnectorSource): Record<string, unknown> {
   const raw = typeof source.config === 'string' ? safeParseConfig(source.config) : source.config;
   const connectors = asRecord(raw?.connectors);
   const slack = asRecord(connectors?.[PROVIDER]);
-  return str(slack?.backfill_cursor) ?? null;
+  return asRecord(slack?.backfill_cursor) ?? {};
+}
+
+/** Read a single channel's persisted watermark, or null. (Convenience for tests/callers.) */
+export function readChannelWatermark(source: ConnectorSource, channel: string): string | null {
+  return str(readBackfillCursors(source)[channel]) ?? null;
 }
 
 /**
- * Persist ONLY the watermark via a surgical `jsonb_set` against the CURRENT row, so a
- * concurrent sibling config write (e.g. a secret rotation between our read and write) is
- * not clobbered by a whole-config UPDATE from a stale snapshot. `jsonb_set` with
- * `create_missing = true` mutates only the {connectors,slack,backfill_cursor} path; the
- * parent objects must exist (connector enable always creates connectors.slack first).
+ * Persist ONE channel's watermark via a surgical, MONOTONIC `jsonb_set` against the CURRENT
+ * row. Two properties matter:
+ *
+ *  - SURGICAL: only the {connectors,slack,backfill_cursor,<channel>} path is written, so a
+ *    concurrent sibling config write (e.g. a secret rotation, or another channel's cursor
+ *    advancing in a parallel run) is not clobbered by a whole-config UPDATE from a stale
+ *    snapshot.
+ *  - MONOTONIC: the new value is `GREATEST(existing, $1)` computed server-side against the
+ *    CURRENT row, so a concurrent/retried run that observed an OLDER newestTs can never
+ *    move the stored cursor backward (the regression the reviewer flagged). The existing
+ *    value is read back inside the same statement (coalesced to '' when absent) and
+ *    compared as text — Slack `ts` strings are zero-padded decimal, so lexical compare
+ *    agrees with chronological order for same-width values; we additionally cast to
+ *    numeric-safe text via the `>` on the decimal strings being equal-width.
+ *
+ * `jsonb_set` with `create_missing = true` needs the parent objects present; connector
+ * enable always creates connectors.slack, and we seed `backfill_cursor` to `{}` on the
+ * first write via COALESCE so the channel key can be added.
  */
 export async function writeBackfillWatermark(
   engine: BrainEngine,
   source: ConnectorSource,
+  channel: string,
   watermark: string,
 ): Promise<void> {
+  // GREATEST over the decimal `ts` strings, computed against the CURRENT row. We compare
+  // the existing channel cursor (coalesced to '0') with the candidate numerically so the
+  // write only ever advances. The whole backfill_cursor object is COALESCE'd to '{}' so the
+  // first write on a never-backfilled source still has a parent object for the channel key.
   await engine.executeRaw(
     `UPDATE sources
-        SET config = jsonb_set(config, '{connectors,slack,backfill_cursor}', to_jsonb($1::text), true)
-      WHERE id = $2`,
-    [watermark, source.id],
+        SET config = jsonb_set(
+              jsonb_set(config, '{connectors,slack,backfill_cursor}',
+                        COALESCE(config #> '{connectors,slack,backfill_cursor}', '{}'::jsonb), true),
+              ARRAY['connectors','slack','backfill_cursor', $2::text],
+              to_jsonb(
+                CASE
+                  WHEN (config #>> ARRAY['connectors','slack','backfill_cursor', $2::text]) IS NULL
+                    THEN $3::text
+                  WHEN (config #>> ARRAY['connectors','slack','backfill_cursor', $2::text])::numeric
+                       >= ($3::text)::numeric
+                    THEN (config #>> ARRAY['connectors','slack','backfill_cursor', $2::text])
+                  ELSE $3::text
+                END
+              ),
+              true)
+      WHERE id = $1`,
+    [source.id, channel, watermark],
   );
 }
 
