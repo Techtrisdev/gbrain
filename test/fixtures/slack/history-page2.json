@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "subtype": "channel_join",
+      "user": "U_PAT",
+      "text": "has joined the channel",
+      "ts": "1700000300.000100"
+    },
+    {
+      "type": "message",
+      "user": "U_PAT",
+      "text": "Third backfilled message — the newest one.",
+      "ts": "1700000400.000100"
+    }
+  ],
+  "has_more": false,
+  "response_metadata": { "next_cursor": "" }
+}

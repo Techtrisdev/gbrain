@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "user": "U_LEE",
+      "text": "The single message in the quiet channel — older than the busy channel's newest.",
+      "ts": "1700000150.000100"
+    }
+  ],
+  "has_more": false,
+  "response_metadata": { "next_cursor": "" }
+}

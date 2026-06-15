@@ -64,6 +64,10 @@ const backfillPage2 = loadFixture('graphql-backfill-page2.json');
 const SECRET_MARKER = 'AKIAIOSFODNN7EXAMPLE'; // AWS-key-shaped; strip() masks it
 const WEBHOOK_SECRET = 'linear-webhook-signing-secret';
 
+/** The receiver passes the resolved source to normalize(payload, source); Linear ignores
+ *  it (ingests all issues). A minimal source satisfies the SaaSConnector signature. */
+const SRC: ConnectorSource = { id: 'src-1', config: {} };
+
 // ── Fake engine: captures connector_candidates INSERTs + sources config UPDATEs ──
 
 /**
@@ -156,7 +160,7 @@ function stubGraphqlFetch(pages: unknown[]): { calls: { variables: any; auth: st
 describe('Linear webhook: status change → candidate(s)', () => {
   test('emits a high-confidence pending primary candidate AND a typed take', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const records = linearConnector.normalize(statusChange);
+    const records = linearConnector.normalize(statusChange, SRC);
 
     // Two records: the Issue candidate + the typed take (status went to completed).
     expect(records).toHaveLength(2);
@@ -198,7 +202,7 @@ describe('Linear webhook: status change → candidate(s)', () => {
         updatedAt: '2026-06-14T12:00:00.000Z',
       },
     };
-    const records = linearConnector.normalize(assigneeChange);
+    const records = linearConnector.normalize(assigneeChange, SRC);
     const take = records.find((r) => r.sourceRecordId.includes(':take:'))!;
     expect(take.sourceRecordId).toBe('issue-uuid-2:take:commitment:2026-06-14T12:00:00.000Z');
     expect(take.item.summary).toContain('Dana');
@@ -212,7 +216,7 @@ describe('Linear webhook: status change → candidate(s)', () => {
       updatedFrom: { title: 'old title' }, // not a material field
       data: { id: 'issue-uuid-3', identifier: 'ENG-9', title: 'new title', updatedAt: '2026-06-14T12:00:00.000Z' },
     };
-    expect(linearConnector.normalize(titleEdit)).toHaveLength(1);
+    expect(linearConnector.normalize(titleEdit, SRC)).toHaveLength(1);
   });
 });
 
@@ -339,7 +343,7 @@ describe('Linear backfill (AC2: updatedAt cursor + watermark, resume-safe)', () 
 
   test('a re-fetch of the SAME records is a no-op (ON CONFLICT) — duplicate-delivery safe', async () => {
     const { engine, inserts } = makeFakeEngine();
-    const records = linearConnector.normalize(statusChange);
+    const records = linearConnector.normalize(statusChange, SRC);
     await landRecords(engine, 'src-1', linearConnector, records);
     const firstCount = inserts.length;
     // Land the identical records again — same (source, source_record_id, version) keys.
@@ -396,8 +400,8 @@ describe('Linear backfill (AC2: updatedAt cursor + watermark, resume-safe)', () 
       },
     });
 
-    await landRecords(engine, 'src-1', linearConnector, linearConnector.normalize(completionAt('2026-06-14T10:00:00.000Z')));
-    await landRecords(engine, 'src-1', linearConnector, linearConnector.normalize(completionAt('2026-06-15T10:00:00.000Z')));
+    await landRecords(engine, 'src-1', linearConnector, linearConnector.normalize(completionAt('2026-06-14T10:00:00.000Z'), SRC));
+    await landRecords(engine, 'src-1', linearConnector, linearConnector.normalize(completionAt('2026-06-15T10:00:00.000Z'), SRC));
 
     const takes = inserts.filter((r) => r.source_record_id.includes(':take:decision:'));
     expect(takes).toHaveLength(2);
@@ -405,7 +409,7 @@ describe('Linear backfill (AC2: updatedAt cursor + watermark, resume-safe)', () 
     expect(takes[1].source_record_id).toBe('issue-recompletion:take:decision:2026-06-15T10:00:00.000Z');
 
     // Re-delivery of the SAME event still dedupes (deterministic key).
-    const dup = await landRecords(engine, 'src-1', linearConnector, linearConnector.normalize(completionAt('2026-06-15T10:00:00.000Z')));
+    const dup = await landRecords(engine, 'src-1', linearConnector, linearConnector.normalize(completionAt('2026-06-15T10:00:00.000Z'), SRC));
     expect(dup.written).toBe(0);
   });
 });
@@ -449,7 +453,7 @@ describe('Linear redaction (AC5: secret in a description is masked)', () => {
         updatedAt: '2026-06-14T12:00:00.000Z',
       },
     };
-    const records = linearConnector.normalize(payload);
+    const records = linearConnector.normalize(payload, SRC);
     await landRecords(engine, 'src-1', linearConnector, records);
 
     const blob = JSON.stringify(inserts);
@@ -471,7 +475,7 @@ describe('Linear redaction (AC5: secret in a description is masked)', () => {
         updatedAt: '2026-06-14T12:00:00.000Z',
       },
     };
-    const records = linearConnector.normalize(payload);
+    const records = linearConnector.normalize(payload, SRC);
     await landRecords(engine, 'src-1', linearConnector, records);
 
     const candidate = inserts.find((r) => r.source_record_id === 'issue-secret-2')!;
@@ -499,7 +503,7 @@ describe('Linear redaction (AC5: secret in a description is masked)', () => {
         updatedAt: '2026-06-14T12:00:00.000Z',
       },
     };
-    const records = linearConnector.normalize(payload);
+    const records = linearConnector.normalize(payload, SRC);
     await landRecords(engine, 'src-1', linearConnector, records);
 
     const candidate = inserts.find((r) => r.source_record_id === 'comment-1')!;
@@ -533,7 +537,7 @@ describe('Linear redaction (AC5: secret in a description is masked)', () => {
         updatedAt: '2026-06-14T12:00:00.000Z',
       },
     };
-    const records = linearConnector.normalize(payload);
+    const records = linearConnector.normalize(payload, SRC);
     await landRecords(engine, 'src-1', linearConnector, records);
     expect(JSON.stringify(inserts)).not.toContain(SECRET_MARKER);
   });
@@ -558,7 +562,7 @@ describe('Linear classifyTake — priority direction (finding 4)', () => {
     };
   }
   function takeTypeOf(payload: Record<string, unknown>): string {
-    const take = linearConnector.normalize(payload).find((r) => r.sourceRecordId.includes(':take:'))!;
+    const take = linearConnector.normalize(payload, SRC).find((r) => r.sourceRecordId.includes(':take:'))!;
     return take.sourceRecordId.split(':take:')[1].split(':')[0];
   }
 

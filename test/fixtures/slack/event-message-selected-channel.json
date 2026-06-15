@@ -1,0 +1,15 @@
+{
+  "type": "event_callback",
+  "team_id": "T_ACME_123",
+  "api_app_id": "A_GBRAIN_1",
+  "event_id": "Ev_delivery_0001",
+  "event_time": 1700000000,
+  "event": {
+    "type": "message",
+    "channel": "C_ENG_GENERAL",
+    "channel_type": "channel",
+    "user": "U_JORDAN",
+    "text": "Decided to ship the Slack connector behind the v0 signing gate. Key AKIAIOSFODNN7EXAMPLE rotated.",
+    "ts": "1700000000.000100"
+  }
+}

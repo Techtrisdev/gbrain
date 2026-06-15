@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "type": "message",
+      "user": "U_SAM",
+      "text": "First backfilled message in the eng channel.",
+      "ts": "1700000100.000100"
+    },
+    {
+      "type": "message",
+      "user": "U_ROBIN",
+      "text": "Second backfilled message — secret sk-abcdefghijklmnopqrstuvwxyz012345 leaked.",
+      "ts": "1700000200.000100"
+    }
+  ],
+  "has_more": true,
+  "response_metadata": { "next_cursor": "cursor-page-1" }
+}
