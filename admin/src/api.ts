@@ -50,4 +50,33 @@ export const api = {
     apiFetch(`/admin/api/calibration/profile${holder ? `?holder=${encodeURIComponent(holder)}` : ''}`),
   calibrationChart: (type: string, holder?: string) =>
     apiFetchText(`/admin/api/calibration/charts/${encodeURIComponent(type)}${holder ? `?holder=${encodeURIComponent(holder)}` : ''}`),
+
+  // Connectors + candidate review queue (TECH-2036). Every mutation here is the SAME
+  // agent-callable endpoint the UI uses — no UI-only action (agent-native parity).
+  connectors: () => apiFetch('/admin/api/connectors'),
+  connectorConnect: (provider: string, sourceId: string) =>
+    apiFetch(`/admin/api/connectors/${encodeURIComponent(provider)}/connect`, {
+      method: 'POST', body: JSON.stringify({ sourceId }),
+    }),
+  connectorDisconnect: (provider: string, sourceId: string) =>
+    apiFetch(`/admin/api/connectors/${encodeURIComponent(provider)}/disconnect`, {
+      method: 'POST', body: JSON.stringify({ sourceId }),
+    }),
+  connectorConfig: (
+    provider: string,
+    sourceId: string,
+    patch: { enabled?: boolean; selection?: unknown; policy?: unknown },
+  ) =>
+    apiFetch(`/admin/api/connectors/${encodeURIComponent(provider)}/config`, {
+      method: 'POST', body: JSON.stringify({ sourceId, ...patch }),
+    }),
+  candidates: (status = 'pending', page = 1, source = '') =>
+    apiFetch(
+      `/admin/api/candidates?status=${encodeURIComponent(status)}&page=${page}` +
+        (source ? `&source=${encodeURIComponent(source)}` : ''),
+    ),
+  candidateApprove: (id: number) =>
+    apiFetch(`/admin/api/candidates/${id}/approve`, { method: 'POST', body: JSON.stringify({}) }),
+  candidateReject: (id: number, reason: string) =>
+    apiFetch(`/admin/api/candidates/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) }),
 };

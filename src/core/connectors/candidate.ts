@@ -261,3 +261,189 @@ export async function toRow(
 
   return { written: true, row: rows[0] };
 }
+
+// ── Review queue (TECH-2036): list + act on pending candidates ────────────────────
+//
+// The admin review queue (admin/src/pages/ReviewQueue.tsx) and its agent-callable
+// /admin/api/candidates* routes are thin wrappers over these helpers. The candidate row's
+// own status / status_reason / acted_by / acted_at columns ARE the audit trail (gbrain has
+// no separate audit_logs table) — every act here stamps the actor + time. Approval hands the
+// row to the promotion-hook seam below; the bridge that fills it lives in TECH-2037.
+
+/** The connector_candidates columns, in row order — the single source of truth so every
+ *  SELECT / RETURNING produces an identical ConnectorCandidateRow shape. */
+const CANDIDATE_COLS = [
+  'id', 'source_id', 'source_record_id', 'version',
+  'source_record_ids', 'provider', 'proposed_slug', 'proposed_markdown',
+  'confidence', 'redactions', 'expires_at', 'as_of', 'rationale_ref',
+  'status', 'status_reason', 'acted_by', 'acted_at', 'superseded_by', 'proposed_at',
+] as const;
+/** Bare column list, for RETURNING / unqualified SELECT. */
+const CANDIDATE_COLUMNS = CANDIDATE_COLS.join(', ');
+/** Same columns, qualified by a table alias — for the JOINed review-queue SELECT. */
+const candidateColumnsAs = (alias: string): string => CANDIDATE_COLS.map((c) => `${alias}.${c}`).join(', ');
+
+/**
+ * Confidence at/above which a candidate carrying NO linked rationale `take` (rationale_ref)
+ * is flagged for explicit reviewer attention (AC4 — a high-confidence SoR field-change with no
+ * rationale should not be promoted on autopilot). A flag, never a block.
+ */
+export const NEEDS_RATIONALE_CONFIDENCE = 0.8;
+
+/** True when a candidate is high-confidence yet has no linked rationale `take`. Pure. */
+export function needsRationale(
+  row: Pick<ConnectorCandidateRow, 'confidence' | 'rationale_ref'>,
+): boolean {
+  return (row.confidence ?? 0) >= NEEDS_RATIONALE_CONFIDENCE && !row.rationale_ref;
+}
+
+/** A candidate row enriched for the review queue: the source's human name + the flag. */
+export interface ReviewCandidate extends ConnectorCandidateRow {
+  source_name: string | null;
+  needs_rationale: boolean;
+}
+
+export interface ListCandidatesOpts {
+  /** Default 'pending' — the review queue's working set. */
+  status?: 'pending' | 'accepted' | 'rejected';
+  /** Optional per-source filter. */
+  sourceId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface ListCandidatesResult {
+  rows: ReviewCandidate[];
+  total: number;
+  page: number;
+  pages: number;
+}
+
+/**
+ * List candidates (default: pending), newest-first, paginated, each enriched with the source
+ * name (LEFT JOIN sources) and the needs_rationale flag. Read-only — no side effects. The
+ * status + optional source filter are positional-parameterised; page size is clamped to
+ * [1, 200].
+ */
+export async function listCandidates(
+  engine: BrainEngine,
+  opts: ListCandidatesOpts = {},
+): Promise<ListCandidatesResult> {
+  const status = opts.status ?? 'pending';
+  const page = Math.max(1, Math.floor(opts.page ?? 1));
+  const pageSize = Math.min(200, Math.max(1, Math.floor(opts.pageSize ?? 50)));
+  const offset = (page - 1) * pageSize;
+
+  const filters: string[] = ['c.status = $1'];
+  const params: unknown[] = [status];
+  if (opts.sourceId) {
+    params.push(opts.sourceId);
+    filters.push(`c.source_id = $${params.length}`);
+  }
+  const where = filters.join(' AND ');
+  const limitParam = `$${params.length + 1}`;
+  const offsetParam = `$${params.length + 2}`;
+
+  const rows = await engine.executeRaw<ConnectorCandidateRow & { source_name: string | null }>(
+    `SELECT ${candidateColumnsAs('c')}, s.name AS source_name
+       FROM connector_candidates c
+       LEFT JOIN sources s ON s.id = c.source_id
+      WHERE ${where}
+      ORDER BY c.proposed_at DESC, c.id DESC
+      LIMIT ${limitParam} OFFSET ${offsetParam}`,
+    [...params, pageSize, offset],
+  );
+  const [countRow] = await engine.executeRaw<{ total: number }>(
+    `SELECT count(*)::int AS total FROM connector_candidates c WHERE ${where}`,
+    params,
+  );
+  const total = countRow?.total ?? 0;
+  return {
+    rows: rows.map((r) => ({ ...r, needs_rationale: needsRationale(r) })),
+    total,
+    page,
+    pages: Math.max(1, Math.ceil(total / pageSize)),
+  };
+}
+
+/**
+ * Reject a PENDING candidate: status→rejected + reviewer's reason + actor/time audit. Guarded
+ * by `status = 'pending'` so a double-submit or a race on an already-acted row is a safe no-op
+ * (returns null). The reason is redaction-stripped — a reviewer note must not become a new
+ * leak vector for a secret pasted from the candidate body.
+ */
+export async function rejectCandidate(
+  engine: BrainEngine,
+  id: number,
+  actor: string,
+  reason: string | null,
+): Promise<ConnectorCandidateRow | null> {
+  const rows = await engine.executeRaw<ConnectorCandidateRow>(
+    `UPDATE connector_candidates
+        SET status = 'rejected', status_reason = $2, acted_by = $3, acted_at = now()
+      WHERE id = $1 AND status = 'pending'
+      RETURNING ${CANDIDATE_COLUMNS}`,
+    [id, reason != null ? strip(reason) : null, strip(actor)],
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * The promotion-hook seam (AC3 / gt-promotion-hook). TECH-2036 defines the interface + the
+ * approve call site; TECH-2037 registers the real techtris-brain promotion bridge (open the
+ * markdown PR, reflect pr_url/indexed back). Until then no hook is registered and an approved
+ * candidate sits in an 'accepted'-pending, retriable state — never lost (TECH-2037 AC3).
+ */
+export interface PromotionHook {
+  (engine: BrainEngine, candidate: ConnectorCandidateRow, actor: string): Promise<{ prUrl?: string }>;
+}
+let promotionHook: PromotionHook | null = null;
+
+/** Register (or clear, with null) the promotion bridge invoked on candidate approval. */
+export function registerPromotionHook(fn: PromotionHook | null): void {
+  promotionHook = fn;
+}
+/** The currently-registered promotion hook, or null when none is wired (the v1 default). */
+export function getPromotionHook(): PromotionHook | null {
+  return promotionHook;
+}
+
+export interface ApproveResult {
+  /** The accepted row, or null when the id was not pending (not-found / already acted). */
+  row: ConnectorCandidateRow | null;
+  /** Whether a promotion bridge ran, and its outcome. `pending` = accepted but not yet
+   *  promoted (no hook, or the bridge threw) — retriable, never lost. */
+  promotion: { invoked: boolean; pending?: boolean; prUrl?: string; error?: string };
+}
+
+/**
+ * Approve a PENDING candidate: status→accepted + actor/time audit, then hand the row to the
+ * promotion hook. Marking accepted is committed BEFORE the bridge runs, so a bridge failure
+ * leaves an accepted-pending (retriable) row rather than losing the decision (TECH-2037 AC3).
+ * Guarded by `status = 'pending'` for idempotency.
+ */
+export async function approveCandidate(
+  engine: BrainEngine,
+  id: number,
+  actor: string,
+): Promise<ApproveResult> {
+  const rows = await engine.executeRaw<ConnectorCandidateRow>(
+    `UPDATE connector_candidates
+        SET status = 'accepted', acted_by = $2, acted_at = now()
+      WHERE id = $1 AND status = 'pending'
+      RETURNING ${CANDIDATE_COLUMNS}`,
+    [id, strip(actor)],
+  );
+  const row = rows[0] ?? null;
+  if (!row) return { row: null, promotion: { invoked: false } };
+
+  const hook = getPromotionHook();
+  if (!hook) return { row, promotion: { invoked: false, pending: true } };
+  try {
+    const result = await hook(engine, row, actor);
+    return { row, promotion: { invoked: true, prUrl: result.prUrl } };
+  } catch (err) {
+    // Bridge failure: the row stays 'accepted' (already committed) — retriable, never lost.
+    return { row, promotion: { invoked: false, pending: true, error: err instanceof Error ? err.message : String(err) } };
+  }
+}

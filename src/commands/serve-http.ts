@@ -45,6 +45,7 @@ import {
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
+import { listCandidates, approveCandidate, rejectCandidate } from '../core/connectors/candidate.ts';
 import {
   calendarConnector,
   incrementalSync,
@@ -2370,6 +2371,240 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const msg = err instanceof Error ? err.message : String(err);
       console.error('connector oauth callback: exchange/store error:', msg);
       res.status(502).json({ error: 'code_exchange_failed', message: msg });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // /admin/api/candidates* — connector candidate review queue (TECH-2036)
+  // ---------------------------------------------------------------------------
+  // The agent-native (AC5) review surface over the table-only connector_candidates
+  // store: list pending candidates, approve (→ the promotion-hook seam, TECH-2037),
+  // reject (→ status_reason + actor audit). The UI and an agent (JARVIS/Simon) call
+  // these identically — every admin action IS an API. The candidate row's own
+  // status / status_reason / acted_by / acted_at columns are the audit trail.
+  const CONNECTOR_PROVIDER_RE = /^[a-z0-9_]+$/;
+  const CANDIDATE_STATUSES = ['pending', 'accepted', 'rejected'] as const;
+
+  // requireAdmin authenticates one admin role (cookie session), so the acted_by
+  // value is an attribution LABEL, not an authz decision: an agent may self-identify
+  // via `actor` in the body (AC5 parity); a browser omits it and records 'admin'.
+  function adminActor(req: Request): string {
+    const a = (req.body as Record<string, unknown> | undefined)?.actor;
+    return typeof a === 'string' && a.trim() ? a.trim().slice(0, 120) : 'admin';
+  }
+  function parseCandidateId(req: Request, res: Response): number | null {
+    const id = parseInt(req.params.id as string, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ error: 'invalid_id' });
+      return null;
+    }
+    return id;
+  }
+
+  app.get('/admin/api/candidates', requireAdmin, async (req: Request, res: Response) => {
+    try {
+      const statusRaw = typeof req.query.status === 'string' ? req.query.status : 'pending';
+      const status = (CANDIDATE_STATUSES as readonly string[]).includes(statusRaw)
+        ? (statusRaw as (typeof CANDIDATE_STATUSES)[number])
+        : 'pending';
+      const page = parseInt(req.query.page as string) || 1;
+      const sourceId =
+        typeof req.query.source === 'string' && req.query.source && req.query.source !== 'all'
+          ? req.query.source
+          : undefined;
+      res.json(await listCandidates(engine, { status, page, sourceId }));
+    } catch {
+      res.status(503).json({ error: 'service_unavailable' });
+    }
+  });
+
+  app.post('/admin/api/candidates/:id/approve', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const id = parseCandidateId(req, res);
+    if (id === null) return;
+    try {
+      const result = await approveCandidate(engine, id, adminActor(req));
+      if (!result.row) {
+        res.status(404).json({ error: 'not_pending', message: 'candidate not found or already acted' });
+        return;
+      }
+      res.json({ candidate: result.row, promotion: result.promotion });
+    } catch (err) {
+      res.status(500).json({ error: 'approve_failed', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/admin/api/candidates/:id/reject', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const id = parseCandidateId(req, res);
+    if (id === null) return;
+    // AC3: a rejection is an audit record — it MUST carry a reason. Enforce server-side
+    // (not just in the UI) so the agent-direct path can't reject without one.
+    const reasonRaw = (req.body as Record<string, unknown>)?.reason;
+    const reason = typeof reasonRaw === 'string' ? reasonRaw.trim().slice(0, 2000) : '';
+    if (!reason) {
+      res.status(400).json({ error: 'reason_required', message: 'a rejection reason is required' });
+      return;
+    }
+    try {
+      const row = await rejectCandidate(engine, id, adminActor(req), reason);
+      if (!row) {
+        res.status(404).json({ error: 'not_pending', message: 'candidate not found or already acted' });
+        return;
+      }
+      res.json({ candidate: row });
+    } catch (err) {
+      res.status(500).json({ error: 'reject_failed', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // /admin/api/connectors — management (list / disconnect / per-source config) (TECH-2036)
+  // ---------------------------------------------------------------------------
+  // The connect/callback OAuth dance is above. These add the management surface the
+  // Connectors page needs. Secrets are NEVER returned: only metadata (enabled, account,
+  // selection, retention/redaction policy) + the token row's status/account/expiry from
+  // connector_tokens (the encrypted envelope columns are never selected).
+  function safeParseSourceConfig(v: Record<string, unknown> | string): Record<string, unknown> {
+    if (typeof v !== 'string') return v ?? {};
+    try {
+      return JSON.parse(v) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+
+  // GET /admin/api/connectors — every source × its connector config + token status.
+  app.get('/admin/api/connectors', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      const sources = await engine.executeRaw<{ id: string; name: string; config: Record<string, unknown> | string }>(
+        `SELECT id, name, config FROM sources WHERE NOT archived ORDER BY name`,
+      );
+      const tokens = await engine.executeRaw<{
+        source_id: string; provider: string; account: string | null; status: string; expires_at: Date | string | null;
+      }>(`SELECT source_id, provider, account, status, expires_at FROM connector_tokens`);
+      const tokenBy = new Map<string, (typeof tokens)[number]>();
+      for (const t of tokens) tokenBy.set(`${t.source_id}|${t.provider}`, t);
+
+      const out: unknown[] = [];
+      for (const s of sources) {
+        const cfg = safeParseSourceConfig(s.config);
+        const connectors = (cfg.connectors ?? null) as Record<string, Record<string, unknown>> | null;
+        if (!connectors) continue;
+        for (const [provider, c] of Object.entries(connectors)) {
+          const tok = tokenBy.get(`${s.id}|${provider}`) ?? null;
+          out.push({
+            sourceId: s.id,
+            sourceName: s.name,
+            provider,
+            enabled: c.enabled === true,
+            account: (typeof c.account === 'string' ? c.account : null) ?? tok?.account ?? null,
+            hasSecret: typeof c.secret === 'string' && c.secret.length > 0, // boolean ONLY — never the value
+            token: tok ? { status: tok.status, account: tok.account, expiresAt: tok.expires_at } : null,
+            selection: c.selection ?? null,
+            policy: c.policy ?? null,
+          });
+        }
+      }
+      res.json(out);
+    } catch {
+      res.status(503).json({ error: 'service_unavailable' });
+    }
+  });
+
+  // POST /admin/api/connectors/:provider/disconnect — body { sourceId }. Clears the
+  // stored token and disables the connector. Idempotent. The jsonb path is bound as a
+  // text[] param (NOT string-interpolated), and provider is charset-validated, so the
+  // URL segment can never inject into the SQL path.
+  app.post('/admin/api/connectors/:provider/disconnect', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+    if (!CONNECTOR_PROVIDER_RE.test(provider)) {
+      res.status(400).json({ error: 'invalid_provider' });
+      return;
+    }
+    const sourceId = (req.body as Record<string, unknown>)?.sourceId;
+    if (!sourceId || typeof sourceId !== 'string') {
+      res.status(400).json({ error: 'sourceId required' });
+      return;
+    }
+    try {
+      await engine.executeRaw(`DELETE FROM connector_tokens WHERE source_id = $1 AND provider = $2`, [sourceId, provider]);
+      await engine.executeRaw(
+        `UPDATE sources SET config = jsonb_set(config, $2::text[], 'false'::jsonb, true) WHERE id = $1`,
+        [sourceId, ['connectors', provider, 'enabled']],
+      );
+      res.json({ status: 'disconnected', source_id: sourceId, provider });
+    } catch (err) {
+      res.status(500).json({ error: 'disconnect_failed', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // POST /admin/api/connectors/:provider/config — body { sourceId, enabled?, selection?, policy? }.
+  // Surgical per-field jsonb_set so a sibling config key (e.g. the webhook secret) is never
+  // clobbered. selection (channels/labels/calendars) + policy (retention/redaction) are
+  // arbitrary JSON objects; enabled is a boolean. Only the provided fields are written.
+  app.post('/admin/api/connectors/:provider/config', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const provider = typeof req.params.provider === 'string' ? req.params.provider : '';
+    if (!CONNECTOR_PROVIDER_RE.test(provider)) {
+      res.status(400).json({ error: 'invalid_provider' });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const sourceId = body.sourceId;
+    if (!sourceId || typeof sourceId !== 'string') {
+      res.status(400).json({ error: 'sourceId required' });
+      return;
+    }
+    // Decide which fields to write BEFORE any DB work.
+    const wantsEnabled = typeof body.enabled === 'boolean';
+    const wantsSelection = body.selection !== undefined && body.selection !== null;
+    const wantsPolicy = body.policy !== undefined && body.policy !== null;
+    if (!wantsEnabled && !wantsSelection && !wantsPolicy) {
+      res.status(400).json({ error: 'no_fields', message: 'provide at least one of enabled, selection, policy' });
+      return;
+    }
+    try {
+      const [src] = await engine.executeRaw<{ id: string }>(`SELECT id FROM sources WHERE id = $1`, [sourceId]);
+      if (!src) {
+        res.status(404).json({ error: 'unknown_source', message: `no source '${sourceId}'` });
+        return;
+      }
+      // jsonb_set(create_missing) only creates the FINAL path element — an absent intermediate
+      // parent (config has no `connectors`, or no `connectors.<provider>`) makes every leaf write
+      // a silent no-op that still returns 200 (the TECH-2036 review's F1). Pre-create both parents
+      // with a COALESCE-merge so existing siblings (e.g. a webhook secret) are preserved, then the
+      // surgical leaf writes below actually persist.
+      await engine.executeRaw(
+        `UPDATE sources SET config = jsonb_set(
+           jsonb_set(config, '{connectors}', COALESCE(config->'connectors', '{}'::jsonb), true),
+           $2::text[], COALESCE(config #> $2, '{}'::jsonb), true
+         ) WHERE id = $1`,
+        [sourceId, ['connectors', provider]],
+      );
+
+      const applied: string[] = [];
+      // enabled — typed boolean via to_jsonb($::boolean) (a plain bool bind, no JSON text).
+      if (wantsEnabled) {
+        await engine.executeRaw(
+          `UPDATE sources SET config = jsonb_set(config, $2::text[], to_jsonb($3::boolean), true) WHERE id = $1`,
+          [sourceId, ['connectors', provider, 'enabled'], body.enabled],
+        );
+        applied.push('enabled');
+      }
+      // selection (channels/labels/calendars) + policy (retention/redaction) — JSON objects.
+      // Bind the JS value directly with $::jsonb, the same bind path toRow uses for redactions
+      // (the gbrain engine encodes the object across both pglite and postgres; no JSON.stringify).
+      for (const key of ['selection', 'policy'] as const) {
+        const value = body[key];
+        if (value !== undefined && value !== null) {
+          await engine.executeRaw(
+            `UPDATE sources SET config = jsonb_set(config, $2::text[], $3::jsonb, true) WHERE id = $1`,
+            [sourceId, ['connectors', provider, key], value],
+          );
+          applied.push(key);
+        }
+      }
+      res.json({ status: 'updated', source_id: sourceId, provider, fields: applied });
+    } catch (err) {
+      res.status(500).json({ error: 'config_failed', message: err instanceof Error ? err.message : String(err) });
     }
   });
 
