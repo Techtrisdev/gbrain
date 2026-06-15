@@ -18,3 +18,4 @@
 import './linear.ts';
 import './slack.ts';
 import './calendar.ts';
+import './github.ts';
