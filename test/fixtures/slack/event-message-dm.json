@@ -1,0 +1,15 @@
+{
+  "type": "event_callback",
+  "team_id": "T_ACME_123",
+  "api_app_id": "A_GBRAIN_1",
+  "event_id": "Ev_delivery_0002",
+  "event_time": 1700000050,
+  "event": {
+    "type": "message",
+    "channel": "D_PRIVATE_DM",
+    "channel_type": "im",
+    "user": "U_JORDAN",
+    "text": "Off-the-record: pay Jane Smith 250k and close the Acme deal",
+    "ts": "1700000050.000200"
+  }
+}

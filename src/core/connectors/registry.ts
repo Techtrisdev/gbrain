@@ -16,3 +16,4 @@
  */
 
 import './linear.ts';
+import './slack.ts';
