@@ -21,7 +21,15 @@
  * Both are idempotent: [REDACTED] matches no PII/secret pattern, dropped fields
  * stay dropped, and a re-run of either yields byte-identical content.
  *
- * Out of scope (later): NER-model enrichment.
+ * WIRING CONTRACT (hard dependency for the connector framework, TECH-2034): this is
+ * a primitive — it is NOT yet called by candidate.ts::toRow. The framework MUST run
+ * strip()/minimize() over EVERY field that flows into a candidate, including
+ * `proposed_markdown` (which can become the served page body) and every metadata
+ * value, BEFORE toRow. A wiring that strips summary/metadata but forgets
+ * proposed_markdown bypasses this module entirely.
+ *
+ * Out of scope (later): NER-model enrichment, plus the regex-uncoverable shapes
+ * documented on strip().
  */
 
 import { scrubPii } from '../eval-capture-scrub.ts';
@@ -31,35 +39,62 @@ const REDACTED = '[REDACTED]';
 // ── strip: PII (via scrubPii) + secret shapes ───────────────────────────────────
 
 /**
- * Secret-shape patterns layered on top of scrubPii's six PII families. Each is
- * anchored on a distinctive prefix/structure so [REDACTED] (no prefix, no digit
- * run) can never re-match — preserving idempotency. Linear, backtracking-safe.
+ * URL userinfo (`scheme://user:pass@host`). Masks the credential regardless of host
+ * shape (IP, bare hostname, or TLD) — runs BEFORE scrubPii so the email regex can't
+ * partially eat a `pass@host.tld` substring and leave a malformed remainder.
+ */
+const URL_USERINFO_RE = /\b([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s:@/]+:[^\s@/]+@/g;
+
+/**
+ * Non-Bearer `Authorization:` schemes (Basic/Token/ApiKey/Digest/...). Bearer is
+ * already covered by scrubPii. Keeps the header + scheme literal, masks the credential.
+ */
+const AUTH_SCHEME_RE = /\b([Aa]uthorization:\s*[A-Za-z][A-Za-z-]*\s+)[A-Za-z0-9._~+/=-]{6,}=*/g;
+
+/**
+ * A secret value assigned to a secret-named key — AWS secret access key, Azure
+ * `AccountKey`, generic `api_key` / `client_secret` / `password` / `token`. These
+ * are the prefix-less high-entropy shapes only key-context can identify. Keeps the
+ * key name, masks the value.
+ */
+const SECRET_ASSIGNMENT_RE =
+  /\b([A-Za-z0-9_]*(?:secret|token|password|passwd|api[_-]?key|access[_-]?key|client[_-]?secret|account[_-]?key)['"]?\s*[=:]\s*['"]?)([A-Za-z0-9/+_=.-]{12,})/gi;
+
+/**
+ * Prefix-anchored secret tokens layered on top of scrubPii's six PII families. Each
+ * is anchored on a distinctive prefix so [REDACTED] can never re-match (idempotency).
+ * The PEM block's inner gap is BOUNDED ({0,8192}?) so a stream of unterminated BEGIN
+ * markers cannot drive quadratic backtracking (a measured DoS); a real PEM private
+ * key is well under 8KB.
  */
 const SECRET_PATTERNS: readonly RegExp[] = [
-  // PEM private-key blocks (RSA/EC/OPENSSH/PGP). Non-greedy, bounded by END line.
-  /-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z0-9 ]*PRIVATE KEY-----/g,
-  // AWS access key id.
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  // GitHub tokens: ghp_/gho_/ghs_/ghr_/ghu_ + classic, and fine-grained PAT.
-  /\bgh[posru]_[A-Za-z0-9]{36,255}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{59,255}\b/g,
-  // Slack tokens (bot/user/app/refresh/legacy).
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
-  // Google API key.
-  /\bAIza[0-9A-Za-z_-]{35}\b/g,
-  // OpenAI-style secret key.
-  /\bsk-[A-Za-z0-9]{20,}\b/g,
-  // Stripe-style keyed secrets (sk/pk/rk _ live/test _ ...).
-  /\b[sprSPR]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g,
+  /-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----[\s\S]{0,8192}?-----END[A-Z0-9 ]*PRIVATE KEY-----/g,
+  /\bAKIA[0-9A-Z]{16}\b/g, // AWS access key id
+  /\bgh[posru]_[A-Za-z0-9]{36,255}\b/g, // GitHub classic/OAuth/app/server/user tokens
+  /\bgithub_pat_[A-Za-z0-9_]{59,255}\b/g, // GitHub fine-grained PAT
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, // Slack
+  /\bAIza[0-9A-Za-z_-]{35}\b/g, // Google API key
+  /\bGOCSPX-[A-Za-z0-9_-]{20,}\b/g, // Google OAuth client secret
+  /\bsk-[A-Za-z0-9]{32,}\b/g, // OpenAI-style (>=32 cuts false positives on short sk- slugs)
+  /\b[sprSPR]k_(?:live|test)_[A-Za-z0-9]{16,}\b/g, // Stripe-style
 ];
 
 /**
- * Mask obvious PII and secrets in free text. Pure, idempotent, safe on any input.
- * scrubPii runs first (email/phone/SSN/JWT/Bearer/Luhn-CC), then the secret shapes.
+ * Mask obvious PII and secrets in free text. Pure, idempotent, linear-time, safe on
+ * any input. Order: URL userinfo → scrubPii (PII families) → Authorization schemes →
+ * secret-named assignments → prefix-anchored tokens.
+ *
+ * v1 deliberately does NOT cover shapes regex cannot identify without context/NER
+ * (the ticket scopes these out): IPv4/IPv6 addresses, IBANs, postal addresses, full
+ * personal names, and prefix-less high-entropy keys outside a secret-named field.
+ * That boundary is pinned in test/connector-redact.test.ts § "v1 coverage boundary".
  */
 export function strip(text: string): string {
   if (!text) return text;
-  let out = scrubPii(text);
+  let out = text.replace(URL_USERINFO_RE, `$1${REDACTED}@`);
+  out = scrubPii(out);
+  out = out.replace(AUTH_SCHEME_RE, (_m, prefix) => `${prefix}${REDACTED}`);
+  out = out.replace(SECRET_ASSIGNMENT_RE, (_m, key) => `${key}${REDACTED}`);
   for (const re of SECRET_PATTERNS) {
     out = out.replace(re, REDACTED);
   }
@@ -149,6 +184,12 @@ export function isKnownProfile(profile: string): boolean {
  * - Only the profile's allowlisted metadata keys survive (each stripped).
  * - Summary survives (stripped) only when the profile keeps it.
  * - An unknown profile falls back to maximal minimization (identity only).
+ *
+ * NOTE: metadata allowlist keys are matched EXACTLY (case-sensitive, snake_case). A
+ * connector emitting `Channel`/`channelId` instead of `channel`/`channel_id` will
+ * have those fields dropped — fail-closed (never a leak) but a fidelity trap. The
+ * framework (TECH-2034) must reconcile each connector's metadata vocabulary against
+ * these profiles, or extend the allowlists, before go-live.
  *
  * Idempotent: feeding the result back in keeps the same metadata/summary
  * (strip is idempotent; there is no body left to drop).

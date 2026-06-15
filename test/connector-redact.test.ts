@@ -110,3 +110,72 @@ describe('minimize — field-minimization with fail-closed profiles', () => {
     expect(out.metadata.url).toBe('https://x.test/a');
   });
 });
+
+describe('strip — hardened secret coverage (review fixes)', () => {
+  test('AWS secret access key (prefix-less, in a secret-named assignment) is masked', () => {
+    const out = strip('AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY');
+    expect(out).not.toContain('wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY');
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test('basic-auth URL credential is masked even with an IP / bare host', () => {
+    expect(strip('https://svc:abc123XYZtoken@10.0.0.5:5432/db')).not.toContain('abc123XYZtoken');
+    expect(strip('postgres://user:p4ssw0rd@db-internal/app')).not.toContain('p4ssw0rd');
+    expect(strip('https://alice:s3cr3tval@github.com/o/r.git')).not.toContain('s3cr3tval');
+  });
+
+  test('non-Bearer Authorization schemes (Basic/token) are masked', () => {
+    expect(strip('Authorization: Basic dXNlcjpwYXNzd29yZA==')).not.toContain('dXNlcjpwYXNzd29yZA==');
+    expect(strip('Authorization: token abcdef0123456789')).not.toContain('abcdef0123456789');
+  });
+
+  test('Google OAuth client secret + Azure AccountKey are masked', () => {
+    expect(strip('client GOCSPX-' + 'a'.repeat(28))).toContain('[REDACTED]');
+    expect(strip('AccountKey=' + 'a'.repeat(40) + '==;')).toContain('[REDACTED]');
+  });
+
+  test('generic secret-named assignment masks the value, keeps the key', () => {
+    const out = strip("client_secret='" + 'x'.repeat(24) + "'");
+    expect(out).toContain('client_secret');
+    expect(out).not.toContain('x'.repeat(24));
+  });
+});
+
+describe('strip — ReDoS / performance bound (review fix)', () => {
+  test('repeated unterminated PEM markers stay linear (the bounded-gap fix)', () => {
+    // Unbounded, this input measured ~11s (quadratic). With the {0,8192}? gap bound
+    // it is linear (~300ms for 20k markers); a generous ceiling proves the fix
+    // without flaking on machine variance.
+    const pathological = '-----BEGIN A PRIVATE KEY-----'.repeat(20000);
+    const t0 = performance.now();
+    strip(pathological);
+    expect(performance.now() - t0).toBeLessThan(1500);
+  });
+});
+
+describe('strip — idempotency across the full pattern catalog', () => {
+  const catalog = [
+    'email a@b.com', '555-123-4567', '123-45-6789',
+    'Bearer abcdef1234567890XYZ', 'card 4111 1111 1111 1111',
+    'AKIAIOSFODNN7EXAMPLE', 'ghp_' + 'a'.repeat(36), 'xoxb-123456789012-abcdefghijkl',
+    'AIza' + 'a'.repeat(35), 'sk-' + 'a'.repeat(32), 'sk_live_' + 'a'.repeat(24),
+    'GOCSPX-' + 'a'.repeat(28), 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+    'https://u:p4sslong@10.0.0.5/x', 'Authorization: Basic dXNlcjpwYXNz',
+  ];
+  for (const input of catalog) {
+    test(`strip(strip(x)) === strip(x): ${input.slice(0, 22)}`, () => {
+      const once = strip(input);
+      expect(strip(once)).toBe(once);
+    });
+  }
+});
+
+describe('strip — documented v1 coverage boundary (intentionally NOT masked)', () => {
+  // These need context/NER and are explicitly out of scope for v1. Asserting current
+  // behavior PINS the boundary so any future accidental narrowing shows up in the diff.
+  test('IPv4, IBAN, and a bare personal name pass through unchanged', () => {
+    expect(strip('host 192.168.1.42 reachable')).toContain('192.168.1.42');
+    expect(strip('iban GB29NWBK60161331926819')).toContain('GB29NWBK60161331926819');
+    expect(strip('owner is Jane Doe per the record')).toContain('Jane Doe');
+  });
+});
