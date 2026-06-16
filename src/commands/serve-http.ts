@@ -47,6 +47,7 @@ import { getConnector, readConnectorConfig, landRecords } from '../core/connecto
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
 import { listCandidates, approveCandidate, rejectCandidate, PromotionTargetError } from '../core/connectors/candidate.ts';
 import type { PromotionTarget } from '../core/connectors/promotion.ts';
+import { handlePromotionCallback } from '../core/connectors/promotion.ts';
 import {
   calendarConnector,
   incrementalSync,
@@ -2261,6 +2262,46 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         console.error('connector webhook: landing error:', msg);
         res.status(500).json({ error: 'landing_failed', message: msg });
       }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // POST /internal/promotion-callback — the inbound promotion STATUS callback (TECH-2110)
+  // ---------------------------------------------------------------------------
+  // The merged techtris-brain bridge (PR #101 `emit_status`) calls this after it opens a PR
+  // (or fails) so the candidate row reflects the terminal promotion state. This is a MACHINE
+  // callback — it is gated by HMAC verification (NOT requireAdmin / a browser cookie). The
+  // verification + parse + match + writeback all live in handlePromotionCallback; this route
+  // is the thin Express adapter.
+  //
+  // ⚠️ TICKET-vs-REALITY: the TECH-2110 ticket spec'd { candidate_id, artifact_hash, …,
+  // signed_at, nonce } + header X-Promotion-Signature + nonce/skew replay. The MERGED Brain
+  // actually sends { status, branch, pr_url, source_record_id_hash } + header
+  // X-Brain-Signature + status∈{opened,failed} with NO replay token. We build to the merged
+  // reality: ownership is by source_record_id_hash, replay-safety by idempotency. Full detail
+  // in promotion.ts § Promotion STATUS CALLBACK.
+  //
+  // express.raw({ type: '*/*' }) is mounted as ROUTE-LEVEL middleware so the global JSON
+  // parser does NOT consume the stream first: req.body arrives as the exact raw Buffer the
+  // Brain signed. We MUST verify over those raw bytes — re-serializing a parsed object would
+  // change the bytes and break the Brain's HMAC.
+  app.post(
+    '/internal/promotion-callback',
+    express.raw({ type: '*/*', limit: '64kb' }),
+    async (req: Request, res: Response) => {
+      const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      const signatureHeader = req.header('X-Brain-Signature');
+      const result = await handlePromotionCallback({
+        rawBody,
+        signatureHeader,
+        secret: process.env.PROMOTION_HMAC_SECRET,
+        engine,
+      });
+      if (result.ok) {
+        res.status(200).json({ status: 'ok', candidate_id: result.candidateId, promotion_status: result.mappedStatus });
+        return;
+      }
+      res.status(result.status).json({ error: result.error });
     },
   );
 

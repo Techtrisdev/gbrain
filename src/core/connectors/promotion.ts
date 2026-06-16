@@ -37,6 +37,7 @@
 import { createHash, createHmac } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { ConnectorCandidateRow } from './candidate.ts';
+import { hmacSha256Verify } from './base.ts';
 import { strip } from './redact.ts';
 
 // ── The locked artifact shape ────────────────────────────────────────────────────
@@ -314,3 +315,244 @@ const CANDIDATE_PROMOTION_RETURNING = [
   'promotion_branch', 'promoted_at', 'artifact_hash',
   'proposed_at',
 ].join(', ');
+
+// ════════════════════════════════════════════════════════════════════════════════════
+// Promotion STATUS CALLBACK (TECH-2110) — the inbound machine endpoint
+// ════════════════════════════════════════════════════════════════════════════════════
+//
+// THE LOCKED CONTRACT — built to the MERGED Brain bridge, NOT the speculative ticket spec.
+//
+// The TECH-2110 ticket spec'd an inbound wire of
+//   { candidate_id, artifact_hash, …, signed_at, nonce }  +  header X-Promotion-Signature
+//   + artifact_hash ownership  +  nonce/clock-skew replay protection.
+// That is WRONG. The authoritative sender is the merged techtris-brain bridge (PR #101,
+// its `emit_status`), which actually sends:
+//   - Header:    X-Brain-Signature  (NOT X-Promotion-Signature)
+//   - Signature: lowercase hex HMAC-SHA256 over the RAW request body bytes, keyed by
+//                PROMOTION_HMAC_SECRET. The Brain signs json.dumps(payload, sort_keys=True)
+//                .encode() and sends those EXACT bytes, so we MUST verify over the raw bytes
+//                as received — never re-serialize first (re-serialization changes the bytes
+//                and breaks the HMAC).
+//   - Body:      EXACTLY { status, branch, pr_url, source_record_id_hash } — no candidate_id,
+//                no artifact_hash, no nonce, no signed_at, no target_*, no reason.
+//   - status ∈  EXACTLY { "opened", "failed" } — the only two the Brain emits.
+//   - Identity:  source_record_id_hash = sha256(source_record_id).hexdigest()[:16] — the
+//                Brain's only candidate identifier on the wire (there is no candidate_id).
+//
+// gbrain therefore matches the MERGED reality: ownership is by source_record_id_hash, and
+// replay-safety rests on IDEMPOTENCY (re-applying the same writeback is a no-op) because the
+// Brain sends no nonce/timestamp to support the ticket's skew-window replay model.
+//
+// STATUS MAPPING (load-bearing): the wire `status` is NOT a valid promotion_status CHECK
+// value. We map:  "opened" → 'pr_opened' (+ store pr_url + branch, stamp promoted_at),
+//                 "failed" → 'failed' (status_* only; the candidate STAYS status='accepted',
+//                            never 'rejected').
+//
+// SECURITY: verify-before-parse. A forged/missing/garbage signature → 401 with ZERO DB
+// writes and the body NEVER parsed or logged. A missing secret → 500 fail-closed (no write).
+// LOGGING (AC7): the secret, the signature, and the full body are NEVER logged; only `status`,
+// `source_record_id_hash` (already a hash — safe), and the matched candidate id.
+
+/** The two wire statuses the merged Brain bridge emits. */
+export type PromotionCallbackWireStatus = 'opened' | 'failed';
+
+/** The EXACT 4-key body the merged Brain `emit_status` sends. */
+export interface PromotionCallbackBody {
+  status: PromotionCallbackWireStatus;
+  branch: string;
+  pr_url: string;
+  source_record_id_hash: string;
+}
+
+/** The 4 keys the body must carry — used to reject BOTH missing and unknown keys. */
+const PROMOTION_CALLBACK_KEYS: readonly string[] = ['branch', 'pr_url', 'source_record_id_hash', 'status'];
+
+/** Discriminated result the Express wrapper maps to an HTTP response. */
+export type PromotionCallbackResult =
+  | { ok: true; status: 200; candidateId: number; mappedStatus: PromotionStatus }
+  | { ok: false; status: 400 | 401 | 404 | 409 | 500; error: string };
+
+/**
+ * The 16-char identity the Brain puts on the wire:
+ *   first 16 lowercase hex chars of sha256(source_record_id).
+ * Mirrors the Brain's `_sha256_hex(source_record_id.encode())[:16]`.
+ */
+export function sourceRecordIdHash16(sourceRecordId: string): string {
+  return createHash('sha256').update(sourceRecordId, 'utf8').digest('hex').slice(0, 16);
+}
+
+/**
+ * Strictly validate the parsed JSON body: it must be a plain object carrying EXACTLY the 4
+ * keys (no missing, no extra), each of the right type, with status ∈ {opened, failed}.
+ * Returns the typed body or null (caller → 400). Pure; no I/O.
+ */
+function parsePromotionCallbackBody(parsed: unknown): PromotionCallbackBody | null {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+
+  // Reject missing OR unknown keys: the key set must be EXACTLY the 4 expected keys.
+  const keys = Object.keys(obj).sort();
+  if (keys.length !== PROMOTION_CALLBACK_KEYS.length) return null;
+  for (let i = 0; i < PROMOTION_CALLBACK_KEYS.length; i++) {
+    if (keys[i] !== PROMOTION_CALLBACK_KEYS[i]) return null;
+  }
+
+  const { status, branch, pr_url, source_record_id_hash } = obj;
+  if (status !== 'opened' && status !== 'failed') return null;
+  if (typeof branch !== 'string') return null;
+  if (typeof pr_url !== 'string') return null;
+  if (typeof source_record_id_hash !== 'string' || source_record_id_hash.length === 0) return null;
+
+  return { status, branch, pr_url, source_record_id_hash };
+}
+
+/**
+ * Among the dispatched-and-awaiting-callback set (status='accepted' AND artifact_hash IS NOT
+ * NULL), return ALL candidates whose source_record_id hashes to the wire identity.
+ *
+ * The SELECT predicate (not a SQL hash match) is deliberate: the Brain sends only the 16-char
+ * hash, and we scope the comparison to the rows that were actually dispatched, recomputing the
+ * hash in TS. The caller FAILS CLOSED on >1 (it never picks a row): the merged Brain callback
+ * body carries no source_id/provider/candidate_id/artifact_hash, so gbrain cannot safely
+ * disambiguate multiple accepted candidates sharing a source_record_id hash — and a write path
+ * must never guess which row to mutate.
+ */
+async function matchCandidatesByHash(
+  engine: BrainEngine,
+  hash16: string,
+): Promise<ConnectorCandidateRow[]> {
+  const rows = await engine.executeRaw<ConnectorCandidateRow>(
+    `SELECT ${CANDIDATE_PROMOTION_RETURNING}
+       FROM connector_candidates
+      WHERE status = 'accepted' AND artifact_hash IS NOT NULL`,
+  );
+  return rows.filter((r) => sourceRecordIdHash16(r.source_record_id) === hash16);
+}
+
+/**
+ * Handle a promotion status callback. ALL I/O is the injected `engine`; the raw body Buffer
+ * and the X-Brain-Signature header value are passed in — there is no Express/network coupling
+ * here, so the handler is driven directly in tests with a real engine + a synthetically signed
+ * body. NEVER throws for an expected rejection (forged sig / bad body / no match): it returns a
+ * typed result the wrapper maps to a status code. An unexpected engine error → 500.
+ *
+ * Order is load-bearing:
+ *   1. secret present?            no → 500 (fail-closed), no parse, no write.
+ *   2. hmacSha256Verify(raw)?     no → 401, body NEVER parsed/logged, no write.
+ *   3. JSON.parse + strict 4-key validate → bad → 400, no write.
+ *   4. match by source_record_id_hash → 0 → 404; >1 → 409 ambiguous (ZERO writes, never guess).
+ *   5. allowlisted writeback via updateCandidatePromotionState → 200 (idempotent on replay).
+ */
+export async function handlePromotionCallback(args: {
+  rawBody: Buffer;
+  signatureHeader: string | undefined;
+  secret: string | undefined;
+  engine: BrainEngine;
+}): Promise<PromotionCallbackResult> {
+  const { rawBody, signatureHeader, secret, engine } = args;
+
+  // (1) Missing secret → fail closed. Do not parse, do not write.
+  if (!secret) {
+    console.error('promotion callback: PROMOTION_HMAC_SECRET is not configured — failing closed');
+    return { ok: false, status: 500, error: 'callback_secret_unconfigured' };
+  }
+
+  // (2) Verify-before-parse over the RAW bytes. A forged/missing/garbage signature ends here:
+  //     the body is never parsed and never logged. hmacSha256Verify is constant-time and
+  //     returns false for a missing/empty/non-hex signature.
+  if (!hmacSha256Verify(rawBody, secret, signatureHeader ?? '')) {
+    // Do NOT log the signature or any body content.
+    console.warn('promotion callback: signature verification failed — rejecting before parse');
+    return { ok: false, status: 401, error: 'signature_mismatch' };
+  }
+
+  // (3) Parse + strictly validate the 4-key body.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return { ok: false, status: 400, error: 'malformed_json' };
+  }
+  const body = parsePromotionCallbackBody(parsed);
+  if (!body) {
+    return { ok: false, status: 400, error: 'invalid_body' };
+  }
+
+  // (4) Match by source_record_id_hash among the dispatched set. Fail CLOSED on ambiguity:
+  //     0 → 404; exactly 1 → proceed; >1 → 409 with ZERO writes. The Brain callback carries no
+  //     source_id/provider/candidate_id/artifact_hash, so we cannot disambiguate and must never
+  //     guess which row to mutate.
+  let matches: ConnectorCandidateRow[];
+  try {
+    matches = await matchCandidatesByHash(engine, body.source_record_id_hash);
+  } catch (err) {
+    console.error('promotion callback: candidate lookup failed:', err instanceof Error ? err.message : String(err));
+    return { ok: false, status: 500, error: 'lookup_failed' };
+  }
+  if (matches.length === 0) {
+    // source_record_id_hash is already a hash — safe to log.
+    console.warn(`promotion callback: no dispatched candidate matched source_record_id_hash=${body.source_record_id_hash}`);
+    return { ok: false, status: 404, error: 'candidate_not_found' };
+  }
+  if (matches.length > 1) {
+    console.warn(
+      `promotion callback: ambiguous source_record_id_hash=${body.source_record_id_hash} matched ${matches.length} dispatched candidates — refusing with zero writes`,
+    );
+    return { ok: false, status: 409, error: 'ambiguous_candidate_match' };
+  }
+  const candidate = matches[0];
+
+  // (4.5) Monotonic guard against a stale 'opened' redelivery. The merged Brain sends no
+  //       nonce/timestamp and its HMAC never expires, so an OLD valid-MAC 'opened' delivery
+  //       could be replayed after the row already reached a different terminal promotion_status
+  //       (e.g. 'failed') and would otherwise revert it to 'pr_opened' + re-stamp promoted_at.
+  //       'failed' is authoritative (it corrects the optimistic pr_opened); re-promotion is
+  //       impossible (approveCandidate is guarded by status='pending'), so 'failed'→'pr_opened'
+  //       is NEVER legitimate. Refuse an 'opened' that would downgrade any already-set terminal
+  //       state that is not itself pr_opened; the response stays 200 (idempotent-friendly for
+  //       at-least-once redelivery) and reports the preserved state. 'failed' is never blocked,
+  //       and a true idempotent 'opened' (current already pr_opened) falls through to the no-op
+  //       write below.
+  if (
+    body.status === 'opened' &&
+    candidate.promotion_status != null &&
+    candidate.promotion_status !== 'pr_opened'
+  ) {
+    console.warn(
+      `promotion callback: ignoring stale 'opened' for candidate_id=${candidate.id} already at promotion_status=${candidate.promotion_status}`,
+    );
+    return {
+      ok: true,
+      status: 200,
+      candidateId: candidate.id,
+      mappedStatus: candidate.promotion_status as PromotionStatus,
+    };
+  }
+
+  // (5) Allowlisted writeback. The status MAPPING is load-bearing: 'opened' is NOT a valid
+  //     promotion_status CHECK value — it maps to 'pr_opened'. On 'failed' we set only
+  //     promotion_status='failed'; the candidate row's `status` stays 'accepted' (NOT
+  //     'rejected') — updateCandidatePromotionState can never touch `status`. Re-applying the
+  //     same patch (a duplicate delivery) writes the same values — an idempotent no-op — and
+  //     returns 200 (replay-safe: the Brain sends no nonce/timestamp).
+  const patch: PromotionStatePatch =
+    body.status === 'opened'
+      ? { promotion_status: 'pr_opened', promotion_pr_url: body.pr_url, promotion_branch: body.branch, promoted: true }
+      : { promotion_status: 'failed' };
+
+  try {
+    const updated = await updateCandidatePromotionState(engine, candidate.id, patch);
+    if (!updated) {
+      // The row vanished between match and update (extremely unlikely). Treat as not-found.
+      return { ok: false, status: 404, error: 'candidate_not_found' };
+    }
+    // AC7 logging: status, source_record_id_hash (safe), and the matched candidate id ONLY.
+    console.log(
+      `promotion callback: applied status=${body.status} source_record_id_hash=${body.source_record_id_hash} candidate_id=${candidate.id}`,
+    );
+    return { ok: true, status: 200, candidateId: candidate.id, mappedStatus: patch.promotion_status as PromotionStatus };
+  } catch (err) {
+    console.error('promotion callback: writeback failed:', err instanceof Error ? err.message : String(err));
+    return { ok: false, status: 500, error: 'writeback_failed' };
+  }
+}
