@@ -75,8 +75,19 @@ export const api = {
       `/admin/api/candidates?status=${encodeURIComponent(status)}&page=${page}` +
         (source ? `&source=${encodeURIComponent(source)}` : ''),
     ),
-  candidateApprove: (id: number) =>
-    apiFetch(`/admin/api/candidates/${id}/approve`, { method: 'POST', body: JSON.stringify({}) }),
+  // TECH-2109: the approve flow sends the reviewer-selected promotion target. Default is a
+  // new inbox page (target_kind 'inbox', no path); 'existing_page' requires target_path.
+  candidateApprove: (
+    id: number,
+    target: { target_kind?: 'existing_page' | 'inbox'; target_path?: string } = {},
+  ) =>
+    apiFetch(`/admin/api/candidates/${id}/approve`, {
+      method: 'POST',
+      body: JSON.stringify({
+        target_kind: target.target_kind ?? 'inbox',
+        ...(target.target_path ? { target_path: target.target_path } : {}),
+      }),
+    }),
   candidateReject: (id: number, reason: string) =>
     apiFetch(`/admin/api/candidates/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) }),
 };

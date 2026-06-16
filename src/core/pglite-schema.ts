@@ -786,6 +786,15 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   acted_by           TEXT,
   acted_at           TIMESTAMPTZ,
   superseded_by      BIGINT        REFERENCES connector_candidates(id) ON DELETE SET NULL,
+  -- TECH-2109 promotion bridge: reviewer-selected target + dispatch state.
+  -- All additive + nullable; old rows read NULL. Does NOT touch the status CHECK.
+  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox')),
+  target_path        TEXT,
+  promotion_status   TEXT          CHECK (promotion_status IS NULL OR promotion_status IN ('pr_opened','indexed','promoted_to_inbox','needs_fix','failed')),
+  promotion_pr_url   TEXT,
+  promotion_branch   TEXT,
+  promoted_at        TIMESTAMPTZ,
+  artifact_hash      TEXT,
   proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
   CONSTRAINT connector_candidates_source_record_version_unique
     UNIQUE (source_id, source_record_id, version)
