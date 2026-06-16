@@ -390,9 +390,9 @@ describe('idempotency (replay-safe)', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-// Monotonic guard (stale 'opened' replay) + >1-match tie-break
+// Monotonic guard (stale 'opened' replay) + >1-match fail-closed
 // ─────────────────────────────────────────────────────────────────
-describe('monotonic guard + tie-break', () => {
+describe('monotonic guard + ambiguous match', () => {
   test("a stale 'opened' replayed after 'failed' is ignored — no downgrade, no promoted_at re-stamp", async () => {
     const { id, hash16 } = await seedDispatched('rec-stale');
 
@@ -416,21 +416,25 @@ describe('monotonic guard + tie-break', () => {
     expect(after.status).toBe('accepted');
   });
 
-  test('>1 dispatched candidates share a source_record_id → only the most-recent acted_at row is written', async () => {
+  test('>1 dispatched candidates share a source_record_id → fail closed (409, ZERO writes)', async () => {
     const srid = 'rec-multiversion';
     const a = await toRow(engine, { source_id: 'default', source_record_id: srid, version: '1', provider: 'crunchbase', proposed_markdown: '# a' });
     const b = await toRow(engine, { source_id: 'default', source_record_id: srid, version: '2', provider: 'crunchbase', proposed_markdown: '# b' });
-    // Both dispatched (accepted + artifact_hash), neither pr_opened; b has the more-recent acted_at.
+    // Both dispatched (accepted + artifact_hash) and share the same source_record_id hash.
     await engine.executeRaw(`UPDATE connector_candidates SET status='accepted', artifact_hash='h1', acted_at='2026-06-01T00:00:00Z' WHERE id=$1`, [a.row.id]);
     await engine.executeRaw(`UPDATE connector_candidates SET status='accepted', artifact_hash='h2', acted_at='2026-06-10T00:00:00Z' WHERE id=$1`, [b.row.id]);
 
     const { rawBody, signature } = signedBody({ status: 'opened', branch: BRANCH, pr_url: PR_URL, source_record_id_hash: sourceRecordIdHash16(srid) });
     const r = await handlePromotionCallback({ rawBody, signatureHeader: signature, secret: SECRET, engine });
-    expect(r.ok).toBe(true);
 
-    // Tie-break: the most-recent acted_at row (b) gets pr_opened; the older (a) is untouched.
-    expect((await readRow(b.row.id)).promotion_status).toBe('pr_opened');
+    // Fail closed: the Brain body carries no source_id/provider/candidate_id/artifact_hash, so
+    // gbrain cannot disambiguate and refuses — a write path must NEVER guess which row to mutate.
+    expect(r.ok).toBe(false);
+    expect((r as Extract<PromotionCallbackResult, { ok: false }>).status).toBe(409);
+
+    // NEITHER row was mutated.
     expect((await readRow(a.row.id)).promotion_status).toBeNull();
+    expect((await readRow(b.row.id)).promotion_status).toBeNull();
   });
 });
 

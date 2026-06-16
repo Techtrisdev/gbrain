@@ -370,7 +370,7 @@ const PROMOTION_CALLBACK_KEYS: readonly string[] = ['branch', 'pr_url', 'source_
 /** Discriminated result the Express wrapper maps to an HTTP response. */
 export type PromotionCallbackResult =
   | { ok: true; status: 200; candidateId: number; mappedStatus: PromotionStatus }
-  | { ok: false; status: 400 | 401 | 404 | 500; error: string };
+  | { ok: false; status: 400 | 401 | 404 | 409 | 500; error: string };
 
 /**
  * The 16-char identity the Brain puts on the wire:
@@ -408,43 +408,25 @@ function parsePromotionCallbackBody(parsed: unknown): PromotionCallbackBody | nu
 
 /**
  * Among the dispatched-and-awaiting-callback set (status='accepted' AND artifact_hash IS NOT
- * NULL), find the ONE candidate whose source_record_id hashes to the wire identity.
+ * NULL), return ALL candidates whose source_record_id hashes to the wire identity.
  *
  * The SELECT predicate (not a SQL hash match) is deliberate: the Brain sends only the 16-char
- * hash, and we want to scope the comparison to the rows that were actually dispatched. We
- * recompute the hash in TS and compare. If >1 row shares the hash (the same source_record_id
- * across versions — rare), prefer one already promotion_status='pr_opened', then the most
- * recent acted_at, and log the ambiguity. Returns the single matched row or null.
+ * hash, and we scope the comparison to the rows that were actually dispatched, recomputing the
+ * hash in TS. The caller FAILS CLOSED on >1 (it never picks a row): the merged Brain callback
+ * body carries no source_id/provider/candidate_id/artifact_hash, so gbrain cannot safely
+ * disambiguate multiple accepted candidates sharing a source_record_id hash — and a write path
+ * must never guess which row to mutate.
  */
-async function matchCandidateByHash(
+async function matchCandidatesByHash(
   engine: BrainEngine,
   hash16: string,
-): Promise<ConnectorCandidateRow | null> {
+): Promise<ConnectorCandidateRow[]> {
   const rows = await engine.executeRaw<ConnectorCandidateRow>(
     `SELECT ${CANDIDATE_PROMOTION_RETURNING}
        FROM connector_candidates
       WHERE status = 'accepted' AND artifact_hash IS NOT NULL`,
   );
-
-  const matches = rows.filter((r) => sourceRecordIdHash16(r.source_record_id) === hash16);
-  if (matches.length === 0) return null;
-  if (matches.length === 1) return matches[0];
-
-  // Ambiguity (rare): same source_record_id across versions. Deterministic tie-break:
-  // prefer an already-pr_opened row, then the most-recent acted_at. Log the count only —
-  // source_record_id_hash is already a safe hash.
-  console.warn(
-    `promotion callback: ambiguous source_record_id_hash=${hash16} matched ${matches.length} candidates; resolving by pr_opened then most-recent acted_at`,
-  );
-  const sorted = [...matches].sort((a, b) => {
-    const aPr = a.promotion_status === 'pr_opened' ? 1 : 0;
-    const bPr = b.promotion_status === 'pr_opened' ? 1 : 0;
-    if (aPr !== bPr) return bPr - aPr;
-    const aT = a.acted_at ? new Date(a.acted_at).getTime() : 0;
-    const bT = b.acted_at ? new Date(b.acted_at).getTime() : 0;
-    return bT - aT;
-  });
-  return sorted[0];
+  return rows.filter((r) => sourceRecordIdHash16(r.source_record_id) === hash16);
 }
 
 /**
@@ -458,7 +440,7 @@ async function matchCandidateByHash(
  *   1. secret present?            no → 500 (fail-closed), no parse, no write.
  *   2. hmacSha256Verify(raw)?     no → 401, body NEVER parsed/logged, no write.
  *   3. JSON.parse + strict 4-key validate → bad → 400, no write.
- *   4. match by source_record_id_hash → 0 → 404, no write.
+ *   4. match by source_record_id_hash → 0 → 404; >1 → 409 ambiguous (ZERO writes, never guess).
  *   5. allowlisted writeback via updateCandidatePromotionState → 200 (idempotent on replay).
  */
 export async function handlePromotionCallback(args: {
@@ -496,19 +478,29 @@ export async function handlePromotionCallback(args: {
     return { ok: false, status: 400, error: 'invalid_body' };
   }
 
-  // (4) Match the candidate by source_record_id_hash among the dispatched set.
-  let candidate: ConnectorCandidateRow | null;
+  // (4) Match by source_record_id_hash among the dispatched set. Fail CLOSED on ambiguity:
+  //     0 → 404; exactly 1 → proceed; >1 → 409 with ZERO writes. The Brain callback carries no
+  //     source_id/provider/candidate_id/artifact_hash, so we cannot disambiguate and must never
+  //     guess which row to mutate.
+  let matches: ConnectorCandidateRow[];
   try {
-    candidate = await matchCandidateByHash(engine, body.source_record_id_hash);
+    matches = await matchCandidatesByHash(engine, body.source_record_id_hash);
   } catch (err) {
     console.error('promotion callback: candidate lookup failed:', err instanceof Error ? err.message : String(err));
     return { ok: false, status: 500, error: 'lookup_failed' };
   }
-  if (!candidate) {
+  if (matches.length === 0) {
     // source_record_id_hash is already a hash — safe to log.
     console.warn(`promotion callback: no dispatched candidate matched source_record_id_hash=${body.source_record_id_hash}`);
     return { ok: false, status: 404, error: 'candidate_not_found' };
   }
+  if (matches.length > 1) {
+    console.warn(
+      `promotion callback: ambiguous source_record_id_hash=${body.source_record_id_hash} matched ${matches.length} dispatched candidates — refusing with zero writes`,
+    );
+    return { ok: false, status: 409, error: 'ambiguous_candidate_match' };
+  }
+  const candidate = matches[0];
 
   // (4.5) Monotonic guard against a stale 'opened' redelivery. The merged Brain sends no
   //       nonce/timestamp and its HMAC never expires, so an OLD valid-MAC 'opened' delivery
