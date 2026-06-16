@@ -45,7 +45,8 @@ import {
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
-import { listCandidates, approveCandidate, rejectCandidate } from '../core/connectors/candidate.ts';
+import { listCandidates, approveCandidate, rejectCandidate, PromotionTargetError } from '../core/connectors/candidate.ts';
+import type { PromotionTarget } from '../core/connectors/promotion.ts';
 import {
   calendarConnector,
   incrementalSync,
@@ -2421,14 +2422,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.post('/admin/api/candidates/:id/approve', requireAdmin, express.json(), async (req: Request, res: Response) => {
     const id = parseCandidateId(req, res);
     if (id === null) return;
+    // TECH-2109: read the reviewer-selected promotion target from the body. Default mode is
+    // 'inbox' with no path (the Brain bridge defaults the inbox path). 'existing_page'
+    // requires a non-empty target_path (enforced server-side in approveCandidate, which
+    // throws PromotionTargetError on an unsafe/missing path → 400 below).
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const kindRaw = typeof body.target_kind === 'string' ? body.target_kind : 'inbox';
+    const kind: PromotionTarget['kind'] = kindRaw === 'existing_page' ? 'existing_page' : 'inbox';
+    const path = typeof body.target_path === 'string' ? body.target_path.trim() : '';
     try {
-      const result = await approveCandidate(engine, id, adminActor(req));
+      const result = await approveCandidate(engine, id, adminActor(req), { kind, path });
       if (!result.row) {
         res.status(404).json({ error: 'not_pending', message: 'candidate not found or already acted' });
         return;
       }
       res.json({ candidate: result.row, promotion: result.promotion });
     } catch (err) {
+      if (err instanceof PromotionTargetError) {
+        res.status(400).json({ error: 'invalid_target', message: err.message });
+        return;
+      }
       res.status(500).json({ error: 'approve_failed', message: err instanceof Error ? err.message : String(err) });
     }
   });

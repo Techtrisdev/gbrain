@@ -16,6 +16,12 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { strip } from './redact.ts';
+import {
+  buildPromotionArtifact,
+  canonicalizeArtifactForSigning,
+  artifactHash,
+  type PromotionTarget,
+} from './promotion.ts';
 
 // ── Input type ────────────────────────────────────────────────────────────────
 
@@ -74,6 +80,14 @@ export interface ConnectorCandidateRow {
   acted_by: string | null;
   acted_at: Date | null;
   superseded_by: number | null;
+  // TECH-2109 promotion bridge columns — all nullable; pre-promotion rows read null.
+  target_kind: 'existing_page' | 'inbox' | null;
+  target_path: string | null;
+  promotion_status: 'pr_opened' | 'indexed' | 'promoted_to_inbox' | 'needs_fix' | 'failed' | null;
+  promotion_pr_url: string | null;
+  promotion_branch: string | null;
+  promoted_at: Date | null;
+  artifact_hash: string | null;
   proposed_at: Date;
 }
 
@@ -114,7 +128,21 @@ function renderCandidateMarkdown(item: ConnectorCandidateItem): string {
  */
 function buildCandidateRow(
   item: ConnectorCandidateItem,
-): Omit<ConnectorCandidateRow, 'id' | 'proposed_at'> {
+): Omit<
+  ConnectorCandidateRow,
+  // 'id' / 'proposed_at' are DB-generated; the TECH-2109 promotion columns are
+  // written later (at approval) by approveCandidate / the promotion bridge, never
+  // by the connector INSERT — they default to NULL here.
+  | 'id'
+  | 'proposed_at'
+  | 'target_kind'
+  | 'target_path'
+  | 'promotion_status'
+  | 'promotion_pr_url'
+  | 'promotion_branch'
+  | 'promoted_at'
+  | 'artifact_hash'
+> {
   // Redaction is ENFORCED HERE, at the write boundary — toRow is the last gate
   // before connector_candidates and must not trust its callers (the framework's
   // landRecords today, the future promotion bridge, or any other). The
@@ -225,13 +253,7 @@ export async function toRow(
       $13, $14, $15, $16, $17
     )
     ON CONFLICT (source_id, source_record_id, version) DO NOTHING
-    RETURNING
-      id, source_id, source_record_id, version,
-      source_record_ids, provider, proposed_slug, proposed_markdown,
-      confidence, redactions,
-      expires_at, as_of, rationale_ref,
-      status, status_reason, acted_by, acted_at,
-      superseded_by, proposed_at
+    RETURNING ${CANDIDATE_COLUMNS}
   `;
 
   const rows = await engine.executeRaw<ConnectorCandidateRow>(insertSql, params);
@@ -239,13 +261,7 @@ export async function toRow(
   if (rows.length === 0) {
     // ON CONFLICT DO NOTHING — row already existed; fetch it for the caller.
     const fetchSql = `
-      SELECT
-        id, source_id, source_record_id, version,
-        source_record_ids, provider, proposed_slug, proposed_markdown,
-        confidence, redactions,
-        expires_at, as_of, rationale_ref,
-        status, status_reason, acted_by, acted_at,
-        superseded_by, proposed_at
+      SELECT ${CANDIDATE_COLUMNS}
       FROM connector_candidates
       WHERE source_id         = $1
         AND source_record_id  = $2
@@ -276,7 +292,11 @@ const CANDIDATE_COLS = [
   'id', 'source_id', 'source_record_id', 'version',
   'source_record_ids', 'provider', 'proposed_slug', 'proposed_markdown',
   'confidence', 'redactions', 'expires_at', 'as_of', 'rationale_ref',
-  'status', 'status_reason', 'acted_by', 'acted_at', 'superseded_by', 'proposed_at',
+  'status', 'status_reason', 'acted_by', 'acted_at', 'superseded_by',
+  // TECH-2109 promotion bridge columns
+  'target_kind', 'target_path', 'promotion_status', 'promotion_pr_url',
+  'promotion_branch', 'promoted_at', 'artifact_hash',
+  'proposed_at',
 ] as const;
 /** Bare column list, for RETURNING / unqualified SELECT. */
 const CANDIDATE_COLUMNS = CANDIDATE_COLS.join(', ');
@@ -389,13 +409,20 @@ export async function rejectCandidate(
 }
 
 /**
- * The promotion-hook seam (AC3 / gt-promotion-hook). TECH-2036 defines the interface + the
- * approve call site; TECH-2037 registers the real techtris-brain promotion bridge (open the
- * markdown PR, reflect pr_url/indexed back). Until then no hook is registered and an approved
- * candidate sits in an 'accepted'-pending, retriable state — never lost (TECH-2037 AC3).
+ * The promotion-hook seam (AC3 / gt-promotion-hook). TECH-2037 / TECH-2109 register the real
+ * techtris-brain promotion bridge (build → sign → emitRepositoryDispatch →
+ * updateCandidatePromotionState). Until a hook is registered an approved candidate sits in an
+ * 'accepted'-pending, retriable state — never lost (TECH-2037 AC3). The hook receives the
+ * accepted row (already carrying target_kind / target_path / artifact_hash) AND the
+ * reviewer-selected target so it can build the artifact for the dispatch.
  */
 export interface PromotionHook {
-  (engine: BrainEngine, candidate: ConnectorCandidateRow, actor: string): Promise<{ prUrl?: string }>;
+  (
+    engine: BrainEngine,
+    candidate: ConnectorCandidateRow,
+    actor: string,
+    target: PromotionTarget,
+  ): Promise<{ prUrl?: string }>;
 }
 let promotionHook: PromotionHook | null = null;
 
@@ -408,6 +435,67 @@ export function getPromotionHook(): PromotionHook | null {
   return promotionHook;
 }
 
+/** Thrown by approveCandidate when the reviewer-selected target fails server-side validation. */
+export class PromotionTargetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PromotionTargetError';
+  }
+}
+
+/**
+ * Server-side promotion-target validation — rejects BEFORE any write (AC3). The Brain bridge
+ * has its own fail-closed path sandbox, but gbrain refuses to PERSIST or DISPATCH a target
+ * that is obviously unsafe so a bad target never reaches the external repo.
+ *
+ *  - existing_page REQUIRES a non-empty target_path.
+ *  - ANY mode rejects a target_path with leading/trailing whitespace, a leading '/' or '~'
+ *    (absolute), a backslash, a NUL, a URL scheme ('scheme://'), an empty path segment, or
+ *    any dot-prefixed segment ('.', '..', '....', a dotfile, or a dot-directory like '.git'
+ *    / '.github').
+ *
+ * Canonical-by-rejection: anything non-canonical is REJECTED, never silently rewritten, so a
+ * path that PASSES is guaranteed canonical — the exact string persisted in target_path and
+ * emitted in the HMAC-signed artifact is therefore safe without mutating the reviewer's input.
+ * This rejects the parent-directory (..) traversal class AND the non-canonical-but-passing
+ * inputs (' /etc/passwd', 'a/./b.md', '....//x', 'a//b') that a substring/segment-equality
+ * check would let through. The Brain bridge re-validates with its own fail-closed sandbox
+ * (CONTENT_DIRS confinement + protected-path rejection); this is defense in depth.
+ *
+ * inbox MAY omit the path (the Brain defaults it); when inbox supplies a path it is held to
+ * the same rules.
+ */
+export function validatePromotionTarget(target: PromotionTarget): void {
+  const path = target.path ?? '';
+  if (target.kind === 'existing_page' && !path.trim()) {
+    throw new PromotionTargetError('existing_page target requires a non-empty target_path');
+  }
+  if (path) {
+    if (path !== path.trim()) {
+      throw new PromotionTargetError('target_path has leading/trailing whitespace');
+    }
+    if (path.includes('\x00')) throw new PromotionTargetError('target_path contains a NUL byte');
+    if (path.includes('\\')) throw new PromotionTargetError('target_path contains a backslash');
+    if (path.startsWith('/') || path.startsWith('~')) {
+      throw new PromotionTargetError('target_path must be relative (no leading / or ~)');
+    }
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(path)) {
+      throw new PromotionTargetError('target_path must not be a URL (scheme://)');
+    }
+    for (const segment of path.split('/')) {
+      if (segment === '') {
+        throw new PromotionTargetError('target_path contains an empty path segment');
+      }
+      if (segment.startsWith('.')) {
+        // Rejects '.', '..' (traversal), '....' (literal multi-dot), and any dotfile /
+        // dot-directory ('.git', '.github/...') — none of which is a legitimate Brain
+        // content path (CONTENT_DIRS pages + inbox slugs never start with a dot).
+        throw new PromotionTargetError(`target_path contains a dot-prefixed segment: ${segment}`);
+      }
+    }
+  }
+}
+
 export interface ApproveResult {
   /** The accepted row, or null when the id was not pending (not-found / already acted). */
   row: ConnectorCandidateRow | null;
@@ -417,30 +505,60 @@ export interface ApproveResult {
 }
 
 /**
- * Approve a PENDING candidate: status→accepted + actor/time audit, then hand the row to the
- * promotion hook. Marking accepted is committed BEFORE the bridge runs, so a bridge failure
- * leaves an accepted-pending (retriable) row rather than losing the decision (TECH-2037 AC3).
- * Guarded by `status = 'pending'` for idempotency.
+ * Approve a PENDING candidate with a reviewer-selected promotion target.
+ *
+ * Order (AC3):
+ *  1. validatePromotionTarget — rejects an unsafe target BEFORE any write (throws).
+ *  2. Build the minimized artifact + its canonical string + artifact_hash from the CURRENT
+ *     row (fetched read-only) so the hash is computed before the accept UPDATE.
+ *  3. ONE UPDATE sets status='accepted' + actor/time AND persists target_kind / target_path /
+ *     artifact_hash, guarded by status='pending' (idempotency: a duplicate approve hits 0 rows
+ *     and is a safe no-op). The decision + target are committed BEFORE the bridge runs.
+ *  4. Hand the accepted row + target to the promotion hook. A hook failure leaves the row
+ *     accepted-pending (retriable) — never throws out of approve, never marks promoted.
+ *
+ * A non-pending id (not found / already acted) returns { row: null }.
  */
 export async function approveCandidate(
   engine: BrainEngine,
   id: number,
   actor: string,
+  target: PromotionTarget,
 ): Promise<ApproveResult> {
+  // 1. Reject an unsafe target before touching the DB.
+  validatePromotionTarget(target);
+
+  // 2. Read the current row to compute the artifact hash. If it is not pending, the accept
+  //    UPDATE below will no-op anyway; computing the hash off a stale/absent row is harmless
+  //    because it is only written inside the status='pending'-guarded UPDATE.
+  const [current] = await engine.executeRaw<ConnectorCandidateRow>(
+    `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates WHERE id = $1`,
+    [id],
+  );
+  let hash: string | null = null;
+  if (current) {
+    const artifact = buildPromotionArtifact(current, target);
+    const canonical = canonicalizeArtifactForSigning(artifact);
+    hash = artifactHash(canonical);
+  }
+
+  // 3. SAME UPDATE: accept + persist target + artifact_hash, guarded for idempotency.
   const rows = await engine.executeRaw<ConnectorCandidateRow>(
     `UPDATE connector_candidates
-        SET status = 'accepted', acted_by = $2, acted_at = now()
+        SET status = 'accepted', acted_by = $2, acted_at = now(),
+            target_kind = $3, target_path = $4, artifact_hash = $5
       WHERE id = $1 AND status = 'pending'
       RETURNING ${CANDIDATE_COLUMNS}`,
-    [id, strip(actor)],
+    [id, strip(actor), target.kind, target.path || null, hash],
   );
   const row = rows[0] ?? null;
   if (!row) return { row: null, promotion: { invoked: false } };
 
+  // 4. Hand to the promotion hook (build → sign → emit → reflect). Failure stays retriable.
   const hook = getPromotionHook();
   if (!hook) return { row, promotion: { invoked: false, pending: true } };
   try {
-    const result = await hook(engine, row, actor);
+    const result = await hook(engine, row, actor, target);
     return { row, promotion: { invoked: true, prUrl: result.prUrl } };
   } catch (err) {
     // Bridge failure: the row stays 'accepted' (already committed) — retriable, never lost.

@@ -33,6 +33,11 @@ export function ReviewQueuePage() {
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // TECH-2109: reviewer-selected promotion target for the expanded candidate.
+  // Default mode 'inbox' (a new inbox page; the Brain defaults the path). 'existing_page'
+  // promotes onto an existing content page at targetPath.
+  const [targetKind, setTargetKind] = useState<'inbox' | 'existing_page'>('inbox');
+  const [targetPath, setTargetPath] = useState('');
 
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [status, page]);
 
@@ -44,16 +49,27 @@ export function ReviewQueuePage() {
     setExpanded(expanded === id ? null : id);
     setReason('');
     setError(null);
+    // Reset the promotion target to the default (new inbox page) on each expand.
+    setTargetKind('inbox');
+    setTargetPath('');
   };
 
   const act = async (id: number, kind: 'approve' | 'reject') => {
     setBusy(id);
     setError(null);
     try {
-      if (kind === 'approve') await api.candidateApprove(id);
-      else await api.candidateReject(id, reason);
+      if (kind === 'approve') {
+        await api.candidateApprove(id, {
+          target_kind: targetKind,
+          target_path: targetKind === 'existing_page' ? targetPath.trim() : undefined,
+        });
+      } else {
+        await api.candidateReject(id, reason);
+      }
       setExpanded(null);
       setReason('');
+      setTargetKind('inbox');
+      setTargetPath('');
       load();
     } catch (e: any) {
       setError(String(e?.message ?? e));
@@ -192,7 +208,40 @@ export function ReviewQueuePage() {
                         </div>
 
                         {c.status === 'pending' && (
-                          <div style={{ marginTop: 16, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+                          <>
+                          <div
+                            data-testid={`promotion-target-${c.id}`}
+                            style={{ marginTop: 16, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>Promote to</span>
+                            <select
+                              data-testid={`target-kind-${c.id}`}
+                              value={targetKind}
+                              onChange={(e) => setTargetKind(e.target.value as 'inbox' | 'existing_page')}
+                              style={{
+                                background: 'var(--bg-primary, #0a0a14)', color: 'var(--text-primary)',
+                                border: '1px solid var(--border)', borderRadius: 6, padding: '6px 10px', fontSize: 13,
+                              }}
+                            >
+                              <option value="inbox">New inbox page (default)</option>
+                              <option value="existing_page">Existing page…</option>
+                            </select>
+                            {targetKind === 'existing_page' && (
+                              <input
+                                data-testid={`target-path-${c.id}`}
+                                value={targetPath}
+                                onChange={(e) => setTargetPath(e.target.value)}
+                                placeholder="content path, e.g. companies/acme.md"
+                                style={{
+                                  flex: 1, minWidth: 220, background: 'var(--bg-primary, #0a0a14)',
+                                  color: 'var(--text-primary)', border: '1px solid var(--border)',
+                                  borderRadius: 6, padding: '6px 10px', fontSize: 13,
+                                }}
+                              />
+                            )}
+                          </div>
+                          <div style={{ marginTop: 12, display: 'flex', gap: 8, alignItems: 'flex-start' }}>
                             <input
                               data-testid={`reject-reason-${c.id}`}
                               value={reason}
@@ -206,12 +255,14 @@ export function ReviewQueuePage() {
                             />
                             <button
                               data-testid={`approve-${c.id}`}
-                              disabled={busy === c.id}
+                              disabled={busy === c.id || (targetKind === 'existing_page' && !targetPath.trim())}
                               onClick={(e) => { e.stopPropagation(); act(c.id, 'approve'); }}
                               style={{
                                 background: 'var(--success-bg, #103a1f)', color: 'var(--success, #5ad17e)',
                                 border: '1px solid var(--success, #5ad17e)', borderRadius: 6, padding: '6px 14px',
-                                fontSize: 13, cursor: 'pointer',
+                                fontSize: 13,
+                                cursor: targetKind === 'existing_page' && !targetPath.trim() ? 'not-allowed' : 'pointer',
+                                opacity: targetKind === 'existing_page' && !targetPath.trim() ? 0.5 : 1,
                               }}
                             >
                               Approve
@@ -229,6 +280,7 @@ export function ReviewQueuePage() {
                               Reject
                             </button>
                           </div>
+                          </>
                         )}
                       </td>
                     </tr>

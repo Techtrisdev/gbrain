@@ -19,3 +19,11 @@ import './linear.ts';
 import './slack.ts';
 import './calendar.ts';
 import './github.ts';
+
+// TECH-2109: register the connector→Brain promotion bridge so candidate approvals build +
+// sign + emit a repository_dispatch to techtris-brain. The hook is env-backed
+// (PROMOTION_HMAC_SECRET + GBRAIN_PROMOTE_GITHUB_TOKEN) and INERT until a real approval
+// fires — registering it performs no network call. Side-effect import mirrors the connector
+// registrations above (the import IS the wiring).
+import { registerDefaultPromotionHook } from './promotion-hook.ts';
+registerDefaultPromotionHook();

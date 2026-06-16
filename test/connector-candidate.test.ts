@@ -340,27 +340,33 @@ describe('review queue: rejectCandidate (AC3)', () => {
 describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retriable)', () => {
   afterEach(() => registerPromotionHook(null));
 
+  // TECH-2109: approveCandidate now takes a reviewer-selected target. Default 'inbox'.
+  const INBOX: import('../src/core/connectors/promotion.ts').PromotionTarget = { kind: 'inbox', path: '' };
+
   test('with NO hook registered → accepted + promotion pending (retriable, never lost)', async () => {
     const { row } = await toRow(engine, { source_id: 'default', source_record_id: 'app-1', proposed_markdown: 'x' });
-    const res = await approveCandidate(engine, row.id, 'admin');
+    const res = await approveCandidate(engine, row.id, 'admin', INBOX);
     expect(res.row!.status).toBe('accepted');
     expect(res.row!.acted_by).toBe('admin');
     expect(res.promotion.invoked).toBe(false);
     expect(res.promotion.pending).toBe(true);
+    // Target + artifact_hash are persisted in the SAME accept UPDATE.
+    expect(res.row!.target_kind).toBe('inbox');
+    expect(res.row!.artifact_hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  test('with a hook → it runs with the accepted row + actor and returns pr_url', async () => {
-    const seen: { id: number; actor: string }[] = [];
-    const hook: PromotionHook = async (_e, cand, actor) => {
-      seen.push({ id: cand.id, actor });
+  test('with a hook → it runs with the accepted row + actor + target and returns pr_url', async () => {
+    const seen: { id: number; actor: string; kind: string }[] = [];
+    const hook: PromotionHook = async (_e, cand, actor, target) => {
+      seen.push({ id: cand.id, actor, kind: target.kind });
       return { prUrl: 'https://github.com/x/y/pull/1' };
     };
     registerPromotionHook(hook);
     const { row } = await toRow(engine, { source_id: 'default', source_record_id: 'app-2', proposed_markdown: 'x' });
-    const res = await approveCandidate(engine, row.id, 'jarvis');
+    const res = await approveCandidate(engine, row.id, 'jarvis', INBOX);
     expect(res.promotion.invoked).toBe(true);
     expect(res.promotion.prUrl).toBe('https://github.com/x/y/pull/1');
-    expect(seen).toEqual([{ id: row.id, actor: 'jarvis' }]);
+    expect(seen).toEqual([{ id: row.id, actor: 'jarvis', kind: 'inbox' }]);
     expect(res.row!.status).toBe('accepted');
   });
 
@@ -370,7 +376,7 @@ describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retri
     };
     registerPromotionHook(hook);
     const { row } = await toRow(engine, { source_id: 'default', source_record_id: 'app-3', proposed_markdown: 'x' });
-    const res = await approveCandidate(engine, row.id, 'admin');
+    const res = await approveCandidate(engine, row.id, 'admin', INBOX);
     expect(res.row!.status).toBe('accepted'); // committed before the bridge ran
     expect(res.promotion.invoked).toBe(false);
     expect(res.promotion.pending).toBe(true);
@@ -378,7 +384,7 @@ describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retri
   });
 
   test('approving a non-pending id is a guarded no-op (row null)', async () => {
-    const res = await approveCandidate(engine, 999999, 'admin');
+    const res = await approveCandidate(engine, 999999, 'admin', INBOX);
     expect(res.row).toBeNull();
   });
 });

@@ -4346,6 +4346,40 @@ export const MIGRATIONS: Migration[] = [
         ON connector_tokens (source_id, provider);
     `,
   },
+  {
+    version: 95,
+    name: 'connector_candidates_promotion_columns',
+    // TECH-2109: the gbrain side of the connector→Brain promotion bridge.
+    // Adds the reviewer-selected target + dispatch-state columns to
+    // connector_candidates. ALL additive + nullable — old rows read NULL,
+    // and the existing `status` CHECK ('pending','accepted','rejected') is
+    // NEVER touched. Mirrors src/schema.sql + src/core/pglite-schema.ts +
+    // src/core/schema-embedded.ts.
+    //
+    //   target_kind       'existing_page' | 'inbox' (reviewer's promotion mode)
+    //   target_path       reviewer-selected target path (validated app-side)
+    //   promotion_status  dispatch outcome reflected back by the Brain bridge
+    //   promotion_pr_url  Brain PR url (set on a successful PR open)
+    //   promotion_branch  Brain-derived branch ref (reflected back)
+    //   promoted_at       when the candidate reached a promoted terminal state
+    //   artifact_hash     sha256 of the canonical signed artifact (idempotency)
+    //
+    // idempotent: ADD COLUMN IF NOT EXISTS is a no-op on a DB already carrying
+    // these columns (fresh installs get them from schema.sql / pglite-schema.ts).
+    idempotent: true,
+    sql: `
+      ALTER TABLE connector_candidates
+        ADD COLUMN IF NOT EXISTS target_kind TEXT
+          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox')),
+        ADD COLUMN IF NOT EXISTS target_path TEXT,
+        ADD COLUMN IF NOT EXISTS promotion_status TEXT
+          CHECK (promotion_status IS NULL OR promotion_status IN ('pr_opened','indexed','promoted_to_inbox','needs_fix','failed')),
+        ADD COLUMN IF NOT EXISTS promotion_pr_url TEXT,
+        ADD COLUMN IF NOT EXISTS promotion_branch TEXT,
+        ADD COLUMN IF NOT EXISTS promoted_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS artifact_hash TEXT;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
