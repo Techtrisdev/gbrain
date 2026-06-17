@@ -39,7 +39,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { ConnectorCandidateRow } from './candidate.ts';
 import { hmacSha256Verify } from './base.ts';
 import { strip } from './redact.ts';
-import { mintAppJwt } from './github.ts';
+import { mintAppJwt } from './github-app-jwt.ts';
 
 // ── The locked artifact shape ────────────────────────────────────────────────────
 
@@ -236,8 +236,10 @@ export async function emitRepositoryDispatch(opts: EmitDispatchOpts): Promise<Em
 // The repository_dispatch Bearer can be EITHER a static GBRAIN_PROMOTE_GITHUB_TOKEN
 // (back-compat) OR a short-lived GitHub App INSTALLATION token minted on demand from the same
 // App the github_kb connector uses (GBRAIN_GITHUB_APP_ID + GBRAIN_GITHUB_APP_PRIVATE_KEY).
-// Reuses github.ts::mintAppJwt (pure RS256 crypto); the installation-id resolve + token
-// exchange use an injectable fetch so tests need no real network / key / installation. The
+// Reuses github-app-jwt.ts::mintAppJwt (pure RS256 crypto leaf — NOT github.ts, which would
+// pull the connector module's registerConnector side effect into the boot graph); the
+// installation-id resolve + token exchange use an injectable fetch so tests need no real
+// network / key / installation. The
 // private key, the App JWT, and the minted token are NEVER logged.
 
 /** Env: the GitHub App credentials (shared with github_kb) + an optional installation-id override. */
@@ -304,7 +306,7 @@ async function resolveInstallationId(
 
 /**
  * Mint (or reuse a cached) short-lived GitHub App INSTALLATION token authorizing
- * repository_dispatch on `repo`. Reuses github.ts::mintAppJwt (9-min RS256 App JWT), resolves
+ * repository_dispatch on `repo`. Reuses github-app-jwt.ts::mintAppJwt (9-min RS256 App JWT), resolves
  * the installation id, then exchanges the JWT for a ~1h installation token (cached by
  * installation id, refreshed before expiry). NEVER logs the key / JWT / token.
  */
