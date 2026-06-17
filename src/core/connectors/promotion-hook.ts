@@ -32,8 +32,13 @@ import {
   signArtifact,
   emitRepositoryDispatch,
   updateCandidatePromotionState,
+  getPromotionDispatchToken,
+  BRAIN_DISPATCH_REPO,
+  PROMOTION_APP_ID_ENV,
+  PROMOTION_APP_PRIVATE_KEY_ENV,
   type PromotionTarget,
   type FetchFn,
+  type AppAuthFetch,
 } from './promotion.ts';
 
 /** Env var holding the HMAC secret shared with the Brain bridge. NEVER logged. */
@@ -44,12 +49,53 @@ export const PROMOTION_GITHUB_TOKEN_ENV = 'GBRAIN_PROMOTE_GITHUB_TOKEN';
 export interface PromotionHookDeps {
   /** Resolve the HMAC secret. Defaults to process.env[PROMOTION_HMAC_SECRET]. */
   getSecret?: () => string | undefined;
-  /** Resolve the GitHub token. Defaults to process.env[GBRAIN_PROMOTE_GITHUB_TOKEN]. */
+  /**
+   * @deprecated A STATIC dispatch token. Kept for back-compat; when set (or
+   * GBRAIN_PROMOTE_GITHUB_TOKEN is in env) it takes precedence over App-token minting.
+   */
   getGithubToken?: () => string | undefined;
+  /**
+   * Full async dispatch-token resolver override (tests). When unset, a default resolver is
+   * built: static token → GitHub App installation token → throw.
+   */
+  getToken?: () => Promise<string>;
+  /** Injected App-auth fetch for the default App-token resolver's HTTP (tests). */
+  dispatchTokenFetch?: AppAuthFetch;
+  /** Env reader for the default token resolver (tests). Defaults to process.env. */
+  getEnv?: (key: string) => string | undefined;
   /** Injected fetch (tests pass a fake; production uses global fetch). */
   fetchFn?: FetchFn;
   /** Target repo override (tests). Defaults to the Brain repo inside emitRepositoryDispatch. */
   repo?: string;
+}
+
+/**
+ * Default dispatch-token resolver (A3 Path 2). Precedence:
+ *   1. an explicit static token (`deps.getGithubToken` or `GBRAIN_PROMOTE_GITHUB_TOKEN`) — back-compat;
+ *   2. else, if the GitHub App creds are set (`GBRAIN_GITHUB_APP_ID` + `GBRAIN_GITHUB_APP_PRIVATE_KEY`),
+ *      mint a short-lived installation token for the Brain repo;
+ *   3. else throw → approveCandidate leaves the candidate accepted-pending (retriable).
+ * NEVER logs the token / key / JWT.
+ */
+function makeDefaultTokenResolver(
+  deps: PromotionHookDeps,
+  getEnv: (key: string) => string | undefined,
+): () => Promise<string> {
+  return async (): Promise<string> => {
+    const staticToken = deps.getGithubToken ? deps.getGithubToken() : getEnv(PROMOTION_GITHUB_TOKEN_ENV);
+    if (staticToken) return staticToken;
+    const appId = getEnv(PROMOTION_APP_ID_ENV);
+    const appKey = getEnv(PROMOTION_APP_PRIVATE_KEY_ENV);
+    if (appId && appKey) {
+      return getPromotionDispatchToken(deps.repo ?? BRAIN_DISPATCH_REPO, {
+        getEnv,
+        fetchImpl: deps.dispatchTokenFetch,
+      });
+    }
+    throw new Error(
+      `no dispatch credential — set ${PROMOTION_GITHUB_TOKEN_ENV}, or ${PROMOTION_APP_ID_ENV} + ${PROMOTION_APP_PRIVATE_KEY_ENV} (GitHub App)`,
+    );
+  };
 }
 
 /**
@@ -71,7 +117,8 @@ function logPromotion(event: string, row: ConnectorCandidateRow): void {
  */
 export function makePromotionHook(deps: PromotionHookDeps = {}): PromotionHook {
   const getSecret = deps.getSecret ?? (() => process.env[PROMOTION_HMAC_SECRET_ENV]);
-  const getGithubToken = deps.getGithubToken ?? (() => process.env[PROMOTION_GITHUB_TOKEN_ENV]);
+  const getEnv = deps.getEnv ?? ((key: string) => process.env[key]);
+  const getToken = deps.getToken ?? makeDefaultTokenResolver(deps, getEnv);
 
   return async (
     engine: BrainEngine,
@@ -80,14 +127,16 @@ export function makePromotionHook(deps: PromotionHookDeps = {}): PromotionHook {
     target: PromotionTarget,
   ): Promise<{ prUrl?: string }> => {
     const secret = getSecret();
-    const githubToken = getGithubToken();
     if (!secret) throw new Error(`${PROMOTION_HMAC_SECRET_ENV} is not set — cannot sign promotion artifact`);
-    if (!githubToken) throw new Error(`${PROMOTION_GITHUB_TOKEN_ENV} is not set — cannot emit repository_dispatch`);
 
     // build → canonicalize → sign
     const artifact = buildPromotionArtifact(candidate, target);
     const canonical = canonicalizeArtifactForSigning(artifact);
     const signature = signArtifact(canonical, secret);
+
+    // Resolve the dispatch Bearer: a static token, else a minted GitHub App installation token.
+    // Throws (caught by approveCandidate → accepted-pending, retriable) when no credential is set.
+    const githubToken = await getToken();
 
     // emit (throws on non-2xx → approveCandidate leaves the row accepted-pending, retriable)
     await emitRepositoryDispatch({
