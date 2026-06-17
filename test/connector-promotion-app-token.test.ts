@@ -19,7 +19,7 @@ const { privateKey: APP_KEY } = generateKeyPairSync('rsa', {
 });
 const APP_ID = '123456';
 
-interface Call { url: string; method: string; auth: string }
+interface Call { url: string; method: string; auth: string; contentType?: string; body?: string }
 function makeAppFetch(opts: { installationId?: string; token?: string; expiresAt?: string; failInstall?: boolean; failToken?: boolean } = {}): {
   fetchImpl: AppAuthFetch;
   calls: Call[];
@@ -29,7 +29,7 @@ function makeAppFetch(opts: { installationId?: string; token?: string; expiresAt
   const token = opts.token ?? 'ghs_minted_install_token';
   const expiresAt = opts.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString();
   const fetchImpl: AppAuthFetch = async (url, init) => {
-    calls.push({ url, method: init.method, auth: init.headers.authorization });
+    calls.push({ url, method: init.method, auth: init.headers.authorization, contentType: init.headers['content-type'], body: init.body });
     if (url.endsWith('/installation')) {
       if (opts.failInstall) return { ok: false, status: 404, text: async () => 'not found' };
       return { ok: true, status: 200, text: async () => JSON.stringify({ id: Number(installationId) }) };
@@ -64,6 +64,12 @@ describe('getPromotionDispatchToken — GitHub App installation-token minting', 
     expect(calls[1].method).toBe('POST');
     expect(calls[1].url).toContain('/app/installations/5550/access_tokens');
     expect(calls[1].auth.startsWith('Bearer ')).toBe(true);
+    // The exchange POST is SCOPED: restricted to the target repo NAME + Contents:write only,
+    // sent as an application/json body — never a default (all-repos, all-permissions) token.
+    expect(calls[1].contentType).toBe('application/json');
+    const body = JSON.parse(calls[1].body ?? '{}');
+    expect(body.repositories).toEqual(['repo-mint-A']);
+    expect(body.permissions).toEqual({ contents: 'write' });
   });
 
   test('caches by repo: a second call within expiry does NOT re-fetch', async () => {
@@ -95,6 +101,12 @@ describe('getPromotionDispatchToken — GitHub App installation-token minting', 
     expect(tok).toBe('ghs_tok_override');
     expect(calls.length).toBe(1); // exchange POST only — no resolve GET
     expect(calls[0].url).toContain('/app/installations/424242/access_tokens');
+    // Override skips the GET, but the POST still sends the SAME restricted repo/permission body.
+    expect(calls[0].method).toBe('POST');
+    expect(calls[0].contentType).toBe('application/json');
+    const body = JSON.parse(calls[0].body ?? '{}');
+    expect(body.repositories).toEqual(['repo-override']);
+    expect(body.permissions).toEqual({ contents: 'write' });
   });
 
   test('throws when App credentials are missing', async () => {

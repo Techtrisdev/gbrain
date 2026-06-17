@@ -245,10 +245,10 @@ export const PROMOTION_APP_ID_ENV = 'GBRAIN_GITHUB_APP_ID';
 export const PROMOTION_APP_PRIVATE_KEY_ENV = 'GBRAIN_GITHUB_APP_PRIVATE_KEY';
 export const PROMOTION_INSTALLATION_ID_ENV = 'GBRAIN_PROMOTE_GITHUB_INSTALLATION_ID';
 
-/** Injectable fetch for App-auth HTTP (no request body; GET/POST). Tests pass a fake. */
+/** Injectable fetch for App-auth HTTP (GET resolve; POST exchange carries a scoped JSON body). Tests pass a fake. */
 export type AppAuthFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string> },
+  init: { method: string; headers: Record<string, string>; body?: string },
 ) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
 
 interface CachedInstallToken {
@@ -328,9 +328,24 @@ export async function getPromotionDispatchToken(
   const appJwt = mintAppJwt(privateKey, appId);
   const installationId = await resolveInstallationId(repo, appJwt, doFetch, getEnv);
 
+  // Scope the installation token to JUST the target repo + the minimum permission needed.
+  // repository_dispatch (POST /repos/{owner}/{repo}/dispatches) requires Contents: write per
+  // GitHub's fine-grained-PAT permission table — nothing narrower is accepted. Omitting
+  // `repositories`/`permissions` would mint a token carrying ALL of the installation's repos
+  // and permissions, far too broad for this single-purpose dispatch credential. The
+  // `repositories` field takes bare repo NAMES (not owner/name); slice handles a bare name too.
+  const repoName = repo.slice(repo.lastIndexOf('/') + 1);
+  const tokenRequestBody = JSON.stringify({
+    repositories: [repoName],
+    permissions: { contents: 'write' },
+  });
   const res = await doFetch(
     `https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
-    { method: 'POST', headers: appAuthHeaders(appJwt) },
+    {
+      method: 'POST',
+      headers: { ...appAuthHeaders(appJwt), 'content-type': 'application/json' },
+      body: tokenRequestBody,
+    },
   );
   if (!res.ok) throw new Error(`App installation token exchange failed: status=${res.status}`);
   const json = JSON.parse(await res.text()) as { token?: string; expires_at?: string };
