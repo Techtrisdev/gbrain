@@ -39,6 +39,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { ConnectorCandidateRow } from './candidate.ts';
 import { hmacSha256Verify } from './base.ts';
 import { strip } from './redact.ts';
+import { mintAppJwt } from './github.ts';
 
 // ── The locked artifact shape ────────────────────────────────────────────────────
 
@@ -228,6 +229,134 @@ export async function emitRepositoryDispatch(opts: EmitDispatchOpts): Promise<Em
     throw new Error(`repository_dispatch failed: status=${res.status}`);
   }
   return { ok: true, status: res.status };
+}
+
+// ── GitHub App dispatch-token minting (A3 Path 2) ──────────────────────────────────────
+//
+// The repository_dispatch Bearer can be EITHER a static GBRAIN_PROMOTE_GITHUB_TOKEN
+// (back-compat) OR a short-lived GitHub App INSTALLATION token minted on demand from the same
+// App the github_kb connector uses (GBRAIN_GITHUB_APP_ID + GBRAIN_GITHUB_APP_PRIVATE_KEY).
+// Reuses github.ts::mintAppJwt (pure RS256 crypto); the installation-id resolve + token
+// exchange use an injectable fetch so tests need no real network / key / installation. The
+// private key, the App JWT, and the minted token are NEVER logged.
+
+/** Env: the GitHub App credentials (shared with github_kb) + an optional installation-id override. */
+export const PROMOTION_APP_ID_ENV = 'GBRAIN_GITHUB_APP_ID';
+export const PROMOTION_APP_PRIVATE_KEY_ENV = 'GBRAIN_GITHUB_APP_PRIVATE_KEY';
+export const PROMOTION_INSTALLATION_ID_ENV = 'GBRAIN_PROMOTE_GITHUB_INSTALLATION_ID';
+
+/** Injectable fetch for App-auth HTTP (GET resolve; POST exchange carries a scoped JSON body). Tests pass a fake. */
+export type AppAuthFetch = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body?: string },
+) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+
+interface CachedInstallToken {
+  token: string;
+  expiresAtMs: number;
+}
+/** Installation tokens last ~1h; refresh this far before expiry. */
+const INSTALL_TOKEN_SKEW_MS = 60_000;
+/** Installation-token cache (module-level), keyed by repo — a hit skips the JWT mint + both HTTP calls. */
+const promotionInstallTokenCache = new Map<string, CachedInstallToken>();
+
+export interface DispatchTokenDeps {
+  /** Env reader (tests inject). Defaults to process.env. */
+  getEnv?: (key: string) => string | undefined;
+  /** Injected fetch for the App-auth HTTP. Defaults to global fetch. */
+  fetchImpl?: AppAuthFetch;
+  /** Clock (tests inject). Defaults to Date.now. */
+  now?: () => number;
+}
+
+const appAuthHeaders = (appJwt: string): Record<string, string> => ({
+  authorization: `Bearer ${appJwt}`,
+  accept: 'application/vnd.github+json',
+  'x-github-api-version': '2022-11-28',
+  'user-agent': 'gbrain-connector-promotion',
+});
+
+/**
+ * Resolve the App installation id for `repo`: an explicit env override if set, else
+ * `GET /repos/{repo}/installation` authenticated as the App (JWT). Throws loud on a non-2xx
+ * (e.g. the App is not installed on the repo) so a misconfig surfaces rather than minting
+ * against the wrong installation.
+ */
+async function resolveInstallationId(
+  repo: string,
+  appJwt: string,
+  doFetch: AppAuthFetch,
+  getEnv: (key: string) => string | undefined,
+): Promise<string> {
+  const override = getEnv(PROMOTION_INSTALLATION_ID_ENV);
+  if (override && override.trim()) return override.trim();
+  const res = await doFetch(`https://api.github.com/repos/${repo}/installation`, {
+    method: 'GET',
+    headers: appAuthHeaders(appJwt),
+  });
+  if (!res.ok) {
+    throw new Error(`resolve App installation for ${repo} failed: status=${res.status} (is the App installed with contents:write?)`);
+  }
+  const id = (JSON.parse(await res.text()) as { id?: number }).id;
+  if (id === undefined || id === null) throw new Error(`resolve App installation for ${repo}: response missing id`);
+  return String(id);
+}
+
+/**
+ * Mint (or reuse a cached) short-lived GitHub App INSTALLATION token authorizing
+ * repository_dispatch on `repo`. Reuses github.ts::mintAppJwt (9-min RS256 App JWT), resolves
+ * the installation id, then exchanges the JWT for a ~1h installation token (cached by
+ * installation id, refreshed before expiry). NEVER logs the key / JWT / token.
+ */
+export async function getPromotionDispatchToken(
+  repo: string = BRAIN_DISPATCH_REPO,
+  deps: DispatchTokenDeps = {},
+): Promise<string> {
+  const getEnv = deps.getEnv ?? ((key: string) => process.env[key]);
+  const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as AppAuthFetch);
+  const nowMs = deps.now ?? (() => Date.now());
+
+  // Cache check first (keyed by repo) — a hit skips the JWT mint + both App-auth HTTP calls.
+  const cached = promotionInstallTokenCache.get(repo);
+  if (cached && cached.expiresAtMs - nowMs() > INSTALL_TOKEN_SKEW_MS) return cached.token;
+
+  const privateKey = getEnv(PROMOTION_APP_PRIVATE_KEY_ENV);
+  const appId = getEnv(PROMOTION_APP_ID_ENV);
+  if (!privateKey) throw new Error(`${PROMOTION_APP_PRIVATE_KEY_ENV} is not set (GitHub App private key, PKCS#8 PEM)`);
+  if (!appId) throw new Error(`${PROMOTION_APP_ID_ENV} is not set (GitHub App id)`);
+
+  const appJwt = mintAppJwt(privateKey, appId);
+  const installationId = await resolveInstallationId(repo, appJwt, doFetch, getEnv);
+
+  // Scope the installation token to JUST the target repo + the minimum permission needed.
+  // repository_dispatch (POST /repos/{owner}/{repo}/dispatches) requires Contents: write per
+  // GitHub's fine-grained-PAT permission table — nothing narrower is accepted. Omitting
+  // `repositories`/`permissions` would mint a token carrying ALL of the installation's repos
+  // and permissions, far too broad for this single-purpose dispatch credential. The
+  // `repositories` field takes bare repo NAMES (not owner/name); slice handles a bare name too.
+  const repoName = repo.slice(repo.lastIndexOf('/') + 1);
+  const tokenRequestBody = JSON.stringify({
+    repositories: [repoName],
+    permissions: { contents: 'write' },
+  });
+  const res = await doFetch(
+    `https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
+    {
+      method: 'POST',
+      headers: { ...appAuthHeaders(appJwt), 'content-type': 'application/json' },
+      body: tokenRequestBody,
+    },
+  );
+  if (!res.ok) throw new Error(`App installation token exchange failed: status=${res.status}`);
+  const json = JSON.parse(await res.text()) as { token?: string; expires_at?: string };
+  if (!json.token) throw new Error('App installation token exchange: response missing token');
+  const parsedExpiry = json.expires_at ? Date.parse(json.expires_at) : NaN;
+  const minted: CachedInstallToken = {
+    token: json.token,
+    expiresAtMs: Number.isNaN(parsedExpiry) ? nowMs() + 50 * 60 * 1000 : parsedExpiry,
+  };
+  promotionInstallTokenCache.set(repo, minted);
+  return minted.token;
 }
 
 // ── Reflect dispatch state back onto the candidate row ────────────────────────────────
