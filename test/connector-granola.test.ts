@@ -94,7 +94,7 @@ interface StubNote {
   id: string;
   title?: string;
   owner?: { name?: string; email?: string };
-  summary?: string;
+  summary_markdown?: string;
   created_at?: string;
   // A transcript the stub returns to PROVE the connector ignores it. The connector must
   // never request it (no include param) and never surface it in a candidate.
@@ -147,7 +147,7 @@ describe('Granola normalize', () => {
             id: 'not_abc',
             title: 'Q3 roadmap sync',
             owner: { name: 'Jane Operator', email: 'jane@example.com' },
-            summary: 'Agreed to ship the connector pilot. Action: wire Granola ingestion.',
+            summary_markdown: 'Agreed to ship the connector pilot. Action: wire Granola ingestion.',
             created_at: '2026-06-18T10:00:00Z',
             transcript: [{ speaker: 'x', text: 'RAW TRANSCRIPT SHOULD NEVER APPEAR' }],
           },
@@ -174,7 +174,7 @@ describe('Granola normalize', () => {
     const { engine, inserts } = makeFakeEngine();
     // The runtime JSON is `as`-cast, not validated; a structured title must not crash normalize.
     const records = granolaConnector.normalize(
-      { notes: [{ id: 'n1', title: { text: 'x' }, summary: 's1' }, { id: 'n2', title: 'Real', summary: 's2' }] },
+      { notes: [{ id: 'n1', title: { text: 'x' }, summary_markdown: 's1' }, { id: 'n2', title: 'Real', summary_markdown: 's2' }] },
       source(),
     );
     const result = await landRecords(engine, 'src-granola', granolaConnector, records);
@@ -190,8 +190,8 @@ describe('Granola normalize', () => {
             id: 'n1',
             title: 'Real Title',
             owner: { email: 'a@b.com' },
-            url: 'https://granola/n1',
-            summary: 'sum',
+            web_url: 'https://granola/n1',
+            summary_markdown: 'sum',
             created_at: '2026-06-18T09:00:00Z',
             updated_at: '2026-06-18T10:00:00Z',
           },
@@ -215,7 +215,7 @@ describe('Granola redaction', () => {
   test('a secret-shaped string in the summary is masked by strip() in the landing path', async () => {
     const { engine, inserts } = makeFakeEngine();
     const records = granolaConnector.normalize(
-      { notes: [{ id: 'not_sec', title: 'Creds', summary: 'deploy key AKIAIOSFODNN7EXAMPLE noted' }] },
+      { notes: [{ id: 'not_sec', title: 'Creds', summary_markdown: 'deploy key AKIAIOSFODNN7EXAMPLE noted' }] },
       source(),
     );
     await landRecords(engine, 'src-granola', granolaConnector, records);
@@ -225,13 +225,14 @@ describe('Granola redaction', () => {
 });
 
 describe('Granola getNote — privacy', () => {
-  test('getNote NEVER requests include=transcript', async () => {
+  test('getNote reads summary_markdown, adds no transcript query param, and the always-returned transcript is never read', async () => {
     const { urls } = stubGranolaFetch({
       pages: [],
-      details: { not_x: { id: 'not_x', summary: 'ok', transcript: ['nope'] } },
+      // The real API returns `transcript` by default; the type omits it so it is never read.
+      details: { not_x: { id: 'not_x', summary_markdown: 'ok', transcript: ['nope'] } },
     });
     const detail = await getNote(API_KEY, 'not_x');
-    expect(detail?.summary).toBe('ok');
+    expect(detail?.summary_markdown).toBe('ok');
     expect(urls.length).toBe(1);
     expect(urls[0]).not.toContain('include');
     expect(urls[0]).not.toContain('transcript');
@@ -253,9 +254,9 @@ describe('Granola backfill', () => {
         { notes: [{ id: 'n3' }], hasMore: false },
       ],
       details: {
-        n1: { id: 'n1', title: 'One', summary: 's1', created_at: '2026-06-17T09:00:00Z' },
-        n2: { id: 'n2', title: 'Two', summary: 's2', created_at: '2026-06-18T09:00:00Z' },
-        n3: { id: 'n3', title: 'Three', summary: 's3', created_at: '2026-06-16T09:00:00Z' },
+        n1: { id: 'n1', title: 'One', summary_markdown: 's1', created_at: '2026-06-17T09:00:00Z' },
+        n2: { id: 'n2', title: 'Two', summary_markdown: 's2', created_at: '2026-06-18T09:00:00Z' },
+        n3: { id: 'n3', title: 'Three', summary_markdown: 's3', created_at: '2026-06-16T09:00:00Z' },
       },
     });
     const landed = await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
@@ -274,7 +275,7 @@ describe('Granola backfill', () => {
     // The API misbehaves: every list page returns hasMore:true with the SAME cursor.
     stubGranolaFetch({
       pages: [{ notes: [{ id: 'n1' }], hasMore: true, cursor: 'STUCK' }],
-      details: { n1: { id: 'n1', summary: 's1', created_at: '2026-06-18T09:00:00Z' } },
+      details: { n1: { id: 'n1', summary_markdown: 's1', created_at: '2026-06-18T09:00:00Z' } },
     });
     // Must return (not hang) — the repeated-cursor guard breaks the loop.
     const landed = await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
@@ -289,8 +290,8 @@ describe('Granola backfill', () => {
     stubGranolaFetch({
       pages: [{ notes: [{ id: 'n_a' }, { id: 'n_b' }], hasMore: false }],
       details: {
-        n_a: { id: 'n_a', summary: 'a', created_at: '2026-06-18T09:00:00-05:00' }, // 14:00Z
-        n_b: { id: 'n_b', summary: 'b', created_at: '2026-06-18T11:30:00+02:00' }, // 09:30Z
+        n_a: { id: 'n_a', summary_markdown: 'a', created_at: '2026-06-18T09:00:00-05:00' }, // 14:00Z
+        n_b: { id: 'n_b', summary_markdown: 'b', created_at: '2026-06-18T11:30:00+02:00' }, // 09:30Z
       },
     });
     await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
@@ -309,7 +310,7 @@ describe('Granola backfill', () => {
     const mk = () =>
       stubGranolaFetch({
         pages: [{ notes: [{ id: 'n1' }], hasMore: false }],
-        details: { n1: { id: 'n1', summary: 's1', created_at: '2026-06-18T09:00:00Z' } },
+        details: { n1: { id: 'n1', summary_markdown: 's1', created_at: '2026-06-18T09:00:00Z' } },
       });
     mk();
     await granolaConnector.backfill!(engine, cfg);
@@ -327,7 +328,7 @@ describe('Granola backfill', () => {
       const u = String(url);
       const d = u.match(/\/v1\/notes\/([^/?]+)/);
       if (d) {
-        return { ok: true, status: 200, json: async () => ({ id: decodeURIComponent(d[1]), summary: 's', created_at: '2026-06-18T09:00:00Z' }), text: async () => '' };
+        return { ok: true, status: 200, json: async () => ({ id: decodeURIComponent(d[1]), summary_markdown: 's', created_at: '2026-06-18T09:00:00Z' }), text: async () => '' };
       }
       listCalls += 1;
       return { ok: true, status: 200, json: async () => ({ notes: [{ id: `n${listCalls}` }], hasMore: true, cursor: `cur-${listCalls}` }), text: async () => '' };
@@ -341,7 +342,7 @@ describe('Granola backfill', () => {
     const { engine, watermarkWrites } = makeFakeEngine();
     stubGranolaFetch({
       pages: [{ notes: [{ id: 'old1' }], hasMore: false }],
-      details: { old1: { id: 'old1', summary: 's', created_at: '2026-06-01T00:00:00Z' } },
+      details: { old1: { id: 'old1', summary_markdown: 's', created_at: '2026-06-01T00:00:00Z' } },
     });
     const cfg = source({ connectors: { granola: { watermark: '2026-06-18T00:00:00.000Z', api_key: API_KEY } } });
     await granolaConnector.backfill!(engine, cfg);

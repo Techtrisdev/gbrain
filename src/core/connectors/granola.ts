@@ -63,18 +63,27 @@ export interface GranolaNotesListPage {
 }
 
 /**
- * A note's detail (Get Note WITHOUT include=transcript). We read summary + metadata ONLY.
- * `transcript` is intentionally absent from this type so it can never be referenced — the
- * privacy invariant is enforced at the type level, not just by omitting the query param.
+ * A note's detail (Get Note). We read the AI summary + metadata ONLY.
+ *
+ * PRIVACY: the live API returns a `transcript` field BY DEFAULT (it is NOT gated behind a
+ * query param — verified against the real API). This type intentionally OMITS `transcript`,
+ * so the connector can never reference it: the transcript arrives in the HTTP response, is
+ * never read, and is discarded with the response object — it reaches no candidate, log, or
+ * Brain page. The invariant rests on field selection (this type), not on a query param.
+ *
+ * The AI summary is `summary_markdown` (preferred) / `summary_text`; the note URL is
+ * `web_url`. (The docs' Quick Start showed a flat `summary`/`url`, but the real API uses
+ * these names — caught by reviewing the first real candidates.)
  */
 export interface GranolaNoteDetail {
   id?: string;
   title?: string;
   owner?: { name?: string; email?: string };
-  summary?: string;
+  summary_markdown?: string;
+  summary_text?: string;
   created_at?: string;
   updated_at?: string;
-  url?: string;
+  web_url?: string;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────────
@@ -142,7 +151,7 @@ function metadataForNote(note: GranolaNoteDetail): Record<string, unknown> {
   if (title) md.title = title.slice(0, MAX_TITLE_LEN);
   const ownerEmail = str(note.owner?.email);
   if (ownerEmail) md.author = ownerEmail;
-  const url = str(note.url);
+  const url = str(note.web_url);
   if (url) md.url = url;
   const createdAt = str(note.created_at);
   if (createdAt) md.created_at = createdAt;
@@ -156,7 +165,8 @@ function metadataForNote(note: GranolaNoteDetail): Record<string, unknown> {
  *  masks PII/secrets. */
 function summaryBlockForNote(note: GranolaNoteDetail): string {
   const headline = headlineForNote(note);
-  const aiSummary = str(note.summary);
+  // The AI summary is `summary_markdown` (preferred) / `summary_text` — NOT `summary`.
+  const aiSummary = str(note.summary_markdown) ?? str(note.summary_text);
   if (!aiSummary) return headline;
   const capped = aiSummary.slice(0, MAX_SUMMARY_LEN);
   return `${headline}\n\n${capped}`;
