@@ -19,6 +19,7 @@ import './linear.ts';
 import './slack.ts';
 import './calendar.ts';
 import './github.ts';
+import './granola.ts';
 
 // TECH-2109: register the connector→Brain promotion bridge so candidate approvals build +
 // sign + emit a repository_dispatch to techtris-brain. The hook is env-backed
