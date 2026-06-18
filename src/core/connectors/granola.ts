@@ -95,6 +95,11 @@ const MAX_SUMMARY_LEN = 8000;
 const DEFAULT_LOOKBACK_MS = 48 * 60 * 60 * 1000;
 /** Page size cap for List Notes (the API may cap lower). */
 const LIST_PAGE_SIZE = 100;
+/** Hard bound on pagination pages per backfill. An opaque cursor carries no monotonicity
+ *  guarantee (unlike Google's pageToken), so a buggy/cycling cursor must not wedge the
+ *  unattended poll job. At LIST_PAGE_SIZE=100 this is 100k notes — far beyond any real
+ *  Brain — so it only ever trips on a runaway cursor. */
+const MAX_BACKFILL_PAGES = 1000;
 
 // ── Helpers: defensive payload access ────────────────────────────────────────────
 
@@ -130,12 +135,19 @@ function headlineForNote(note: GranolaNoteDetail): string {
 function metadataForNote(note: GranolaNoteDetail): Record<string, unknown> {
   const md: Record<string, unknown> = {};
   if (note.id) md.doc_id = note.id;
-  if (note.title) md.title = note.title.slice(0, MAX_TITLE_LEN);
-  const ownerEmail = note.owner?.email;
+  // str() guard (NOT a bare truthiness check): the runtime JSON is `as`-cast, not validated,
+  // so a structured/non-string title would throw on .slice() and abort the whole page —
+  // mirror headlineForNote's str() handling.
+  const title = str(note.title);
+  if (title) md.title = title.slice(0, MAX_TITLE_LEN);
+  const ownerEmail = str(note.owner?.email);
   if (ownerEmail) md.author = ownerEmail;
-  if (note.url) md.url = note.url;
-  if (note.created_at) md.created_at = note.created_at;
-  if (note.updated_at) md.updated_at = note.updated_at;
+  const url = str(note.url);
+  if (url) md.url = url;
+  const createdAt = str(note.created_at);
+  if (createdAt) md.created_at = createdAt;
+  const updatedAt = str(note.updated_at);
+  if (updatedAt) md.updated_at = updatedAt;
   return md;
 }
 
@@ -230,9 +242,16 @@ export const granolaConnector: SaaSConnector = {
     }
 
     const createdAfter = readQueryWatermark(source);
+    // Track the watermark as a parsed INSTANT (ms), not a raw string: lexicographic compare
+    // diverges from real-instant ordering when created_at carries non-Z offsets, which would
+    // silently advance the watermark past unseen notes (permanent skip). Seed from the prior
+    // watermark so we never regress it; persist a normalized UTC ISO string.
+    const priorMs = Date.parse(readWatermark(source) ?? '');
+    let newestMs = Number.isNaN(priorMs) ? -Infinity : priorMs;
     let cursor: string | null = null;
     let landed = 0;
-    let newestCreatedAt: string | null = readWatermark(source);
+    const seenCursors = new Set<string>();
+    let pages = 0;
 
     do {
       const page = await listNotes(apiKey, { createdAfter, cursor });
@@ -245,19 +264,36 @@ export const granolaConnector: SaaSConnector = {
         // meeting-note volumes this connector sees; a huge initial backfill is slow but
         // correct. getNote NEVER requests the transcript.
         const detail = await getNote(apiKey, id);
-        if (detail) {
-          details.push(detail);
-          const created = str(detail.created_at) ?? str(item.created_at);
-          if (created && (!newestCreatedAt || created > newestCreatedAt)) newestCreatedAt = created;
-        }
+        if (!detail) continue;
+        details.push(detail);
+        const created = str(detail.created_at) ?? str(item.created_at);
+        const ms = created ? Date.parse(created) : NaN;
+        if (!Number.isNaN(ms) && ms > newestMs) newestMs = ms;
       }
       const records = this.normalize({ notes: details }, source);
       const result = await landRecords(engine, source.id, this, records);
       landed += result.written;
-      cursor = page.hasMore && page.cursor ? page.cursor : null;
+
+      // Pagination safety: bound total pages AND break on a repeated cursor. The notes on
+      // each page are already landed (idempotently), so breaking loses no work — it just
+      // stops a runaway cursor from looping forever and hammering the API.
+      pages += 1;
+      const next = page.hasMore && page.cursor ? page.cursor : null;
+      if (next && (seenCursors.has(next) || pages >= MAX_BACKFILL_PAGES)) {
+        console.warn(
+          `granola backfill: stopping pagination early (source=${source.id} pages=${pages} ` +
+            `repeatedCursor=${seenCursors.has(next)}) — possible API cursor loop`,
+        );
+        cursor = null;
+      } else {
+        if (next) seenCursors.add(next);
+        cursor = next;
+      }
     } while (cursor);
 
-    if (newestCreatedAt) await writeWatermark(engine, source, newestCreatedAt);
+    if (Number.isFinite(newestMs)) {
+      await writeWatermark(engine, source, new Date(newestMs).toISOString());
+    }
     return landed;
   },
 };

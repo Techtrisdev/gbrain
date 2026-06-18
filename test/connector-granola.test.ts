@@ -168,6 +168,18 @@ describe('Granola normalize', () => {
     expect(JSON.stringify(cand.allParams)).not.toContain('Jane Operator');
     expect(JSON.stringify(cand.allParams)).not.toContain('jane@example.com');
   });
+
+  test('a non-string title (structured/object) does not throw — the page survives', async () => {
+    const { engine, inserts } = makeFakeEngine();
+    // The runtime JSON is `as`-cast, not validated; a structured title must not crash normalize.
+    const records = granolaConnector.normalize(
+      { notes: [{ id: 'n1', title: { text: 'x' }, summary: 's1' }, { id: 'n2', title: 'Real', summary: 's2' }] },
+      source(),
+    );
+    const result = await landRecords(engine, 'src-granola', granolaConnector, records);
+    expect(result.written).toBe(2); // both land; the bad title is simply omitted from metadata
+    expect(inserts.length).toBe(2);
+  });
 });
 
 describe('Granola redaction', () => {
@@ -220,12 +232,41 @@ describe('Granola backfill', () => {
     const landed = await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
     expect(landed).toBe(3);
     expect(inserts.map((i) => i.source_record_id).sort()).toEqual(['n1', 'n2', 'n3']);
-    // watermark advanced to the NEWEST created_at across all pages
-    expect(watermarkWrites.at(-1)?.watermark).toBe('2026-06-18T09:00:00Z');
+    // watermark advanced to the NEWEST created_at across all pages (normalized to UTC)
+    expect(watermarkWrites.at(-1)?.watermark).toBe('2026-06-18T09:00:00.000Z');
     // second page used the cursor from the first
     expect(urls.some((u) => u.includes('cursor=CUR2'))).toBe(true);
     // no transcript ever requested
     expect(urls.every((u) => !u.includes('include'))).toBe(true);
+  });
+
+  test('terminates on a repeated/cyclic cursor instead of looping forever', async () => {
+    const { engine, inserts } = makeFakeEngine();
+    // The API misbehaves: every list page returns hasMore:true with the SAME cursor.
+    stubGranolaFetch({
+      pages: [{ notes: [{ id: 'n1' }], hasMore: true, cursor: 'STUCK' }],
+      details: { n1: { id: 'n1', summary: 's1', created_at: '2026-06-18T09:00:00Z' } },
+    });
+    // Must return (not hang) — the repeated-cursor guard breaks the loop.
+    const landed = await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
+    expect(landed).toBe(1); // landed once, deduped, then broke
+    expect(inserts.length).toBe(1);
+  });
+
+  test('watermark advances by real INSTANT (parsed), not lexicographic string, across offsets', async () => {
+    const { engine, watermarkWrites } = makeFakeEngine();
+    // n_a string-sorts LOWER but is the LATER instant (14:00Z); n_b string-sorts HIGHER but
+    // is EARLIER (09:30Z). A string compare would wrongly pick n_b; a parsed compare picks n_a.
+    stubGranolaFetch({
+      pages: [{ notes: [{ id: 'n_a' }, { id: 'n_b' }], hasMore: false }],
+      details: {
+        n_a: { id: 'n_a', summary: 'a', created_at: '2026-06-18T09:00:00-05:00' }, // 14:00Z
+        n_b: { id: 'n_b', summary: 'b', created_at: '2026-06-18T11:30:00+02:00' }, // 09:30Z
+      },
+    });
+    await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
+    // newest real instant is n_a's 14:00Z — persisted normalized to UTC
+    expect(watermarkWrites.at(-1)?.watermark).toBe('2026-06-18T14:00:00.000Z');
   });
 
   test('throws a clear error when no API key is configured', async () => {
