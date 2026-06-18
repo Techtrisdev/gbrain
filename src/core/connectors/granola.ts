@@ -98,8 +98,8 @@ const LIST_PAGE_SIZE = 100;
 /** Hard bound on pagination pages per backfill. An opaque cursor carries no monotonicity
  *  guarantee (unlike Google's pageToken), so a buggy/cycling cursor must not wedge the
  *  unattended poll job. At LIST_PAGE_SIZE=100 this is 100k notes — far beyond any real
- *  Brain — so it only ever trips on a runaway cursor. */
-const MAX_BACKFILL_PAGES = 1000;
+ *  Brain — so it only ever trips on a runaway cursor. Exported for the regression test. */
+export const MAX_BACKFILL_PAGES = 1000;
 
 // ── Helpers: defensive payload access ────────────────────────────────────────────
 

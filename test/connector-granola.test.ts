@@ -29,6 +29,7 @@ const {
   readApiKey,
   readWatermark,
   readQueryWatermark,
+  MAX_BACKFILL_PAGES,
 } = await import('../src/core/connectors/granola.ts');
 const { landRecords } = await import('../src/core/connectors/base.ts');
 
@@ -180,6 +181,34 @@ describe('Granola normalize', () => {
     expect(result.written).toBe(2); // both land; the bad title is simply omitted from metadata
     expect(inserts.length).toBe(2);
   });
+
+  test('str() guards keep every real-string field (the guards drop nothing legitimate)', () => {
+    const records = granolaConnector.normalize(
+      {
+        notes: [
+          {
+            id: 'n1',
+            title: 'Real Title',
+            owner: { email: 'a@b.com' },
+            url: 'https://granola/n1',
+            summary: 'sum',
+            created_at: '2026-06-18T09:00:00Z',
+            updated_at: '2026-06-18T10:00:00Z',
+          },
+        ],
+      },
+      source(),
+    );
+    const md = records[0].item.metadata!;
+    expect(md.doc_id).toBe('n1');
+    expect(md.title).toBe('Real Title');
+    expect(md.author).toBe('a@b.com'); // kept at normalize; strip() masks it at the toRow boundary
+    expect(md.url).toBe('https://granola/n1');
+    expect(md.created_at).toBe('2026-06-18T09:00:00Z');
+    expect(md.updated_at).toBe('2026-06-18T10:00:00Z');
+    // and the title rides into the persisted content via the summary headline
+    expect(records[0].item.summary).toContain('Real Title');
+  });
 });
 
 describe('Granola redaction', () => {
@@ -287,6 +316,37 @@ describe('Granola backfill', () => {
     mk();
     await granolaConnector.backfill!(engine, cfg);
     expect(inserts.length).toBe(1); // second run dedupes
+  });
+
+  test('bounds an EVER-ADVANCING cursor at MAX_BACKFILL_PAGES (the seen-Set cannot catch this)', async () => {
+    const { engine } = makeFakeEngine();
+    let listCalls = 0;
+    // A fresh cursor + fresh note id on EVERY list page, hasMore forever — the seenCursors
+    // Set never matches (each cursor is unique), so only the page-count backstop can stop it.
+    globalThis.fetch = (async (url: string | URL) => {
+      const u = String(url);
+      const d = u.match(/\/v1\/notes\/([^/?]+)/);
+      if (d) {
+        return { ok: true, status: 200, json: async () => ({ id: decodeURIComponent(d[1]), summary: 's', created_at: '2026-06-18T09:00:00Z' }), text: async () => '' };
+      }
+      listCalls += 1;
+      return { ok: true, status: 200, json: async () => ({ notes: [{ id: `n${listCalls}` }], hasMore: true, cursor: `cur-${listCalls}` }), text: async () => '' };
+    }) as unknown as typeof fetch;
+    const landed = await granolaConnector.backfill!(engine, source({ connectors: { granola: { api_key: API_KEY } } }));
+    expect(listCalls).toBe(MAX_BACKFILL_PAGES); // the hard page bound fired — did NOT loop forever
+    expect(landed).toBe(MAX_BACKFILL_PAGES);
+  });
+
+  test('watermark never regresses when only OLDER notes arrive', async () => {
+    const { engine, watermarkWrites } = makeFakeEngine();
+    stubGranolaFetch({
+      pages: [{ notes: [{ id: 'old1' }], hasMore: false }],
+      details: { old1: { id: 'old1', summary: 's', created_at: '2026-06-01T00:00:00Z' } },
+    });
+    const cfg = source({ connectors: { granola: { watermark: '2026-06-18T00:00:00.000Z', api_key: API_KEY } } });
+    await granolaConnector.backfill!(engine, cfg);
+    // prior watermark (2026-06-18) is newer than the only note (2026-06-01) → seeded-from-prior, not regressed
+    expect(watermarkWrites.at(-1)?.watermark).toBe('2026-06-18T00:00:00.000Z');
   });
 });
 
