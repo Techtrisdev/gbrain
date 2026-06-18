@@ -655,7 +655,7 @@ export async function handlePromotionCallback(args: {
     return {
       ok: true,
       status: 200,
-      candidateId: candidate.id,
+      candidateId: Number(candidate.id),
       mappedStatus: candidate.promotion_status as PromotionStatus,
     };
   }
@@ -681,7 +681,7 @@ export async function handlePromotionCallback(args: {
     console.log(
       `promotion callback: applied status=${body.status} source_record_id_hash=${body.source_record_id_hash} candidate_id=${candidate.id}`,
     );
-    return { ok: true, status: 200, candidateId: candidate.id, mappedStatus: patch.promotion_status as PromotionStatus };
+    return { ok: true, status: 200, candidateId: Number(candidate.id), mappedStatus: patch.promotion_status as PromotionStatus };
   } catch (err) {
     console.error('promotion callback: writeback failed:', err instanceof Error ? err.message : String(err));
     return { ok: false, status: 500, error: 'writeback_failed' };

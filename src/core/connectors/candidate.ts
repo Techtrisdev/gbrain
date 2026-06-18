@@ -317,6 +317,23 @@ export function needsRationale(
   return (row.confidence ?? 0) >= NEEDS_RATIONALE_CONFIDENCE && !row.rationale_ref;
 }
 
+/**
+ * Coerce the `bigint` id columns (`id`, `superseded_by`) that the Postgres driver returns as
+ * JS `BigInt` to `number`, so a row matches its declared `id: number` / `superseded_by:
+ * number | null` types AND is JSON-serializable. `res.json` / `JSON.stringify` throw on a
+ * `BigInt` ("cannot serialize BigInt"), which surfaced as an HTTP 500 on EVERY admin
+ * approve/reject/list even though the server-side work succeeded (TECH-2120). `Number()`
+ * is lossless here — candidate ids fit comfortably within 2^53. Apply at every read site
+ * that returns a candidate row to a caller. Pure.
+ */
+export function coerceCandidateRow<T extends ConnectorCandidateRow>(row: T): T {
+  return {
+    ...row,
+    id: Number(row.id),
+    superseded_by: row.superseded_by == null ? row.superseded_by : Number(row.superseded_by),
+  } as T;
+}
+
 /** A candidate row enriched for the review queue: the source's human name + the flag. */
 export interface ReviewCandidate extends ConnectorCandidateRow {
   source_name: string | null;
@@ -379,7 +396,7 @@ export async function listCandidates(
   );
   const total = countRow?.total ?? 0;
   return {
-    rows: rows.map((r) => ({ ...r, needs_rationale: needsRationale(r) })),
+    rows: rows.map((r) => ({ ...coerceCandidateRow(r), needs_rationale: needsRationale(r) })),
     total,
     page,
     pages: Math.max(1, Math.ceil(total / pageSize)),
@@ -405,7 +422,7 @@ export async function rejectCandidate(
       RETURNING ${CANDIDATE_COLUMNS}`,
     [id, reason != null ? strip(reason) : null, strip(actor)],
   );
-  return rows[0] ?? null;
+  return rows[0] ? coerceCandidateRow(rows[0]) : null;
 }
 
 /**
@@ -551,7 +568,7 @@ export async function approveCandidate(
       RETURNING ${CANDIDATE_COLUMNS}`,
     [id, strip(actor), target.kind, target.path || null, hash],
   );
-  const row = rows[0] ?? null;
+  const row = rows[0] ? coerceCandidateRow(rows[0]) : null;
   if (!row) return { row: null, promotion: { invoked: false } };
 
   // 4. Hand to the promotion hook (build → sign → emit → reflect). Failure stays retriable.

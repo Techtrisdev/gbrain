@@ -21,8 +21,10 @@ import {
   approveCandidate,
   rejectCandidate,
   needsRationale,
+  coerceCandidateRow,
   registerPromotionHook,
   NEEDS_RATIONALE_CONFIDENCE,
+  type ConnectorCandidateRow,
   type PromotionHook,
 } from '../src/core/connectors/candidate.ts';
 import { readFileSync } from 'fs';
@@ -467,5 +469,37 @@ describe('connector config jsonb_set (route SQL primitive)', () => {
     const cfg = (typeof row.config === 'string' ? JSON.parse(row.config) : row.config) as any;
     expect(cfg.connectors.slack.enabled).toBe(true); // the leaf actually persisted
     expect(cfg.webhook_secret).toBe('TOPSECRET'); // pre-existing sibling preserved
+  });
+});
+
+describe('coerceCandidateRow — BigInt id serialization (TECH-2120)', () => {
+  test('coerces a BigInt id + superseded_by to number, leaving the row JSON-serializable', () => {
+    // The Postgres driver returns bigint columns as JS BigInt; res.json / JSON.stringify throw
+    // on a BigInt (the TECH-2120 500 on every admin approve/reject/list). The coercion must
+    // produce a row that serializes cleanly.
+    const raw = {
+      id: BigInt(7), superseded_by: BigInt(3),
+      source_id: 'default', source_record_id: 'r', version: '1', source_record_ids: [],
+      provider: 'x', proposed_slug: null, proposed_markdown: null, confidence: null,
+      redactions: [], expires_at: null, as_of: null, rationale_ref: null,
+      status: 'pending', status_reason: null, acted_by: null, acted_at: null,
+      target_kind: null, target_path: null, promotion_status: null, promotion_pr_url: null,
+      promotion_branch: null, promoted_at: null, artifact_hash: null,
+    } as unknown as ConnectorCandidateRow;
+    const coerced = coerceCandidateRow(raw);
+    expect(typeof coerced.id).toBe('number');
+    expect(coerced.id).toBe(7);
+    expect(typeof coerced.superseded_by).toBe('number');
+    expect(coerced.superseded_by).toBe(3);
+    // The load-bearing assertion: a BigInt id would make this throw.
+    expect(() => JSON.stringify(coerced)).not.toThrow();
+    expect(JSON.parse(JSON.stringify(coerced)).id).toBe(7);
+  });
+
+  test('null superseded_by stays null; a plain-number id is unchanged', () => {
+    const raw = { id: 4, superseded_by: null } as unknown as ConnectorCandidateRow;
+    const coerced = coerceCandidateRow(raw);
+    expect(coerced.id).toBe(4);
+    expect(coerced.superseded_by).toBeNull();
   });
 });
