@@ -9,19 +9,22 @@
  * fails closed and accountFromPayload returns null (the generic /webhooks/:provider
  * receiver must never drive this connector).
  *
- * ── PRIVACY (load-bearing): SUMMARY-ONLY, TRANSCRIPT NEVER INGESTED ──────────────────
+ * ── PRIVACY (load-bearing): SUMMARY-ONLY, TRANSCRIPT NEVER READ ──────────────────────
  *
- * The operator constraint is explicit: do NOT dump raw transcripts into Brain. The
- * Granola API gates the transcript behind an opt-in `include=transcript` query param; the
- * AI `summary` is returned without it. This connector:
- *   - requests note detail WITHOUT `include=transcript` (getNote never sets it), and
- *   - reads ONLY `summary` + structural metadata from the response — it never touches a
- *     `transcript` field even if the API were to return one.
+ * The operator constraint is explicit: do NOT dump raw transcripts into Brain. IMPORTANT
+ * (verified against the real API): the Get Note response returns the `transcript` field
+ * BY DEFAULT — it is NOT gated behind a query param. The invariant is therefore enforced
+ * by FIELD SELECTION, not by withholding a param. This connector:
+ *   - sets NO `include` query param (getNote requests the plain note detail), and
+ *   - reads ONLY the AI summary (`summary_markdown`/`summary_text`) + structural metadata
+ *     from the response. The `transcript` field is absent from the GranolaNoteDetail type,
+ *     so it can never be referenced: it arrives in the HTTP response and is discarded
+ *     unread with the response object.
  * The summary rides as `item.summary` (kept + masked by the `docs` profile + strip());
- * there is NO `item.body`, so the transcript can never enter a NormalizedRecord and thus
- * never reaches a candidate column. The candidate is still human-reviewed before any
- * promotion. So the worst case is a redacted AI summary in a pending candidate — never a
- * raw transcript, in logs, a candidate, or a Brain page.
+ * there is NO `item.body`, so neither the transcript nor any raw body can enter a
+ * NormalizedRecord and thus never reaches a candidate column. The candidate is still
+ * human-reviewed before any promotion. So the worst case is a redacted AI summary in a
+ * pending candidate — never a raw transcript, in logs, a candidate, or a Brain page.
  *
  * ── Incremental cursor ───────────────────────────────────────────────────────────────
  *
@@ -63,18 +66,27 @@ export interface GranolaNotesListPage {
 }
 
 /**
- * A note's detail (Get Note WITHOUT include=transcript). We read summary + metadata ONLY.
- * `transcript` is intentionally absent from this type so it can never be referenced — the
- * privacy invariant is enforced at the type level, not just by omitting the query param.
+ * A note's detail (Get Note). We read the AI summary + metadata ONLY.
+ *
+ * PRIVACY: the live API returns a `transcript` field BY DEFAULT (it is NOT gated behind a
+ * query param — verified against the real API). This type intentionally OMITS `transcript`,
+ * so the connector can never reference it: the transcript arrives in the HTTP response, is
+ * never read, and is discarded with the response object — it reaches no candidate, log, or
+ * Brain page. The invariant rests on field selection (this type), not on a query param.
+ *
+ * The AI summary is `summary_markdown` (preferred) / `summary_text`; the note URL is
+ * `web_url`. (The docs' Quick Start showed a flat `summary`/`url`, but the real API uses
+ * these names — caught by reviewing the first real candidates.)
  */
 export interface GranolaNoteDetail {
   id?: string;
   title?: string;
   owner?: { name?: string; email?: string };
-  summary?: string;
+  summary_markdown?: string;
+  summary_text?: string;
   created_at?: string;
   updated_at?: string;
-  url?: string;
+  web_url?: string;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────────
@@ -142,7 +154,7 @@ function metadataForNote(note: GranolaNoteDetail): Record<string, unknown> {
   if (title) md.title = title.slice(0, MAX_TITLE_LEN);
   const ownerEmail = str(note.owner?.email);
   if (ownerEmail) md.author = ownerEmail;
-  const url = str(note.url);
+  const url = str(note.web_url);
   if (url) md.url = url;
   const createdAt = str(note.created_at);
   if (createdAt) md.created_at = createdAt;
@@ -156,7 +168,8 @@ function metadataForNote(note: GranolaNoteDetail): Record<string, unknown> {
  *  masks PII/secrets. */
 function summaryBlockForNote(note: GranolaNoteDetail): string {
   const headline = headlineForNote(note);
-  const aiSummary = str(note.summary);
+  // The AI summary is `summary_markdown` (preferred) / `summary_text` — NOT `summary`.
+  const aiSummary = str(note.summary_markdown) ?? str(note.summary_text);
   if (!aiSummary) return headline;
   const capped = aiSummary.slice(0, MAX_SUMMARY_LEN);
   return `${headline}\n\n${capped}`;
@@ -184,8 +197,8 @@ export const granolaConnector: SaaSConnector = {
   /**
    * Map note DETAILS into candidates. Accepts a single note detail or `{ notes: [...] }`.
    * The summary rides as item.summary (kept by the `docs` profile + masked by strip()).
-   * There is NO item.body — the transcript is never fetched or referenced, so it can never
-   * reach a candidate column.
+   * There is NO item.body — the transcript (returned by default) is never READ or
+   * referenced (the type omits it), so it can never reach a candidate column.
    */
   normalize(payload): NormalizedRecord[] {
     const p = asRecord(payload);
@@ -228,9 +241,9 @@ export const granolaConnector: SaaSConnector = {
 
   /**
    * Poll backfill: list notes created since (watermark - lookback), fetch each note's
-   * detail WITHOUT the transcript, land it as a summary candidate, then advance the
-   * watermark to the newest created_at seen. Idempotency makes the trailing-window re-scan
-   * a no-op for already-landed notes.
+   * detail (the transcript is in that response but never read — summary-only), land it as
+   * a summary candidate, then advance the watermark to the newest created_at seen.
+   * Idempotency makes the trailing-window re-scan a no-op for already-landed notes.
    */
   async backfill(engine: BrainEngine, source: ConnectorSource): Promise<number> {
     const { landRecords } = await import('./base.ts');
@@ -262,7 +275,7 @@ export const granolaConnector: SaaSConnector = {
         if (!id) continue;
         // Sequential fetch keeps us well under the 5 req/s sustained rate limit at the low
         // meeting-note volumes this connector sees; a huge initial backfill is slow but
-        // correct. getNote NEVER requests the transcript.
+        // correct. getNote reads summary-only; the default-returned transcript is never read.
         const detail = await getNote(apiKey, id);
         if (!detail) continue;
         details.push(detail);
@@ -320,10 +333,11 @@ export async function listNotes(
 }
 
 /**
- * Fetch a single note's detail — SUMMARY + metadata only. NEVER sets include=transcript,
- * and the GranolaNoteDetail type has no transcript field, so a transcript can never be
- * referenced. Returns null on a 404 (note no longer summarized/accessible) so the backfill
- * skips it rather than aborting the whole page.
+ * Fetch a single note's detail — read as SUMMARY + metadata only. Sets NO `include` query
+ * param. The API returns a `transcript` field by default, but the GranolaNoteDetail type
+ * omits it, so it is never referenced (field-selection invariant, not param-gating).
+ * Returns null on a 404 (note no longer summarized/accessible) so the backfill skips it
+ * rather than aborting the whole page.
  */
 export async function getNote(apiKey: string, id: string): Promise<GranolaNoteDetail | null> {
   const url = `${GRANOLA_API_BASE}/notes/${encodeURIComponent(id)}`;
