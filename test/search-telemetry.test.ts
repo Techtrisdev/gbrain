@@ -108,6 +108,37 @@ describe('recordSearchTelemetry — in-memory bucket', () => {
   });
 });
 
+describe('caller attribution (v0.40.x)', () => {
+  test('caller threads client + source_id into distinct buckets; no caller → unknown', () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 3 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 4 }, { client: 'simon-hermes', sourceId: 'simon-hermes' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5 }); // no caller → unknown/unknown
+    expect(w.bucketCountForTest()).toBe(3);
+    const today = new Date().toISOString().slice(0, 10);
+    expect(w.bucketForTest(today, 'balanced', 'general', 'jarvis-openclaw', 'jarvis-openclaw')?.count).toBe(1);
+    expect(w.bucketForTest(today, 'balanced', 'general', 'simon-hermes', 'simon-hermes')?.count).toBe(1);
+    expect(w.bucketForTest(today, 'balanced', 'general')?.sum_results).toBe(5); // unknown default bucket
+  });
+
+  test('flush writes client + source_id; distinct callers → distinct rows (the acceptance proof)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 8 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 2 }, { client: 'support-agent-demo', sourceId: 'support-demo' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 1 }); // unknown
+    await w.flush();
+    const rows = await engine.executeRaw<{ client: string; source_id: string; sum_results: number }>(
+      'SELECT client, source_id, sum_results FROM search_telemetry ORDER BY client',
+    );
+    expect(rows.length).toBe(3);
+    expect(rows.map(r => r.client)).toEqual(['jarvis-openclaw', 'support-agent-demo', 'unknown']);
+    expect(rows.find(r => r.client === 'support-agent-demo')?.source_id).toBe('support-demo');
+    expect(rows.find(r => r.client === 'unknown')?.source_id).toBe('unknown');
+  });
+});
+
 describe('flush() writes to search_telemetry', () => {
   test('flush drains the bucket map atomically', async () => {
     const w = getTelemetryWriter();

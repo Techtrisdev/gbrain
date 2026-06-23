@@ -34,6 +34,9 @@ export interface ThinkGatherOpts {
   questionEmbedding?: Float32Array;
   /** When set, MCP-bound calls forward this allow-list to takes_search. Local CLI leaves unset. */
   takesHoldersAllowList?: string[];
+  /** v0.40.x — caller attribution for search_telemetry, threaded to the page-search
+   * stream so `think` traffic is attributed like `query` (not bucketed as unknown). */
+  caller?: { client?: string; sourceId?: string };
 }
 
 export interface ThinkGatherResult {
@@ -110,6 +113,7 @@ export async function runGather(
   const pagesPromise = hybridSearch(engine, opts.question, {
     limit: gatherLimit,
     expansion: false,  // think provides its own anchor + graph context; no need for re-expansion
+    caller: opts.caller,  // v0.40.x — attribute `think` page-search telemetry like `query`
   }).catch((e) => {
     process.stderr.write(`[think.gather] hybrid stream failed: ${(e as Error).message}\n`);
     return [] as SearchResult[];

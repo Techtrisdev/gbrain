@@ -30,6 +30,8 @@ interface Bucket {
   date: string;
   mode: string;
   intent: string;
+  client: string;
+  source_id: string;
   count: number;
   sum_results: number;
   sum_tokens: number;
@@ -69,11 +71,21 @@ class TelemetryWriter {
    * immediately after bumping the in-memory bucket. Flush is async +
    * fire-and-forget.
    */
-  record(meta: HybridSearchMeta, opts: { results_count: number; tokens_estimate?: number } = { results_count: 0 }): void {
+  record(
+    meta: HybridSearchMeta,
+    opts: { results_count: number; tokens_estimate?: number } = { results_count: 0 },
+    caller?: { client?: string; sourceId?: string },
+  ): void {
     const date = nowDate();
     const mode = meta.mode ?? 'unset';
     const intent = meta.intent ?? 'unset';
-    const key = `${date}::${mode}::${intent}`;
+    // v0.40.x caller attribution. `client` = oauth_clients.client_name (e.g.
+    // 'jarvis-openclaw'); `source_id` = the caller's bound source. Both default
+    // to 'unknown' for unauthenticated/legacy callers. NEVER the query text —
+    // the rollup stays aggregate + non-sensitive (agent identity, not user PII).
+    const client = caller?.client ?? 'unknown';
+    const source_id = caller?.sourceId ?? 'unknown';
+    const key = `${date}::${mode}::${intent}::${client}::${source_id}`;
 
     let b = this.buckets.get(key);
     if (!b) {
@@ -81,6 +93,8 @@ class TelemetryWriter {
         date,
         mode,
         intent,
+        client,
+        source_id,
         count: 0,
         sum_results: 0,
         sum_tokens: 0,
@@ -129,9 +143,9 @@ class TelemetryWriter {
           try {
             await engine.executeRaw(
               `INSERT INTO search_telemetry
-                 (date, mode, intent, count, sum_results, sum_tokens, sum_budget_dropped, cache_hit, cache_miss, first_seen, last_seen)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now())
-               ON CONFLICT (date, mode, intent) DO UPDATE SET
+                 (date, mode, intent, client, source_id, count, sum_results, sum_tokens, sum_budget_dropped, cache_hit, cache_miss, first_seen, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+               ON CONFLICT (date, mode, intent, client, source_id) DO UPDATE SET
                  count = search_telemetry.count + EXCLUDED.count,
                  sum_results = search_telemetry.sum_results + EXCLUDED.sum_results,
                  sum_tokens = search_telemetry.sum_tokens + EXCLUDED.sum_tokens,
@@ -139,7 +153,7 @@ class TelemetryWriter {
                  cache_hit = search_telemetry.cache_hit + EXCLUDED.cache_hit,
                  cache_miss = search_telemetry.cache_miss + EXCLUDED.cache_miss,
                  last_seen = now()`,
-              [b.date, b.mode, b.intent, b.count, b.sum_results, b.sum_tokens, b.sum_budget_dropped, b.cache_hit, b.cache_miss],
+              [b.date, b.mode, b.intent, b.client, b.source_id, b.count, b.sum_results, b.sum_tokens, b.sum_budget_dropped, b.cache_hit, b.cache_miss],
             );
           } catch {
             // swallow — telemetry write must never break the hot path.
@@ -168,9 +182,11 @@ class TelemetryWriter {
     return this.buckets.size;
   }
 
-  /** Test-only — read a specific bucket (returns null if absent). */
-  bucketForTest(date: string, mode: string, intent: string): Readonly<Bucket> | null {
-    return this.buckets.get(`${date}::${mode}::${intent}`) ?? null;
+  /** Test-only — read a specific bucket (returns null if absent). Caller
+   * attribution defaults to the unauthenticated 'unknown'/'unknown' bucket so
+   * existing (date,mode,intent) callers resolve unchanged. */
+  bucketForTest(date: string, mode: string, intent: string, client = 'unknown', source_id = 'unknown'): Readonly<Bucket> | null {
+    return this.buckets.get(`${date}::${mode}::${intent}::${client}::${source_id}`) ?? null;
   }
 
   private ensureTimer(): void {
@@ -231,11 +247,12 @@ export function recordSearchTelemetry(
   engine: BrainEngine,
   meta: HybridSearchMeta,
   opts: { results_count: number; tokens_estimate?: number } = { results_count: 0 },
+  caller?: { client?: string; sourceId?: string },
 ): void {
   try {
     const w = getTelemetryWriter();
     w.setEngine(engine);
-    w.record(meta, opts);
+    w.record(meta, opts, caller);
   } catch {
     // swallow — telemetry is best-effort.
   }

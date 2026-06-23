@@ -1549,6 +1549,9 @@ const query: Operation = {
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
       detail,
+      // v0.40.x — caller attribution for search_telemetry (client name + bound
+      // source only; never query text). Undefined fields → 'unknown'.
+      caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
       language: (p.lang as string) || undefined,
       symbolKind: (p.symbol_kind as string) || undefined,
       nearSymbol: (p.near_symbol as string) || undefined,
@@ -1755,6 +1758,9 @@ const think: Operation = {
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
       takesHoldersAllowList: ctx.takesHoldersAllowList,
+      // v0.40.x — caller attribution for the think page-search telemetry, same
+      // ctx.auth pattern as the query op (closes the unknown/unknown gap).
+      caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
       ...(scope.sourceId !== undefined ? { sourceId: scope.sourceId } : {}),
       ...(scope.sourceIds !== undefined ? { allowedSources: scope.sourceIds } : {}),
       remote: ctx.remote === true,

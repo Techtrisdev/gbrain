@@ -390,6 +390,13 @@ export interface HybridSearchOpts extends SearchOpts {
    * row; everyone else leaves it undefined and pays no cost.
    */
   onMeta?: (meta: HybridSearchMeta) => void;
+  /**
+   * v0.40.x — caller attribution for search_telemetry. The op layer threads the
+   * authenticated client name (`oauth_clients.client_name`) + bound source so
+   * telemetry rollups can be sliced by consumer. Aggregate identity only — no
+   * query text or user content is recorded. Undefined → 'unknown' attribution.
+   */
+  caller?: { client?: string; sourceId?: string };
 }
 
 export async function hybridSearch(
@@ -511,7 +518,7 @@ export async function hybridSearch(
       // swallow — capture telemetry is best-effort
     }
     try {
-      recordSearchTelemetry(engine, meta, { results_count: lastResultsCount });
+      recordSearchTelemetry(engine, meta, { results_count: lastResultsCount }, opts?.caller);
     } catch {
       // swallow — telemetry must never break the search hot path.
     }

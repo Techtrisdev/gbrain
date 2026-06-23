@@ -4380,6 +4380,33 @@ export const MIGRATIONS: Migration[] = [
         ADD COLUMN IF NOT EXISTS artifact_hash TEXT;
     `,
   },
+  {
+    version: 96,
+    name: 'search_telemetry_caller_attribution',
+    // v0.40.x — adoption attribution. Adds `client` (= oauth_clients.client_name,
+    // e.g. 'jarvis-openclaw') + `source_id` (the caller's bound source) to the
+    // search_telemetry rollup and repoints the PK so each (date,mode,intent) can
+    // hold one row per caller. Additive + backfill-safe: existing rows take the
+    // 'unknown'/'unknown' defaults (historical traffic is genuinely
+    // un-attributable), so the new 5-col PK has no duplicate-key risk (the old PK
+    // was already unique on date,mode,intent). search_telemetry is
+    // migration-created (v57) — not in the base schema — so this one migration
+    // covers fresh + existing installs. NEVER stores query text: agent identity
+    // (client name + source) only, not user PII.
+    //
+    // Idempotent: ADD COLUMN IF NOT EXISTS is a no-op on re-run; DROP CONSTRAINT
+    // IF EXISTS + ADD CONSTRAINT re-establishes the same PK on re-run.
+    idempotent: true,
+    sql: `
+      ALTER TABLE search_telemetry
+        ADD COLUMN IF NOT EXISTS client    TEXT NOT NULL DEFAULT 'unknown',
+        ADD COLUMN IF NOT EXISTS source_id TEXT NOT NULL DEFAULT 'unknown';
+
+      ALTER TABLE search_telemetry DROP CONSTRAINT IF EXISTS search_telemetry_pkey;
+      ALTER TABLE search_telemetry ADD CONSTRAINT search_telemetry_pkey
+        PRIMARY KEY (date, mode, intent, client, source_id);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
