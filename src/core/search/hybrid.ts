@@ -397,6 +397,14 @@ export interface HybridSearchOpts extends SearchOpts {
    * query text or user content is recorded. Undefined → 'unknown' attribution.
    */
   caller?: { client?: string; sourceId?: string };
+  /**
+   * v0.40.x INTERNAL — set by hybridSearchCached so the inner (bare) search does
+   * NOT record telemetry; the wrapper records a single row with the correct
+   * cache.status (hit/miss/disabled) instead. Without this, the inner record
+   * carried no cache field and cache_miss stayed permanently 0 (cache_hit_rate
+   * read a false ~100%).
+   */
+  _suppressTelemetry?: boolean;
 }
 
 export async function hybridSearch(
@@ -518,7 +526,11 @@ export async function hybridSearch(
       // swallow — capture telemetry is best-effort
     }
     try {
-      recordSearchTelemetry(engine, meta, { results_count: lastResultsCount }, opts?.caller);
+      // v0.40.x — hybridSearchCached suppresses this so it can record ONE row
+      // per request with the correct cache.status (hit/miss/disabled).
+      if (!opts?._suppressTelemetry) {
+        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount }, opts?.caller);
+      }
     } catch {
       // swallow — telemetry must never break the search hot path.
     }
@@ -1134,6 +1146,10 @@ export async function hybridSearchCached(
         detail_resolved: hit.meta?.detail_resolved ?? null,
         expansion_applied: hit.meta?.expansion_applied ?? false,
         intent: hit.meta?.intent,
+        // v0.40.x — mode resolved for THIS request (folded into knobsHash, so a
+        // cache hit implies same-mode). Needed so cache-hit telemetry buckets by
+        // mode instead of falling back to 'unset'.
+        mode: resolvedForCache.resolved_mode,
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
@@ -1148,6 +1164,12 @@ export async function hybridSearchCached(
       } catch {
         // swallow — telemetry is best-effort
       }
+      // v0.40.x — record cache-HIT telemetry (closes the cache-miss-only gap:
+      // hits previously wrote NO row, so high-cache-hit-rate clients under-counted).
+      // Mutually exclusive with the bare-hybridSearch record on the miss path, so
+      // no double-count; recordSearchTelemetry is non-blocking (in-memory bucket),
+      // so no hot-path latency. Caller threaded for attribution parity with query/think.
+      recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length }, opts?.caller);
       return budgeted;
     }
   }
@@ -1160,6 +1182,9 @@ export async function hybridSearchCached(
   const userOnMeta = opts?.onMeta;
   const results = await hybridSearch(engine, query, {
     ...opts,
+    // v0.40.x — the wrapper records the single telemetry row (with cache.status)
+    // below; suppress the inner record so cache_miss/disabled aren't lost.
+    _suppressTelemetry: true,
     onMeta: (m) => {
       innerMetaBox.current = m;
       // Do NOT call userOnMeta here — we'll emit a merged meta below
@@ -1177,6 +1202,9 @@ export async function hybridSearchCached(
     detail_resolved: innerMeta?.detail_resolved ?? null,
     expansion_applied: innerMeta?.expansion_applied ?? false,
     intent: innerMeta?.intent,
+    // v0.40.x — mode for THIS request (already resolved for the knobsHash), so
+    // the miss/disabled telemetry row buckets by mode instead of 'unset'.
+    mode: resolvedForCache.resolved_mode,
     cache: { status: cacheStatus },
     ...(opts?.tokenBudget && opts.tokenBudget > 0
       ? { token_budget: budgetMeta }
@@ -1187,6 +1215,11 @@ export async function hybridSearchCached(
   } catch {
     // swallow
   }
+  // v0.40.x — record the SINGLE telemetry row for the cached path's miss/disabled
+  // legs, carrying cache.status (the inner record was suppressed). Closes the
+  // cache_miss-always-0 gap that pinned cache_hit_rate at a false ~100%. The hit
+  // leg is recorded separately above (cachedMeta, cache.status='hit').
+  recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length }, opts?.caller);
 
   // Best-effort writeback (skip when search returned empty so we don't
   // cache zero-result queries forever — they often indicate a typo).
