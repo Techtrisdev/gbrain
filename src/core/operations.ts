@@ -1549,6 +1549,9 @@ const query: Operation = {
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
       detail,
+      // v0.40.x — caller attribution for search_telemetry (client name + bound
+      // source only; never query text). Undefined fields → 'unknown'.
+      caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
       language: (p.lang as string) || undefined,
       symbolKind: (p.symbol_kind as string) || undefined,
       nearSymbol: (p.near_symbol as string) || undefined,
