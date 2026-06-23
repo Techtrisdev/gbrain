@@ -51,6 +51,9 @@ export interface RunThinkOpts {
   until?: string;
   /** When set, MCP-bound calls forward this to the gather phase (server-side filter). */
   takesHoldersAllowList?: string[];
+  /** v0.40.x — caller attribution, forwarded to the gather phase so `think`
+   * page-search telemetry is attributed like `query` instead of 'unknown'. */
+  caller?: { client?: string; sourceId?: string };
   /** Inject an LLM client (for tests). Defaults to a fresh Anthropic SDK client. */
   client?: ThinkLLMClient;
   /** Inject a question-embedding function. When omitted, vector takes search is skipped. */
@@ -239,6 +242,7 @@ export async function runThink(
     anchor: opts.anchor,
     questionEmbedding,
     takesHoldersAllowList: opts.takesHoldersAllowList,
+    caller: opts.caller,  // v0.40.x — attribute think page-search telemetry
   });
 
   // Render evidence blocks for the prompt

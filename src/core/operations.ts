@@ -1758,6 +1758,9 @@ const think: Operation = {
       since: p.since ? String(p.since) : undefined,
       until: p.until ? String(p.until) : undefined,
       takesHoldersAllowList: ctx.takesHoldersAllowList,
+      // v0.40.x — caller attribution for the think page-search telemetry, same
+      // ctx.auth pattern as the query op (closes the unknown/unknown gap).
+      caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
       ...(scope.sourceId !== undefined ? { sourceId: scope.sourceId } : {}),
       ...(scope.sourceIds !== undefined ? { allowedSources: scope.sourceIds } : {}),
       remote: ctx.remote === true,
