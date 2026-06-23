@@ -1134,6 +1134,10 @@ export async function hybridSearchCached(
         detail_resolved: hit.meta?.detail_resolved ?? null,
         expansion_applied: hit.meta?.expansion_applied ?? false,
         intent: hit.meta?.intent,
+        // v0.40.x — mode resolved for THIS request (folded into knobsHash, so a
+        // cache hit implies same-mode). Needed so cache-hit telemetry buckets by
+        // mode instead of falling back to 'unset'.
+        mode: resolvedForCache.resolved_mode,
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
@@ -1148,6 +1152,12 @@ export async function hybridSearchCached(
       } catch {
         // swallow — telemetry is best-effort
       }
+      // v0.40.x — record cache-HIT telemetry (closes the cache-miss-only gap:
+      // hits previously wrote NO row, so high-cache-hit-rate clients under-counted).
+      // Mutually exclusive with the bare-hybridSearch record on the miss path, so
+      // no double-count; recordSearchTelemetry is non-blocking (in-memory bucket),
+      // so no hot-path latency. Caller threaded for attribution parity with query/think.
+      recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length }, opts?.caller);
       return budgeted;
     }
   }
