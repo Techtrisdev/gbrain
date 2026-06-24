@@ -326,6 +326,25 @@ export function classifyQueryIntent(query: string): QueryIntent {
   return 'general';
 }
 
+// v0.40.x — process / how-to query patterns (orthogonal to QueryIntent). Gate the
+// intent-conditional post-rerank process reorder (Option A). Deliberately narrow.
+const PROCESS_PATTERNS: RegExp[] = [
+  /\bhow\s+(do|does|did|can|could|should|would|to)\b/i,        // "how does/do/to promote ..."
+  /\b(what'?s?|what\s+is|what\s+are)\s+the\s+(process|procedure|steps?|workflow|flow|approach|policy|rule)\b/i,
+  /\b(steps?|process|procedure|workflow)\s+(to|for|of)\b/i,
+  /\bhow\s+\w+(\s+\w+)?\s+(works?|happens?|is\s+done|is\s+handled|gets?\s+\w+ed)\b/i, // "how promotion works"
+];
+
+/**
+ * v0.40.x — true when the query is a process / how-to question. PURE pattern match,
+ * NO entity awareness: the structural entity guard (referencesKnownEntity) lives in
+ * process-reorder.ts and is applied at the reorder call site because it needs the
+ * engine/corpus. Used only to gate the post-rerank process reorder.
+ */
+export function isProcessQuery(query: string): boolean {
+  return matches(PROCESS_PATTERNS, query);
+}
+
 /** v0.29.0 mapping. */
 export function intentToDetail(intent: QueryIntent): 'low' | 'medium' | 'high' | undefined {
   switch (intent) {

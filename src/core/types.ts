@@ -1226,6 +1226,13 @@ export interface HybridSearchMeta {
   /** True iff multi-query expansion (Haiku) actually fired and produced variants. */
   expansion_applied: boolean;
   /**
+   * v0.40.x — true iff the intent-conditional post-rerank process reorder actually
+   * moved a doc. False/absent when the flag is off, the query isn't process-shaped,
+   * the entity guard suppressed it, or no eligible docs. Lets ops measure the
+   * reorder's firing/suppression rate before enabling on real traffic.
+   */
+  process_reorder_applied?: boolean;
+  /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`
    * command can show "intent: temporal" alongside results to make the

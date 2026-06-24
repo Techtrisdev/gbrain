@@ -17,7 +17,8 @@ import { resolveEmbeddingColumn, isCacheSafe } from './embedding-column.ts';
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
-import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './query-intent.ts';
+import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery, isProcessQuery } from './query-intent.ts';
+import { applyProcessReorder, referencesKnownEntity } from './process-reorder.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget } from './token-budget.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
@@ -371,6 +372,12 @@ export async function runPostFusionStages(
 }
 
 export interface HybridSearchOpts extends SearchOpts {
+  /**
+   * v0.40.x — per-call override for the post-rerank process reorder (Option A).
+   * Normally resolved from the mode flag / `search.process_reorder_enabled` config;
+   * this lets a caller (or test) force it on/off for a single search.
+   */
+  process_reorder_enabled?: boolean;
   expansion?: boolean;
   expandFn?: (query: string) => Promise<string[]>;
   /** Override default RRF K constant (default: 60). Lower values boost top-ranked results more. */
@@ -439,6 +446,8 @@ export async function hybridSearch(
       // override wins over mode bundle. Without this thread the eval gate
       // would be a no-op (both branches resolve to the same mode default).
       graph_signals: opts?.graph_signals,
+      // v0.40.x — process_reorder per-call thread-through (same resolution chain).
+      process_reorder_enabled: opts?.process_reorder_enabled,
     },
   });
 
@@ -977,6 +986,20 @@ export async function hybridSearch(
     ? await applyReranker(query, deduped, rerankerOpts as any)
     : deduped;
 
+  // v0.40.x — Option A: intent-conditional post-rerank process reorder. Runs AFTER
+  // the reranker (so it isn't washed out like the rejected pre-rerank boost), gated
+  // by the mode flag + isProcessQuery + the structural entity guard (suppress for
+  // known-entity queries to preserve person ranking). Bounded, conservative single move.
+  let processReorderApplied = false;
+  if (resolvedMode.process_reorder_enabled && isProcessQuery(query)) {
+    // Thread the FULL source scope. Federated reads use sourceIds (not sourceId), so
+    // collapsing to 'default' would miss a person in a federated source and demote
+    // them — the exact regression prior reviews demanded be closed.
+    const guardSources = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : ['default']);
+    const hasEntity = await referencesKnownEntity(engine, query, guardSources);
+    if (!hasEntity) processReorderApplied = applyProcessReorder(reranked);
+  }
+
   const sliced = reranked.slice(offset, offset + limit);
   // v0.32.3 search-lite: budget enforcement at the main return path.
   // hybridSearchCached used to be the only place this fired; now bare
@@ -991,6 +1014,9 @@ export async function hybridSearch(
     intent: suggestions.intent,
     mode: resolvedMode.resolved_mode,
     embedding_column: resolvedCol.name,
+    // v0.40.x — observability for the process reorder (suppression rate = process
+    // queries where this stayed false). True only when a doc was actually moved.
+    process_reorder_applied: processReorderApplied,
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
@@ -1050,6 +1076,9 @@ export async function hybridSearchCached(
       // override would write to one cache row but read from a different
       // one on the next call.
       graph_signals: opts?.graph_signals,
+      // v0.40.x — process reorder folded into the cache knobsHash (pr=) so a
+      // reorder-on write isn't served to a reorder-off read on a per-call override.
+      process_reorder_enabled: opts?.process_reorder_enabled,
     },
   });
   // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache

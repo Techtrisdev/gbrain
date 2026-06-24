@@ -67,6 +67,8 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   // v0.40.3.0 contextual retrieval
   contextual_retrieval: 'CR tier (none|title|per_chunk_synopsis) — wraps chunks at embed time',
   contextual_retrieval_disabled: 'Soft kill switch — neutralizes CR wrapping for queries + new embeds',
+  // v0.40.x intent-conditional post-rerank process reorder
+  process_reorder_enabled: 'Post-rerank reorder: lift process docs above person results for process/how-to queries (entity-guarded)',
 };
 
 interface SearchModesReport {
