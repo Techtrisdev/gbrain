@@ -1270,7 +1270,9 @@ export interface HybridSearchMeta {
    * so observability sees what mode actually ran (which can differ from
    * the operator's `config.search.mode` setting if per-call overrides win).
    */
-  mode?: 'conservative' | 'balanced' | 'tokenmax';
+  // 'keyword' = the keyword search op (no vector / no cache / no rerank). Keeps
+  // keyword traffic a DISTINCT telemetry bucket, separate from the semantic modes.
+  mode?: 'conservative' | 'balanced' | 'tokenmax' | 'keyword';
   /**
    * v0.36 (D16 / CDX-10): the embedding column that actually ran this
    * search. Threaded through to eval_candidates capture so replay can
