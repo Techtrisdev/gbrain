@@ -17,6 +17,8 @@ import { dirname } from 'path';
 import { hybridSearch, hybridSearchCached } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
+import { recordSearchTelemetry } from './search/telemetry.ts';
+import { classifyQueryIntent } from './search/query-intent.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
 import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
@@ -1374,6 +1376,21 @@ const search: Operation = {
     });
     const results = dedupResults(raw);
     const latency_ms = Date.now() - startedAt;
+
+    // v0.40.x — keyword-op telemetry. This op bypasses hybridSearch, so it records
+    // here. mode='keyword' keeps it a DISTINCT rollup bucket from the semantic modes;
+    // it has no vector/cache/rerank, so cache_hit_rate (over rows with cache activity)
+    // is unaffected. Non-blocking (in-memory bucket); attributed like query/think.
+    recordSearchTelemetry(ctx.engine, {
+      vector_enabled: false,
+      detail_resolved: null,
+      expansion_applied: false,
+      intent: classifyQueryIntent(queryText),
+      mode: 'keyword',
+    }, { results_count: results.length }, {
+      client: ctx.auth?.clientName,
+      sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
+    });
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Fire-and-forget;
     // results already returned by engine, this just marks them as user-surfaced
