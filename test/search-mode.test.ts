@@ -73,6 +73,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       graph_signals: false,
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'none',
+      process_reorder_enabled: false,
     });
   });
 
@@ -97,6 +98,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'title',
+      process_reorder_enabled: false,
     });
   });
 
@@ -119,6 +121,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'per_chunk_synopsis',
+      process_reorder_enabled: false,
     });
   });
 

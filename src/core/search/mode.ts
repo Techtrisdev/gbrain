@@ -179,6 +179,17 @@ export interface ModeBundle {
   graph_signals: boolean;
 
   /**
+   * v0.40.x — intent-conditional post-rerank process reorder (Option A). When
+   * true AND the query is a process/how-to query that does NOT reference a known
+   * entity, a bounded reorder lifts process-dir docs above person-timeline chunks
+   * in the reranked head — it runs AFTER the reranker so it is not washed out.
+   * Default false in ALL bundles (conservative rollout); false → pure reranker
+   * order, bit-for-bit. Override: per-call SearchOpts → `search.process_reorder_enabled`
+   * config → bundle default.
+   */
+  process_reorder_enabled: boolean;
+
+  /**
    * v0.40.3.0 — contextual retrieval tier per mode. Wraps chunks at embed
    * time so the embedder sees document-level orientation alongside the
    * chunk. Wrapper is built JUST IN TIME and never persisted as
@@ -249,6 +260,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.40.3.0 contextual retrieval — none for conservative (minimum surface).
     contextual_retrieval: 'none' as CRMode,
     contextual_retrieval_disabled: false,
+    // v0.40.x — process reorder OFF (conservative rollout; off = pure reranker order).
+    process_reorder_enabled: false,
   }),
   balanced: Object.freeze({
     cache_enabled: true,
@@ -294,6 +307,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // per the cost-tier philosophy.
     contextual_retrieval: 'title' as CRMode,
     contextual_retrieval_disabled: false,
+    // v0.40.x — process reorder OFF by default in balanced too (conservative rollout).
+    process_reorder_enabled: false,
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
@@ -333,6 +348,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // 10K-page brain; documented in the post-upgrade cost prompt.
     contextual_retrieval: 'per_chunk_synopsis' as CRMode,
     contextual_retrieval_disabled: false,
+    // v0.40.x — process reorder OFF by default in tokenmax too (conservative rollout).
+    process_reorder_enabled: false,
   }),
 });
 
@@ -376,6 +393,8 @@ export interface SearchKeyOverrides {
   cross_modal_llm_intent?: boolean;
   // v0.40.4 — graph_signals override (boolean).
   graph_signals?: boolean;
+  // v0.40.x — process-reorder per-key (config) override.
+  process_reorder_enabled?: boolean;
   // v0.40.3.0 contextual retrieval. CRMode override + soft kill switch.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -414,6 +433,8 @@ export interface SearchPerCallOpts {
   cross_modal_llm_intent?: boolean;
   // v0.40.4 — graph_signals per-call override (boolean).
   graph_signals?: boolean;
+  // v0.40.x — process-reorder per-call override.
+  process_reorder_enabled?: boolean;
   // v0.40.3.0 contextual retrieval per-call overrides.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -487,6 +508,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     cross_modal_llm_intent: pick('cross_modal_llm_intent'),
     // v0.40.4
     graph_signals: pick('graph_signals'),
+    // v0.40.x — process reorder resolved via the same pick chain (perCall → config → bundle).
+    process_reorder_enabled: pick('process_reorder_enabled'),
     // v0.40.3.0 contextual retrieval — resolved via the same pick chain.
     contextual_retrieval: pick('contextual_retrieval'),
     contextual_retrieval_disabled: pick('contextual_retrieval_disabled'),
@@ -811,6 +834,12 @@ export function loadOverridesFromConfig(
     out.graph_signals = gs === '1' || gs.toLowerCase() === 'true';
   }
 
+  // v0.40.x — process_reorder_enabled (intent-conditional post-rerank reorder).
+  const pr = get('search.process_reorder_enabled');
+  if (pr !== undefined) {
+    out.process_reorder_enabled = pr === '1' || pr.toLowerCase() === 'true';
+  }
+
   return out;
 }
 
@@ -841,6 +870,7 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.cross_modal.llm_intent',
   // v0.40.4 graph signals
   'search.graph_signals',
+  'search.process_reorder_enabled',
   // v0.40.3.0 contextual retrieval — tier override + soft kill switch.
   // Per-mode default lives in the bundle; this key lets power users
   // override at the per-key level without flipping the global mode.
