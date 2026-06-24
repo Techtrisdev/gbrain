@@ -592,7 +592,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // added under v=5 (per D8 sequencing — first to land claimed v=4; the
 // contextual-retrieval wave rebased to v=5). Mid-deploy hit-rate dip is
 // expected — clears within cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 5;
+export const KNOBS_HASH_VERSION = 6;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -688,6 +688,9 @@ export function knobsHash(
     // neutralizes prior cache rows.
     `cr=${knobs.contextual_retrieval}`,
     `crd=${knobs.contextual_retrieval_disabled ? 1 : 0}`,
+    // v=6 (append-only): process reorder changes result ORDER, so a reorder-on
+    // write must not be served to a reorder-off lookup (and vice-versa on rollback).
+    `pr=${knobs.process_reorder_enabled ? 1 : 0}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));

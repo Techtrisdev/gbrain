@@ -990,9 +990,14 @@ export async function hybridSearch(
   // the reranker (so it isn't washed out like the rejected pre-rerank boost), gated
   // by the mode flag + isProcessQuery + the structural entity guard (suppress for
   // known-entity queries to preserve person ranking). Bounded, conservative single move.
+  let processReorderApplied = false;
   if (resolvedMode.process_reorder_enabled && isProcessQuery(query)) {
-    const hasEntity = await referencesKnownEntity(engine, query, opts?.sourceId ?? 'default');
-    if (!hasEntity) applyProcessReorder(reranked);
+    // Thread the FULL source scope. Federated reads use sourceIds (not sourceId), so
+    // collapsing to 'default' would miss a person in a federated source and demote
+    // them — the exact regression prior reviews demanded be closed.
+    const guardSources = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : ['default']);
+    const hasEntity = await referencesKnownEntity(engine, query, guardSources);
+    if (!hasEntity) processReorderApplied = applyProcessReorder(reranked);
   }
 
   const sliced = reranked.slice(offset, offset + limit);
@@ -1009,6 +1014,9 @@ export async function hybridSearch(
     intent: suggestions.intent,
     mode: resolvedMode.resolved_mode,
     embedding_column: resolvedCol.name,
+    // v0.40.x — observability for the process reorder (suppression rate = process
+    // queries where this stayed false). True only when a doc was actually moved.
+    process_reorder_applied: processReorderApplied,
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
@@ -1068,6 +1076,9 @@ export async function hybridSearchCached(
       // override would write to one cache row but read from a different
       // one on the next call.
       graph_signals: opts?.graph_signals,
+      // v0.40.x — process reorder folded into the cache knobsHash (pr=) so a
+      // reorder-on write isn't served to a reorder-off read on a per-call override.
+      process_reorder_enabled: opts?.process_reorder_enabled,
     },
   });
   // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache

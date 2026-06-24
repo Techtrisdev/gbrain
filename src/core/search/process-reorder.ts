@@ -40,28 +40,30 @@ function isPersonResult(r: SearchResult): boolean {
  * Conservative by design — exactly one element moves, only within the window, only
  * process-dir vs person-timeline. Everything else keeps its reranked position.
  */
-export function applyProcessReorder(results: SearchResult[], windowSize = DEFAULT_WINDOW): SearchResult[] {
+export function applyProcessReorder(results: SearchResult[], windowSize = DEFAULT_WINDOW): boolean {
   const window = Math.min(windowSize, results.length);
-  if (window < 2) return results;
+  if (window < 2) return false;
 
   // Highest-ranked person-page result in the window.
   let personIdx = -1;
   for (let i = 0; i < window; i++) {
     if (isPersonResult(results[i]!)) { personIdx = i; break; }
   }
-  if (personIdx === -1) return results; // nothing to leapfrog
+  if (personIdx === -1) return false; // nothing to leapfrog
 
   // Highest-ranked process doc BELOW that person result, within the window.
   let processIdx = -1;
   for (let i = personIdx + 1; i < window; i++) {
     if (isProcessDoc(results[i]!)) { processIdx = i; break; }
   }
-  if (processIdx === -1) return results; // no process doc to promote
+  if (processIdx === -1) return false; // no process doc to promote
 
-  // Single conservative move: process doc → just above the highest person-timeline chunk.
+  // Single conservative move: the top process doc → just above the highest person.
+  // LIMITATION (by design — "keep movement conservative"): only ONE process doc is
+  // promoted; a SECOND process doc still buried below the person keeps its position.
   const [doc] = results.splice(processIdx, 1);
   results.splice(personIdx, 0, doc!);
-  return results;
+  return true; // a doc was moved
 }
 
 // Query-structure words excluded from the entity-guard token set (reduce false
@@ -80,12 +82,17 @@ const GUARD_STOPWORDS = new Set([
  * Errs toward preserving entity ranking: ANY token match → true (suppress reorder),
  * and on a query error it FAILS CLOSED (returns true) so a DB hiccup can never
  * silently demote an entity result. The reorder is itself behind a default-off flag.
+ *
+ * `sourceIds` is the FULL source scope the search reads (federated reads pass an
+ * array, not a scalar) — the guard must check every source the search can surface,
+ * else a person in a federated source escapes the guard and gets demoted.
  */
 export async function referencesKnownEntity(
   engine: BrainEngine,
   query: string,
-  sourceId: string = 'default',
+  sourceIds: string[] = ['default'],
 ): Promise<boolean> {
+  const sources = sourceIds.length ? sourceIds : ['default'];
   const tokens = Array.from(new Set(
     query.toLowerCase().split(/[^a-z0-9]+/).filter(t => t.length >= 3 && !GUARD_STOPWORDS.has(t)),
   ));
@@ -98,11 +105,11 @@ export async function referencesKnownEntity(
       `SELECT 1 AS one
          FROM pages
         WHERE deleted_at IS NULL
-          AND source_id = $1
+          AND source_id = ANY($1::text[])
           AND (slug LIKE 'people/%' OR slug LIKE 'companies/%' OR slug LIKE 'deals/%')
           AND lower(title) ~ $2
         LIMIT 1`,
-      [sourceId, pattern],
+      [sources, pattern],
     );
     return rows.length > 0;
   } catch {
