@@ -227,13 +227,19 @@ describe('migration v97 — connector_candidates consolidation columns', () => {
       // Skipped-without-DB: no DATABASE_URL in this environment.
       return;
     }
-    // Ensure a clean default source + no stray rows from other E2E tests.
+    // Ensure a clean default source for the FK target.
     await pg.executeRaw(
       `INSERT INTO sources (id, name, config)
          VALUES ('default','default','{"federated":true}'::jsonb)
          ON CONFLICT (id) DO NOTHING`,
     );
-    await pg.executeRaw(`DELETE FROM connector_candidates WHERE source_record_id LIKE 'postgres-%'`);
+    // Clear my own rows AND any 'update_page' row another E2E file may have
+    // landed earlier in this shared invocation — the simulated legacy 2-value
+    // CHECK can't be ADDed if an existing row already violates it. Other rows
+    // (existing_page/inbox/null) satisfy the legacy check and are left intact.
+    await pg.executeRaw(
+      `DELETE FROM connector_candidates WHERE source_record_id LIKE 'postgres-%' OR target_kind = 'update_page'`,
+    );
     await assertRelaxOnPopulatedDb(pg);
   });
 });

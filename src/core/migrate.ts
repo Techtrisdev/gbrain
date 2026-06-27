@@ -4530,8 +4530,10 @@ export const MIGRATIONS: Migration[] = [
     // no-op (idempotent — exactly one row per (tuple, classification)). This is
     // a pure audit log: no JSONB, no PII (source ids only, never query text or
     // capture bodies), no FK to connector_candidates (a decision is recorded
-    // even when the row degrades to raw passthrough). No RLS — internal
-    // telemetry, same posture as the migration-created search_telemetry.
+    // even when the row degrades to raw passthrough). No explicit RLS POLICY —
+    // on Postgres the v38 auto-RLS event trigger ENABLEs row-level security on
+    // it like every other public table (a BYPASSRLS role still reads/writes
+    // it); same posture as the migration-created search_telemetry.
     //
     // Idempotent: CREATE TABLE / INDEX IF NOT EXISTS.
     idempotent: true,

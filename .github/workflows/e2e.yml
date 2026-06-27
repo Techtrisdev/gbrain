@@ -37,7 +37,13 @@ jobs:
           bun-version: 1.3.13
       - run: bun install
       - name: Run Tier 1 E2E tests
-        run: bun test test/e2e/mechanical.test.ts test/e2e/mcp.test.ts
+        # connector-consolidate.test.ts is included here (not under test/e2e/)
+        # specifically so its DATABASE_URL-gated `assertRelaxOnPopulatedDb(pg)`
+        # case runs against the pg16 service — the U6 plan requires a
+        # Postgres-backed migration test for the prod NOT VALID/VALIDATE +
+        # catalog-DROP path (pglite alone leaves it unverified). Its pglite
+        # cases build their own PGLiteEngine and are unaffected by DATABASE_URL.
+        run: bun test test/e2e/mechanical.test.ts test/e2e/mcp.test.ts test/connector-consolidate.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
 
