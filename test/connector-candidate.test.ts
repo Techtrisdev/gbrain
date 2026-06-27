@@ -442,6 +442,34 @@ describe('resolveInboxTarget — default inbox path derivation (bridge inbox-pat
     const t = { kind: 'existing_page' as const, path: 'projects/x.md' };
     expect(resolveInboxTarget(mkRow(), t)).toBe(t);
   });
+
+  test('extreme/out-of-4-digit-year as_of → falls back, path stays receiver-valid (adv-1)', () => {
+    const out = resolveInboxTarget(
+      mkRow({ as_of: new Date(8.64e15), proposed_at: new Date('2026-03-09T00:00:00Z'), proposed_slug: 'foo' }),
+      { kind: 'inbox', path: '' },
+    );
+    expect(out.path).toBe('inbox/2026-03-09-foo.md');
+    expect(out.path).toMatch(INBOX_RE);
+  });
+
+  test('NaN as_of → falls back to proposed_at', () => {
+    const out = resolveInboxTarget(
+      mkRow({ as_of: new Date('not-a-date'), proposed_at: new Date('2026-03-09T00:00:00Z'), proposed_slug: 'foo' }),
+      { kind: 'inbox', path: '' },
+    );
+    expect(out.path).toBe('inbox/2026-03-09-foo.md');
+  });
+
+  test('hostile/edge slugs all sanitize to a receiver-valid path confined to inbox/', () => {
+    const cases = ['../../etc/passwd', 'a/b', 'a b', '日本語', '***', '-foo-', 'A'.repeat(200)];
+    for (const slug of cases) {
+      const out = resolveInboxTarget(mkRow({ proposed_slug: slug }), { kind: 'inbox', path: '' });
+      expect(out.path).toMatch(INBOX_RE);          // [a-z0-9-] only — no traversal survives
+      expect(out.path!.startsWith('inbox/')).toBe(true);
+      expect(out.path).not.toContain('..');
+      expect(out.path).not.toContain('/etc/');
+    }
+  });
 });
 
 describe('connector config jsonb_set (route SQL primitive)', () => {

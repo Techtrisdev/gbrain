@@ -527,11 +527,25 @@ export function resolveInboxTarget(
   target: PromotionTarget,
 ): PromotionTarget {
   if (target.kind !== 'inbox' || (target.path ?? '').trim() !== '') return target;
-  const date = new Date(candidate.as_of ?? candidate.proposed_at);
-  const yyyymmdd = Number.isNaN(date.getTime())
-    ? new Date(candidate.proposed_at).toISOString().slice(0, 10)
-    : date.toISOString().slice(0, 10);
-  return { kind: 'inbox', path: `inbox/${yyyymmdd}-${inboxSlug(candidate)}.md` };
+  return { kind: 'inbox', path: `inbox/${inboxDate(candidate)}-${inboxSlug(candidate)}.md` };
+}
+
+/**
+ * A guaranteed `YYYY-MM-DD` string for the inbox path (as_of, else proposed_at). Guards BOTH
+ * NaN dates AND valid-but-extreme dates whose toISOString() emits the expanded-year form
+ * (`+275760-09-13`, `-271821-...`) — those slice to a non-`\d{4}-\d{2}-\d{2}` prefix the Brain
+ * receiver REJECTS, re-introducing the very silent-no-PR failure this fix kills. Falls back to
+ * the epoch as a last resort so the derived path is ALWAYS receiver-valid, never blocking.
+ */
+function inboxDate(candidate: ConnectorCandidateRow): string {
+  const ymd = (value: Date | string | null): string | null => {
+    if (value == null) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    const s = d.toISOString().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+  };
+  return ymd(candidate.as_of) ?? ymd(candidate.proposed_at) ?? '1970-01-01';
 }
 
 /**
