@@ -17,10 +17,10 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
-import { createHmac } from 'node:crypto';
+import { createHmac, createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { toRow, approveCandidate, validatePromotionTarget, registerPromotionHook, PromotionTargetError } from '../src/core/connectors/candidate.ts';
+import { toRow, approveCandidate, validatePromotionTarget, registerPromotionHook, PromotionTargetError, type PromotionHook } from '../src/core/connectors/candidate.ts';
 import {
   buildPromotionArtifact,
   canonicalizeArtifactForSigning,
@@ -401,5 +401,243 @@ describe('promotion hook logging discipline (AC7)', () => {
     expect(all).toContain('candidate_id=');
     expect(all).toContain('provider=crunchbase');
     expect(all).toContain('target_kind=inbox');
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════
+// U4 — honor the stored consolidation UPDATE target through approve→artifact
+// ═════════════════════════════════════════════════════════════════
+//
+// The cross-repo seam: a machine-decided UPDATE row carries the FULL pre-computed
+// target (target_kind='update_page' + path + timeline_entry + base_compiled_hash).
+// Approval must HONOR that stored target (not re-derive it from the reviewer HTTP
+// request) and buildPromotionArtifact must emit the MODE-AWARE 5-key target the
+// Brain receiver's validate_artifact expects (TARGET_SCHEMA | {base_compiled_hash}
+// iff update_page, byte-unchanged 4-key otherwise).
+
+// A structural sha256 hex (the compiled-truth gbrain merged against — KTD8).
+const UPDATE_HASH = createHash('sha256').update('compiled-truth-v1').digest('hex');
+// The classifier's REAL dated timeline line (NOT the hardcoded promoted-from string).
+const UPDATE_TIMELINE = '2026-06-27: Merged the webhook-retry note into the integration page.';
+// The merged compiled-truth body (clean — strip() is a no-op).
+const MERGED_BODY = '# Toast\n\nUpdated compiled truth: webhook retries now back off exponentially.';
+const UPDATE_TARGET: PromotionTarget = {
+  kind: 'update_page',
+  path: 'integrations/toast.md',
+  timeline_entry: UPDATE_TIMELINE,
+  base_compiled_hash: UPDATE_HASH,
+};
+const UPDATE_ROW = {
+  provider: 'granola',
+  source_id: 'default',
+  source_record_id: 'rec-upd-1',
+  proposed_markdown: MERGED_BODY,
+};
+
+describe('U4 buildPromotionArtifact: update_page mode-dependent shape', () => {
+  test('update_page target carries EXACTLY 5 keys incl. base_compiled_hash', () => {
+    const a = buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET);
+    expect(a.target.mode).toBe('update_page');
+    expect(Object.keys(a.target).sort()).toEqual(
+      ['base_compiled_hash', 'body', 'mode', 'path', 'timeline_entry'].sort(),
+    );
+  });
+
+  test('body = the merged body; timeline_entry = the LLM line (NOT the hardcoded promoted-from string)', () => {
+    const a = buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET);
+    expect(a.target.body).toBe(MERGED_BODY); // strip() is a no-op on clean content
+    expect(a.target.timeline_entry).toBe(UPDATE_TIMELINE);
+    expect(a.target.timeline_entry).not.toContain('Promoted from connector candidate');
+    expect(a.target.path).toBe('integrations/toast.md');
+  });
+
+  test('base_compiled_hash is emitted VERBATIM (a structural sha256, never strip()-mangled)', () => {
+    const a = buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET);
+    expect(a.target.base_compiled_hash).toBe(UPDATE_HASH);
+    expect(a.target.base_compiled_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('inbox/existing_page targets OMIT base_compiled_hash (key ABSENT, not null) — byte-unchanged 4-key', () => {
+    const inbox = buildPromotionArtifact(ROW, INBOX);
+    expect('base_compiled_hash' in inbox.target).toBe(false);
+    expect(Object.keys(inbox.target)).toHaveLength(4);
+    const existing = buildPromotionArtifact(ROW, { kind: 'existing_page', path: 'companies/acme.md' });
+    expect('base_compiled_hash' in existing.target).toBe(false);
+    expect(Object.keys(existing.target)).toHaveLength(4);
+    // The 4-key target is byte-identical to pre-U4: hardcoded provenance timeline_entry.
+    expect(inbox.target.timeline_entry).toContain('Promoted from connector candidate');
+  });
+
+  test('cross-repo key-set match: mirrors the receiver mode-aware TARGET_SCHEMA', () => {
+    // promote_candidate.py: expected = TARGET_SCHEMA | {base_compiled_hash} iff update_page,
+    // plain TARGET_SCHEMA (4 keys) otherwise. fail-closed on BOTH missing and unknown keys.
+    const upd = buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET);
+    expect(new Set(Object.keys(upd.target))).toEqual(
+      new Set(['mode', 'path', 'timeline_entry', 'body', 'base_compiled_hash']),
+    );
+    const inbox = buildPromotionArtifact(ROW, INBOX);
+    expect(new Set(Object.keys(inbox.target))).toEqual(
+      new Set(['mode', 'path', 'timeline_entry', 'body']),
+    );
+  });
+
+  test('omit-not-null: the canonical update_page string carries base_compiled_hash; the 4-key string does NOT', () => {
+    // JSON.stringify drops an ABSENT key but KEEPS a null — so the omit (not null) is what
+    // keeps the 4-key modes free of the key on the wire.
+    const updJson = canonicalizeArtifactForSigning(buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET));
+    expect(updJson).toContain('"base_compiled_hash"');
+    expect(updJson).not.toContain('null');
+    const inboxJson = canonicalizeArtifactForSigning(buildPromotionArtifact(ROW, INBOX));
+    expect(inboxJson).not.toContain('base_compiled_hash');
+  });
+});
+
+describe('U4 validatePromotionTarget: update_page requires path + base_compiled_hash', () => {
+  test('accepts a valid update_page (non-empty path + base_compiled_hash)', () => {
+    expect(() => validatePromotionTarget(UPDATE_TARGET)).not.toThrow();
+  });
+  test('rejects update_page with a missing/blank path', () => {
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: '', base_compiled_hash: UPDATE_HASH })).toThrow(PromotionTargetError);
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: '   ', base_compiled_hash: UPDATE_HASH })).toThrow(PromotionTargetError);
+  });
+  test('rejects update_page with a missing/blank base_compiled_hash', () => {
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: 'integrations/toast.md' })).toThrow(PromotionTargetError);
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: 'integrations/toast.md', base_compiled_hash: '   ' })).toThrow(PromotionTargetError);
+  });
+  test('update_page path is still held to the canonical sandbox (traversal/absolute rejected)', () => {
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: '../escape.md', base_compiled_hash: UPDATE_HASH })).toThrow(PromotionTargetError);
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: '/etc/passwd', base_compiled_hash: UPDATE_HASH })).toThrow(PromotionTargetError);
+  });
+});
+
+describe('U4 canonical signing: stable + deterministic across the mode-varying key set', () => {
+  test('an update_page artifact signs to a hex HMAC that an independent recomputation matches', () => {
+    const canonical = canonicalizeArtifactForSigning(buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET));
+    const sig = signArtifact(canonical, SECRET);
+    expect(sig).toMatch(/^[0-9a-f]{64}$/);
+    const expected = createHmac('sha256', SECRET).update(Buffer.from(canonical, 'utf8')).digest('hex');
+    expect(sig).toBe(expected);
+  });
+  test('a reordered 5-key update_page artifact canonicalizes identically (sortKeysDeep handles the extra key)', () => {
+    const a = buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET);
+    const canonical = canonicalizeArtifactForSigning(a);
+    const reordered: PromotionArtifact = {
+      target: {
+        base_compiled_hash: a.target.base_compiled_hash,
+        body: a.target.body,
+        timeline_entry: a.target.timeline_entry,
+        path: a.target.path,
+        mode: a.target.mode,
+      },
+      redaction_attestation: a.redaction_attestation,
+      source_record_id: a.source_record_id,
+      source_id: a.source_id,
+      provider: a.provider,
+    };
+    expect(canonicalizeArtifactForSigning(reordered)).toBe(canonical);
+  });
+});
+
+describe('U4 approveCandidate: honor the stored consolidation UPDATE target (end-to-end)', () => {
+  afterEach(() => registerPromotionHook(null));
+
+  // Capture the dispatched artifact (the opaque canonical STRING) via an injected fetch.
+  function capturingHook(): { hook: PromotionHook; getArtifact: () => PromotionArtifact | null } {
+    let captured: PromotionArtifact | null = null;
+    const fetchFn: FetchFn = async (_url, init) => {
+      const sent = JSON.parse(init.body);
+      captured = JSON.parse(sent.client_payload.artifact) as PromotionArtifact;
+      return { ok: true, status: 204, text: async () => '' };
+    };
+    return {
+      hook: makePromotionHook({ getSecret: () => SECRET, getGithubToken: () => TOKEN, fetchFn }),
+      getArtifact: () => captured,
+    };
+  }
+
+  async function insertUpdateRow(srid: string) {
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: srid,
+      provider: 'granola',
+      proposed_markdown: MERGED_BODY,
+      classification: 'UPDATE',
+      target_kind: 'update_page',
+      target_path: 'integrations/toast.md',
+      timeline_entry: UPDATE_TIMELINE,
+      base_compiled_hash: UPDATE_HASH,
+      status: 'pending',
+    });
+    return row;
+  }
+
+  test('approving an UPDATE row emits an update_page artifact sourced from the ROW (reviewer target IGNORED)', async () => {
+    const { hook, getArtifact } = capturingHook();
+    registerPromotionHook(hook);
+    const row = await insertUpdateRow('rec-upd-db-1');
+    // The reviewer sends a DEFAULT inbox target — it MUST be ignored for the stored UPDATE.
+    const res = await approveCandidate(engine, row.id, 'admin', INBOX);
+    expect(res.row!.status).toBe('accepted');
+    expect(res.promotion.invoked).toBe(true);
+    const art = getArtifact()!;
+    expect(art.target.mode).toBe('update_page');
+    expect(art.target.body).toBe(MERGED_BODY);
+    expect(art.target.timeline_entry).toBe(UPDATE_TIMELINE);
+    expect(art.target.base_compiled_hash).toBe(UPDATE_HASH);
+    // NOT the reviewer inbox, NOT the hardcoded promoted-from line.
+    expect(art.target.timeline_entry).not.toContain('Promoted from connector candidate');
+    expect(new Set(Object.keys(art.target))).toEqual(
+      new Set(['mode', 'path', 'timeline_entry', 'body', 'base_compiled_hash']),
+    );
+  });
+
+  test('an UPDATE row approves even when the reviewer target is existing_page with an EMPTY path (threw pre-U4)', async () => {
+    const { hook, getArtifact } = capturingHook();
+    registerPromotionHook(hook);
+    const row = await insertUpdateRow('rec-upd-db-2');
+    // Pre-U4 this reviewer target threw 'existing_page requires non-empty path' BEFORE the row
+    // was read → the UPDATE was unapprovable. Now the EFFECTIVE (row-sourced) target validates.
+    const res = await approveCandidate(engine, row.id, 'admin', { kind: 'existing_page', path: '' });
+    expect(res.row!.status).toBe('accepted');
+    expect(getArtifact()!.target.mode).toBe('update_page');
+  });
+
+  test('accept does NOT clobber the classifier-set target_kind (stays update_page + path)', async () => {
+    registerPromotionHook(capturingHook().hook);
+    const row = await insertUpdateRow('rec-upd-db-3');
+    await approveCandidate(engine, row.id, 'admin', INBOX);
+    const [after] = await engine.executeRaw<{ target_kind: string; target_path: string }>(
+      `SELECT target_kind, target_path FROM connector_candidates WHERE id = $1`,
+      [row.id],
+    );
+    expect(after.target_kind).toBe('update_page');
+    expect(after.target_path).toBe('integrations/toast.md');
+  });
+
+  test('the persisted artifact_hash matches the dispatched update_page artifact (signing stability in the real flow)', async () => {
+    const { hook, getArtifact } = capturingHook();
+    registerPromotionHook(hook);
+    const row = await insertUpdateRow('rec-upd-db-4');
+    const res = await approveCandidate(engine, row.id, 'admin', INBOX);
+    const dispatched = getArtifact()!;
+    const recomputed = artifactHash(canonicalizeArtifactForSigning(dispatched));
+    expect(res.row!.artifact_hash).toBe(recomputed);
+  });
+
+  test('a reviewer-driven (non-consolidation) inbox approval is UNCHANGED — 4-key target, hardcoded timeline, NO base_compiled_hash', async () => {
+    const { hook, getArtifact } = capturingHook();
+    registerPromotionHook(hook);
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'rec-plain-1',
+      provider: 'crunchbase',
+      proposed_markdown: '# ACME',
+    });
+    await approveCandidate(engine, row.id, 'admin', INBOX);
+    const art = getArtifact()!;
+    expect(art.target.mode).toBe('inbox');
+    expect('base_compiled_hash' in art.target).toBe(false);
+    expect(Object.keys(art.target)).toHaveLength(4);
+    expect(art.target.timeline_entry).toContain('Promoted from connector candidate');
   });
 });
