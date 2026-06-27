@@ -199,8 +199,19 @@ export async function landRecords(
   // ONCE, lazily, and ONLY when the caller opted in. The webhook path (no opts)
   // never loads the LLM machinery and is byte-identical to before U3. Loading is
   // dynamic to keep the static import graph acyclic (consolidate.ts →
-  // consolidation-config.ts → poll.ts → base.ts).
-  const consolidation = opts.consolidate ? await loadConsolidation(engine, sourceId) : null;
+  // consolidation-config.ts → poll.ts → base.ts). A LOAD failure (the
+  // `SELECT config` read or a dynamic import) degrades the WHOLE batch to today's
+  // raw passthrough — KTD4 promises that ANY runtime throw falls back to
+  // passthrough, and this read runs OUTSIDE the per-record try/catch, so an
+  // unguarded throw here would otherwise abort the entire poll.
+  let consolidation: ConsolidationDeps | null = null;
+  if (opts.consolidate) {
+    try {
+      consolidation = await loadConsolidation(engine, sourceId);
+    } catch {
+      consolidation = null;
+    }
+  }
 
   let written = 0;
   for (const record of records) {
@@ -325,8 +336,13 @@ async function landOneConsolidated(
     return await persistConsolidated(engine, sourceId, candidate, version, verdict);
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
-    // KTD4 degrade: any other throw isolates to THIS record. The raw candidate
-    // still lands (idempotent) so the capture is not lost, and the batch continues.
+    // KTD4 degrade: any other throw isolates to THIS record. Throws reach here only
+    // from the PRE-persist steps (pre-check / extract / classify / single-writer
+    // lookup / the consolidated toRow itself) — the consolidated row was never
+    // written — so this raw candidate genuinely lands (idempotent), the capture is
+    // not lost, and the batch continues. The POST-persist decision-log write is
+    // non-fatal (handled inside persistConsolidated), so it never re-degrades an
+    // already-persisted consolidated row to a raw passthrough.
     return (await toRow(engine, candidate)).written;
   }
 }
@@ -367,16 +383,32 @@ async function persistConsolidated(
   // Durable decision log (audit + Tier-1 calibration), keyed on the tuple +
   // classification (idempotent). Records the FINAL classification — what the row
   // actually became, including a single-writer downgrade.
-  await recordConsolidationDecision(engine, {
-    sourceId,
-    sourceRecordId: candidate.source_record_id,
-    version,
-    classification: final.classification,
-    confidence: final.confidence,
-    targetPath: resolvedPath ?? final.target_path,
-    tier1Cosine: final.tier1_cosine,
-    model: final.model,
-  });
+  //
+  // NON-FATAL: the consolidated candidate row above is ALREADY committed. A
+  // decision-log failure must NOT propagate to landOneConsolidated's outer catch —
+  // that catch is for PRE-persist throws and re-runs toRow(candidate), which here
+  // would be a no-op (ON CONFLICT) but would mislabel a successfully-consolidated
+  // row as a "raw passthrough". Worst case on failure is a lost audit row — never a
+  // re-degraded or duplicated candidate. (AbortError still propagates for shutdown.)
+  try {
+    await recordConsolidationDecision(engine, {
+      sourceId,
+      sourceRecordId: candidate.source_record_id,
+      version,
+      classification: final.classification,
+      confidence: final.confidence,
+      targetPath: resolvedPath ?? final.target_path,
+      tier1Cosine: final.tier1_cosine,
+      model: final.model,
+    });
+  } catch (err) {
+    if (isAbortError(err)) throw err; // graceful shutdown still propagates.
+    console.error(
+      `[consolidation] decision-log write failed for ${sourceId}/${candidate.source_record_id} ` +
+        `(${final.classification}) — candidate row persisted, audit row dropped: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return written;
 }
 

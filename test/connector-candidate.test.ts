@@ -12,7 +12,7 @@
  *   one engine per file, beforeEach resets data, afterAll disconnects.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, spyOn } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import {
@@ -955,5 +955,76 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     expect(row.target_path).toBe('clients/acme.md'); // the resolved repo path
     expect(row.confidence).toBeCloseTo(0.77, 5);
     expect(row.model).toBe('anthropic:claude-sonnet-4-6'); // resolved reasoning-tier fallback
+  });
+
+  test('MINOR-1: a loadConsolidation failure (config read) degrades the WHOLE batch to raw passthrough, no abort', async () => {
+    await enableGranolaConsolidation();
+    const { calls } = stubChatRouting({ extract: () => JSON.stringify({ facts: ['x'], confidence: 1 }) });
+    // Fail the one-time source-config read inside loadConsolidation (which runs
+    // OUTSIDE the per-record try/catch). An unguarded throw there would abort the
+    // whole poll; KTD4 requires it degrade to passthrough instead.
+    const failingLoad = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return async (sql: string, params?: unknown[]) => {
+            if (/SELECT config FROM sources/i.test(sql)) {
+              throw new Error('simulated sources-config read failure');
+            }
+            return (target as unknown as BrainEngine).executeRaw(sql, params);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as BrainEngine;
+    const res = await landRecords(failingLoad, 'default', granolaLike, [rec('ld-1', 'a'), rec('ld-2', 'b')], { consolidate: true });
+    expect(res.written).toBe(2); // batch NOT aborted — both records landed
+    expect(calls.length).toBe(0); // consolidation disabled for the whole batch → no LLM
+    const rows = await engine.executeRaw<{ classification: string | null }>(
+      `SELECT classification FROM connector_candidates WHERE source_record_id IN ('ld-1', 'ld-2')`,
+    );
+    expect(rows.length).toBe(2);
+    expect(rows.every((r) => r.classification === null)).toBe(true); // raw passthrough
+  });
+
+  test('MINOR-2: a decision-log write failure is non-fatal — the consolidated row persists, not re-degraded', async () => {
+    await enableGranolaConsolidation();
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {}); // silence the expected warning
+    // Fail ONLY the decision-log INSERT (it runs AFTER the consolidated row is
+    // already committed). It must not reach the outer degrade path.
+    const failingLog = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return async (sql: string, params?: unknown[]) => {
+            if (/INSERT INTO consolidation_decisions/i.test(sql)) {
+              throw new Error('simulated decision-log write failure');
+            }
+            return (target as unknown as BrainEngine).executeRaw(sql, params);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as BrainEngine;
+    stubChatRouting({ extract: () => JSON.stringify({ facts: [], confidence: 0.7 }) }); // empty facts → NOOP
+    const res = await landRecords(failingLog, 'default', granolaLike, [rec('dlf-1', 'cap')], { consolidate: true });
+    expect(res.written).toBe(1); // persisted, NOT re-degraded
+    const [row] = await engine.executeRaw<{ classification: string; status: string; status_reason: string }>(
+      `SELECT classification, status, status_reason FROM connector_candidates WHERE source_record_id = 'dlf-1'`,
+    );
+    expect(row.classification).toBe('NOOP'); // consolidated verdict intact (NOT a raw null)
+    expect(row.status).toBe('rejected');
+    expect(row.status_reason).toBe('NOOP');
+    // Exactly one row — the degrade path did NOT run a second toRow.
+    const [{ n }] = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM connector_candidates WHERE source_record_id = 'dlf-1'`,
+    );
+    expect(Number(n)).toBe(1);
+    // The audit row was dropped (the write failed) — but the candidate is intact.
+    const [{ d }] = await engine.executeRaw<{ d: number }>(
+      `SELECT count(*)::int AS d FROM consolidation_decisions WHERE source_record_id = 'dlf-1'`,
+    );
+    expect(Number(d)).toBe(0);
+    errSpy.mockRestore();
   });
 });
