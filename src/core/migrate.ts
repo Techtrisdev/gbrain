@@ -4531,7 +4531,7 @@ export const MIGRATIONS: Migration[] = [
     // a pure audit log: no JSONB, no PII (source ids only, never query text or
     // capture bodies), no FK to connector_candidates (a decision is recorded
     // even when the row degrades to raw passthrough). No explicit RLS POLICY —
-    // on Postgres the v38 auto-RLS event trigger ENABLEs row-level security on
+    // on Postgres the v35 auto-RLS event trigger ENABLEs row-level security on
     // it like every other public table (a BYPASSRLS role still reads/writes
     // it); same posture as the migration-created search_telemetry.
     //

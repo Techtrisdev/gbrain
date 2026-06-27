@@ -25,7 +25,7 @@
  * resolved page path, a cosine, and the model — never query text or capture
  * bodies. The redaction choke point stays `toRow`'s `strip()` on the candidate.
  *
- * Access posture: the table carries no explicit RLS POLICY. On Postgres the v38
+ * Access posture: the table carries no explicit RLS POLICY. On Postgres the v35
  * auto-RLS event trigger ENABLEs row-level security on it like every other
  * public table (a BYPASSRLS role still reads/writes it); on PGLite there is no
  * RLS engine. Same posture as search_telemetry / connector_candidates.

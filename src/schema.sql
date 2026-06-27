@@ -1223,7 +1223,7 @@ CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
 -- audit log: no JSONB, no PII (source ids only — never query text or capture
 -- bodies), no FK to connector_candidates (a decision is recorded even when
 -- the row degrades to raw passthrough). No explicit RLS POLICY — on Postgres
--- the v38 auto-RLS event trigger ENABLEs row-level security on it like every
+-- the v35 auto-RLS event trigger ENABLEs row-level security on it like every
 -- other public table (a BYPASSRLS role still reads/writes it); same posture as
 -- search_telemetry / connector_candidates.
 -- ============================================================
