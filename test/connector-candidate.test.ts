@@ -28,6 +28,26 @@ import {
   type ConnectorCandidateRow,
   type PromotionHook,
 } from '../src/core/connectors/candidate.ts';
+import {
+  landRecords,
+  type SaaSConnector,
+  type NormalizedRecord,
+} from '../src/core/connectors/base.ts';
+import {
+  __setChatTransportForTests,
+  __setEmbedTransportForTests,
+  configureGateway,
+  resetGateway,
+  type ChatOpts,
+  type ChatResult,
+} from '../src/core/ai/gateway.ts';
+import {
+  CONSOLIDATION_EXTRACT_SYSTEM,
+  CONSOLIDATION_CLASSIFY_SYSTEM,
+  compiledTruthHash,
+} from '../src/core/connectors/consolidate.ts';
+import type { BrainEngine } from '../src/core/engine.ts';
+import type { Page, SearchResult, SearchOpts } from '../src/core/types.ts';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
@@ -408,6 +428,7 @@ describe('resolveInboxTarget — default inbox path derivation (bridge inbox-pat
     rationale_ref: null, status: 'pending', status_reason: null, acted_by: null, acted_at: null,
     superseded_by: null, target_kind: null, target_path: null, promotion_status: null,
     promotion_pr_url: null, promotion_branch: null, promoted_at: null, artifact_hash: null,
+    base_compiled_hash: null, timeline_entry: null, classification: null,
     proposed_at: new Date('2026-06-18T15:02:03.441Z'), ...over,
   });
   // The Brain receiver's contract (promote_candidate.py _INBOX_PATH_RE) that REJECTED the empty path.
@@ -575,5 +596,364 @@ describe('coerceCandidateRow — BigInt id serialization (TECH-2120)', () => {
     const coerced = coerceCandidateRow(raw);
     expect(coerced.id).toBe(4);
     expect(coerced.superseded_by).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// U3 — consolidation wired into landRecords + the full target persisted
+//
+// Drives the REAL U1→U2 pipeline through landRecords' POLL-only seam: chat is
+// stubbed (routed by system prompt: extract vs classify), embedding is a ZE
+// gateway + embed-transport stub, and searchVector/getPage are proxied over the
+// real PGLite engine so candidate persistence (toRow, FKs, the decision log) is
+// genuine while the classifier's inputs are controlled.
+// ─────────────────────────────────────────────────────────────────
+describe('U3 — landRecords consolidation seam + target persistence', () => {
+  /** A granola-shaped poll-only connector (mirrors granola.ts:toCandidate). */
+  const granolaLike: SaaSConnector = {
+    provider: 'granola',
+    signatureHeader: 'x-granola-unused',
+    verifyWebhook: () => false,
+    accountFromPayload: () => null,
+    normalize: () => [],
+    toCandidate: (record, sourceId) => ({
+      source_id: sourceId,
+      source_record_id: record.sourceRecordId,
+      provider: 'granola',
+      proposed_slug: record.proposedSlug,
+      proposed_markdown: record.item.summary,
+      confidence: 0.9,
+    }),
+  };
+
+  /** Build a NormalizedRecord (a granola summary capture). */
+  function rec(id: string, summary: string): NormalizedRecord {
+    return {
+      sourceRecordId: id,
+      profile: 'docs',
+      item: { sourceRecordId: id, summary, metadata: {} },
+      proposedSlug: `granola-note-${id}`,
+    };
+  }
+
+  /** Turn on consolidation for granola on the default source. */
+  async function enableGranolaConsolidation(): Promise<void> {
+    await engine.executeRaw(
+      `UPDATE sources SET config = $1::jsonb WHERE id = 'default'`,
+      [{ connectors: { granola: { enabled: true, consolidation_enabled: true } } }],
+    );
+  }
+
+  function fakePage(slug: string, compiled_truth: string, source_id = 'shared'): Page {
+    return {
+      id: 1, slug, type: 'note', title: slug, compiled_truth, timeline: '',
+      frontmatter: {}, created_at: new Date('2026-01-01T00:00:00Z'),
+      updated_at: new Date('2026-01-01T00:00:00Z'), source_id,
+    };
+  }
+  function fakeHit(slug: string, score: number, source_id = 'shared'): SearchResult {
+    return {
+      slug, page_id: 1, title: slug, type: 'note',
+      chunk_text: 'a chunk — NOT the page body', chunk_source: 'compiled_truth',
+      chunk_id: 1, chunk_index: 0, score, stale: false, source_id,
+    };
+  }
+
+  /** Proxy the real engine, overriding only searchVector/getPage so the classifier
+   *  sees canned Tier-1 hits + decomposed pages while persistence stays real. */
+  function withClassifierIO(
+    real: BrainEngine,
+    io: { hits?: SearchResult[]; pages?: Record<string, Page> },
+  ): BrainEngine {
+    return new Proxy(real, {
+      get(target, prop, receiver) {
+        if (prop === 'searchVector') {
+          return async (_emb: Float32Array, o?: SearchOpts): Promise<SearchResult[]> => {
+            const scope = o?.sourceId;
+            return (io.hits ?? []).filter((h) => scope == null || (h.source_id ?? 'default') === scope);
+          };
+        }
+        if (prop === 'getPage') {
+          return async (slug: string): Promise<Page | null> => io.pages?.[slug] ?? null;
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as BrainEngine;
+  }
+
+  /** ZE embedding gateway + embed stub so isAvailable('embedding') is true. */
+  function configureEmbedding(): void {
+    configureGateway({
+      embedding_model: 'zeroentropyai:zembed-1',
+      embedding_dimensions: 1280,
+      env: { ZEROENTROPY_API_KEY: 'sk-fake' },
+    });
+    __setEmbedTransportForTests((async (args: { values: unknown[] }) => ({
+      embeddings: args.values.map(() => Array.from({ length: 1280 }, () => 0.1)),
+    })) as unknown as Parameters<typeof __setEmbedTransportForTests>[0]);
+  }
+
+  /** Install a chat transport routed by the system prompt (extract vs classify). */
+  function stubChatRouting(handlers: {
+    extract?: (opts: ChatOpts) => string;
+    classify?: (opts: ChatOpts) => string;
+  }): { calls: ChatOpts[] } {
+    const calls: ChatOpts[] = [];
+    __setChatTransportForTests(async (opts: ChatOpts): Promise<ChatResult> => {
+      calls.push(opts);
+      let text = '';
+      if (opts.system === CONSOLIDATION_EXTRACT_SYSTEM) text = handlers.extract?.(opts) ?? '';
+      else if (opts.system === CONSOLIDATION_CLASSIFY_SYSTEM) text = handlers.classify?.(opts) ?? '';
+      return {
+        text, blocks: [], stopReason: 'end',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub', providerId: 'test',
+      };
+    });
+    return { calls };
+  }
+
+  afterEach(() => {
+    __setChatTransportForTests(null);
+    __setEmbedTransportForTests(null);
+    resetGateway();
+  });
+
+  test('OFF: opts.consolidate with the connector flag disabled is byte-identical to the no-opts passthrough', async () => {
+    // default source config has NO granola consolidation (reset → {federated:true}).
+    const { calls } = stubChatRouting({ extract: () => JSON.stringify({ facts: ['x'], confidence: 1 }) });
+    await landRecords(engine, 'default', granolaLike, [rec('plain-1', 'Same summary body.')]); // webhook-style (no opts)
+    await landRecords(engine, 'default', granolaLike, [rec('gated-1', 'Same summary body.')], { consolidate: true });
+    expect(calls.length).toBe(0); // gate (consolidation_enabled false) → no extraction
+    const cols =
+      'proposed_markdown, confidence, status, status_reason, target_kind, target_path, classification, timeline_entry, base_compiled_hash';
+    const [plain] = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT ${cols} FROM connector_candidates WHERE source_record_id = 'plain-1'`,
+    );
+    const [gated] = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT ${cols} FROM connector_candidates WHERE source_record_id = 'gated-1'`,
+    );
+    expect(gated).toEqual(plain); // byte-identical content (consolidation columns all null, confidence 0.9)
+    expect(gated.classification).toBeNull();
+    expect(gated.confidence).toBe(0.9);
+  });
+
+  test('webhook/synchronous path (no consolidate flag) is structurally NOT consolidated, even with the connector flag ON', async () => {
+    await enableGranolaConsolidation();
+    const { calls } = stubChatRouting({ extract: () => JSON.stringify({ facts: ['x'], confidence: 1 }) });
+    // No opts → the synchronous webhook-shaped call. The LLM must never run.
+    const res = await landRecords(engine, 'default', granolaLike, [rec('wh-1', 'real durable content')]);
+    expect(res.written).toBe(1);
+    expect(calls.length).toBe(0);
+    const [row] = await engine.executeRaw<{ classification: string | null }>(
+      `SELECT classification FROM connector_candidates WHERE source_record_id = 'wh-1'`,
+    );
+    expect(row.classification).toBeNull(); // raw passthrough
+  });
+
+  test('idempotency pre-check: an already-landed tuple is skipped — no re-extraction, no LLM', async () => {
+    await enableGranolaConsolidation();
+    // A prior poll already landed this record.
+    await toRow(engine, { source_id: 'default', source_record_id: 'idem-1', provider: 'granola', proposed_markdown: 'prior' });
+    const { calls } = stubChatRouting({ extract: () => JSON.stringify({ facts: ['x'], confidence: 1 }) });
+    const res = await landRecords(engine, 'default', granolaLike, [rec('idem-1', 'new content')], { consolidate: true });
+    expect(res.written).toBe(0); // existing tuple → skipped, no new row
+    expect(calls.length).toBe(0); // pre-check short-circuits BEFORE extraction (no re-pay)
+    const [{ n }] = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM connector_candidates WHERE source_record_id = 'idem-1'`,
+    );
+    expect(Number(n)).toBe(1);
+  });
+
+  test('NOOP (no-signal capture): row is classification=NOOP / status=rejected, off the pending queue + logged', async () => {
+    await enableGranolaConsolidation();
+    stubChatRouting({ extract: () => JSON.stringify({ facts: [], confidence: 0.7 }) }); // empty facts → NOOP, no classify LLM
+    const res = await landRecords(engine, 'default', granolaLike, [rec('noop-1', 'hi — thanks, talk soon')], { consolidate: true });
+    expect(res.written).toBe(1);
+    const [row] = await engine.executeRaw<{ classification: string; status: string; status_reason: string; confidence: number }>(
+      `SELECT classification, status, status_reason, confidence FROM connector_candidates WHERE source_record_id = 'noop-1'`,
+    );
+    expect(row.classification).toBe('NOOP');
+    expect(row.status).toBe('rejected');
+    expect(row.status_reason).toBe('NOOP');
+    expect(row.confidence).toBeCloseTo(0.7, 5); // extraction confidence carried through
+    // Off the pending queue — the existing status='pending' filter excludes it (no query change).
+    const pending = await listCandidates(engine, { status: 'pending' });
+    expect(pending.rows.find((r) => r.source_record_id === 'noop-1')).toBeUndefined();
+    // Decision log recorded the NOOP, keyed on the tuple.
+    const [{ n }] = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM consolidation_decisions WHERE source_record_id = 'noop-1' AND classification = 'NOOP'`,
+    );
+    expect(Number(n)).toBe(1);
+  });
+
+  test('UPDATE: persists update_page + resolved .md path + merged body + timeline_entry + base_compiled_hash', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    const targetBody = 'Acme is a Series B customer.\n\nRenewal: pending.';
+    const mergedBody = 'Acme is a Series B customer.\n\nRenewal: SIGNED (Q3).';
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['Acme signed the Q3 renewal'], confidence: 0.8 }),
+      classify: () =>
+        JSON.stringify({
+          classification: 'UPDATE',
+          targets: ['clients/acme'],
+          merged_body: mergedBody,
+          timeline_entry: '2026-06-27 — Renewal signed.',
+          confidence: 0.82,
+        }),
+    });
+    const wrapped = withClassifierIO(engine, {
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', targetBody, 'shared') },
+    });
+    const res = await landRecords(wrapped, 'default', granolaLike, [rec('upd-1', 'Acme renewal signed')], { consolidate: true });
+    expect(res.written).toBe(1);
+    const [row] = await engine.executeRaw<{
+      classification: string; target_kind: string; target_path: string;
+      proposed_markdown: string; timeline_entry: string; base_compiled_hash: string;
+      confidence: number; status: string;
+    }>(
+      `SELECT classification, target_kind, target_path, proposed_markdown, timeline_entry,
+              base_compiled_hash, confidence, status
+         FROM connector_candidates WHERE source_record_id = 'upd-1'`,
+    );
+    expect(row.classification).toBe('UPDATE');
+    expect(row.target_kind).toBe('update_page');
+    expect(row.target_path).toBe('clients/acme.md'); // slug → repo path (U4/U5 use it directly)
+    expect(row.proposed_markdown).toContain('SIGNED (Q3)'); // merged body persisted (via strip())
+    expect(row.timeline_entry).toBe('2026-06-27 — Renewal signed.');
+    // hash is over the FULL decomposed compiled_truth — the byte-identical twin of U5's parse.
+    expect(row.base_compiled_hash).toBe(compiledTruthHash(targetBody));
+    expect(row.confidence).toBeCloseTo(0.82, 5); // real classifier confidence, not the 0.9 default
+    expect(row.status).toBe('pending');
+  });
+
+  test('single-writer-per-page (KTD9): a second same-batch UPDATE on an already-targeted page → NEEDS_REVIEW', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a fact'], confidence: 0.8 }),
+      classify: () =>
+        JSON.stringify({
+          classification: 'UPDATE',
+          targets: ['clients/acme'],
+          merged_body: 'Acme body, updated.',
+          timeline_entry: '2026-06-27 — change.',
+          confidence: 0.8,
+        }),
+    });
+    const wrapped = withClassifierIO(engine, {
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.', 'shared') },
+    });
+    // Two captures in ONE batch, both resolving to clients/acme.
+    const res = await landRecords(wrapped, 'default', granolaLike, [rec('sw-a', 'cap a'), rec('sw-b', 'cap b')], { consolidate: true });
+    expect(res.written).toBe(2);
+    const rows = await engine.executeRaw<{ source_record_id: string; classification: string; target_kind: string | null }>(
+      `SELECT source_record_id, classification, target_kind FROM connector_candidates WHERE source_record_id IN ('sw-a', 'sw-b')`,
+    );
+    const a = rows.find((r) => r.source_record_id === 'sw-a')!;
+    const b = rows.find((r) => r.source_record_id === 'sw-b')!;
+    expect(a.classification).toBe('UPDATE'); // first wins the page
+    expect(a.target_kind).toBe('update_page');
+    expect(b.classification).toBe('NEEDS_REVIEW'); // second downgraded (no competing writer)
+    expect(b.target_kind).toBeNull();
+    const [{ n }] = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM connector_candidates WHERE target_kind = 'update_page' AND target_path = 'clients/acme.md'`,
+    );
+    expect(Number(n)).toBe(1); // exactly one in-flight update_page per page
+  });
+
+  test('redaction invariant: a secret in the classifier merged body is redacted by toRow before persistence', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    const secret = 'AKIAIOSFODNN7EXAMPLE';
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a fact'], confidence: 0.8 }),
+      classify: () =>
+        JSON.stringify({
+          classification: 'UPDATE',
+          targets: ['clients/acme'],
+          merged_body: `Acme update. Leaked key ${secret} here.`,
+          timeline_entry: '2026-06-27 — change.',
+          confidence: 0.8,
+        }),
+    });
+    const wrapped = withClassifierIO(engine, {
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.', 'shared') },
+    });
+    await landRecords(wrapped, 'default', granolaLike, [rec('sec-1', 'cap')], { consolidate: true });
+    const [row] = await engine.executeRaw<{ proposed_markdown: string }>(
+      `SELECT proposed_markdown FROM connector_candidates WHERE source_record_id = 'sec-1'`,
+    );
+    expect(row.proposed_markdown).not.toContain(secret);
+    expect(row.proposed_markdown).toContain('[REDACTED]');
+  });
+
+  test('degrade: an unexpected throw on one record lands it as raw passthrough AND the batch continues', async () => {
+    await enableGranolaConsolidation();
+    // Make ONLY the poison record's idempotency pre-check throw (a transient backend
+    // hiccup). The degrade path's toRow INSERT (a different SQL) is unaffected.
+    const failing = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return async (sql: string, params?: unknown[]) => {
+            if (
+              sql.includes('consolidation-idempotency-precheck') &&
+              Array.isArray(params) &&
+              params.includes('poison')
+            ) {
+              throw new Error('simulated transient DB failure on the pre-check');
+            }
+            return (target as unknown as BrainEngine).executeRaw(sql, params);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as BrainEngine;
+    stubChatRouting({ extract: () => JSON.stringify({ facts: [], confidence: 0.7 }) }); // good record → NOOP
+    const res = await landRecords(failing, 'default', granolaLike, [rec('poison', 'bad'), rec('good', 'ok')], { consolidate: true });
+    expect(res.written).toBe(2); // both landed despite the throw on one
+    const [poison] = await engine.executeRaw<{ classification: string | null }>(
+      `SELECT classification FROM connector_candidates WHERE source_record_id = 'poison'`,
+    );
+    expect(poison.classification).toBeNull(); // degraded to raw passthrough
+    const [good] = await engine.executeRaw<{ classification: string | null }>(
+      `SELECT classification FROM connector_candidates WHERE source_record_id = 'good'`,
+    );
+    expect(good.classification).toBe('NOOP'); // batch continued + consolidated
+  });
+
+  test('decision log: one row per classification, keyed on the (source, record, version) tuple', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a fact'], confidence: 0.8 }),
+      classify: () =>
+        JSON.stringify({
+          classification: 'UPDATE',
+          targets: ['clients/acme'],
+          merged_body: 'Acme body, updated.',
+          timeline_entry: '2026-06-27 — change.',
+          confidence: 0.77,
+        }),
+    });
+    const wrapped = withClassifierIO(engine, {
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.', 'shared') },
+    });
+    await landRecords(wrapped, 'default', granolaLike, [rec('dl-1', 'cap')], { consolidate: true });
+    const [row] = await engine.executeRaw<{ classification: string; target_path: string; confidence: number; model: string }>(
+      `SELECT classification, target_path, confidence, model
+         FROM consolidation_decisions WHERE source_record_id = 'dl-1' AND version = '1'`,
+    );
+    expect(row.classification).toBe('UPDATE');
+    expect(row.target_path).toBe('clients/acme.md'); // the resolved repo path
+    expect(row.confidence).toBeCloseTo(0.77, 5);
+    expect(row.model).toBe('anthropic:claude-sonnet-4-6'); // resolved reasoning-tier fallback
   });
 });

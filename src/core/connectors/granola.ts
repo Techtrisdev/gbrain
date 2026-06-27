@@ -284,7 +284,13 @@ export const granolaConnector: SaaSConnector = {
         if (!Number.isNaN(ms) && ms > newestMs) newestMs = ms;
       }
       const records = this.normalize({ notes: details }, source);
-      const result = await landRecords(engine, source.id, this, records);
+      // POLL-only consolidation (KTD4): backfill is the latency-tolerant poll path,
+      // so it opts in via `consolidate: true`. The Memory Consolidation Engine then
+      // runs per record IFF config.connectors.granola.consolidation_enabled is set
+      // (default OFF). The synchronous webhook receiver never passes this flag, so
+      // the webhook path stays consolidation-free. Granola is poll-only, so this is
+      // its only landRecords call site.
+      const result = await landRecords(engine, source.id, this, records, { consolidate: true });
       landed += result.written;
 
       // Pagination safety: bound total pages AND break on a repeated cursor. The notes on

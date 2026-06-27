@@ -13,8 +13,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
+import { isAvailable } from '../ai/gateway.ts';
 import { toRow, type ConnectorCandidateItem } from './candidate.ts';
-import { minimize, type RawConnectorItem } from './redact.ts';
+import { minimize, strip, type RawConnectorItem } from './redact.ts';
+import { recordConsolidationDecision } from './consolidation-decisions.ts';
+import type { ConsolidationClassifyResult } from './consolidate.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
@@ -158,18 +161,47 @@ export interface LandResult {
   total: number;
 }
 
+/** Options for {@link landRecords}. */
+export interface LandRecordsOptions {
+  /**
+   * POLL-ONLY consolidation gate (KTD4). The Memory Consolidation Engine runs an
+   * LLM (extract → classify) per record, so it is permitted ONLY when the caller
+   * is on the latency-tolerant POLL/backfill path and passes `consolidate: true`.
+   * The synchronous webhook receiver (serve-http `/webhooks/:provider`, the
+   * calendar push handler) NEVER passes it, so the webhook path is structurally
+   * exempt — LLM latency can never blow a webhook timeout — regardless of the
+   * per-connector config flag. Absent/false → today's byte-identical raw
+   * passthrough, and the consolidation machinery is not even loaded.
+   */
+  consolidate?: boolean;
+}
+
 /**
  * Redact each record and write it as a table-only candidate. THE single redaction
  * point: minimize the item (drops bodies + non-allowlisted metadata) and strip the
  * proposed markdown before `toRow`. Never writes a page. Idempotent via toRow's
  * ON CONFLICT DO NOTHING, so duplicate webhook deliveries are safe no-ops.
+ *
+ * When `opts.consolidate` is set (the POLL/backfill path only), each record is
+ * additionally routed through the consolidation pipeline (extract → classify →
+ * pre-compute the promotion target on the row), per-connector-flag-gated and
+ * per-record-isolated (any throw degrades THAT record to raw passthrough — one
+ * poison capture can't abort the batch). See {@link LandRecordsOptions.consolidate}.
  */
 export async function landRecords(
   engine: BrainEngine,
   sourceId: string,
   connector: SaaSConnector,
   records: NormalizedRecord[],
+  opts: LandRecordsOptions = {},
 ): Promise<LandResult> {
+  // POLL-ONLY structural gate: load the consolidation deps + this source's config
+  // ONCE, lazily, and ONLY when the caller opted in. The webhook path (no opts)
+  // never loads the LLM machinery and is byte-identical to before U3. Loading is
+  // dynamic to keep the static import graph acyclic (consolidate.ts →
+  // consolidation-config.ts → poll.ts → base.ts).
+  const consolidation = opts.consolidate ? await loadConsolidation(engine, sourceId) : null;
+
   let written = 0;
   for (const record of records) {
     // Minimize the connector record: drop the body, keep only allowlisted +
@@ -192,10 +224,252 @@ export async function landRecords(
       provider: raw.provider ?? connector.provider,
       redactions: [...(raw.redactions ?? []), ...min.redactions],
     };
-    const { written: didWrite } = await toRow(engine, candidate);
+
+    const didWrite = consolidation
+      ? await landOneConsolidated(engine, sourceId, connector, candidate, consolidation)
+      : (await toRow(engine, candidate)).written;
     if (didWrite) written += 1;
   }
   return { written, total: records.length };
+}
+
+// ── Consolidation seam (U3) — POLL-only; degrade-to-passthrough by construction ──
+
+/** The lazily-loaded consolidation runtime + this poll's source config. */
+interface ConsolidationDeps {
+  /** The raw `sources.config` for this poll's source (object | JSON string | null). */
+  sourceConfig: unknown;
+  extract: typeof import('./consolidate.ts').extractConsolidationFacts;
+  classify: typeof import('./consolidate.ts').classifyConsolidationFacts;
+  enabled: typeof import('./consolidation-config.ts').consolidationEnabled;
+}
+
+/**
+ * Dynamically load the consolidation runtime (cycle-safe) + this source's config,
+ * ONCE per `landRecords` call. The dynamic imports resolve the already-evaluated
+ * singletons after first use (cheap), and keep the static import graph acyclic.
+ */
+async function loadConsolidation(engine: BrainEngine, sourceId: string): Promise<ConsolidationDeps> {
+  const [consolidate, config] = await Promise.all([
+    import('./consolidate.ts'),
+    import('./consolidation-config.ts'),
+  ]);
+  const rows = await engine.executeRaw<{ config: unknown }>(
+    `SELECT config FROM sources WHERE id = $1`,
+    [sourceId],
+  );
+  return {
+    sourceConfig: rows[0]?.config ?? null,
+    extract: consolidate.extractConsolidationFacts,
+    classify: consolidate.classifyConsolidationFacts,
+    enabled: config.consolidationEnabled,
+  };
+}
+
+/**
+ * Land ONE record through the consolidation pipeline. Returns whether a NEW row
+ * was written (matching landRecords' `written` accounting). Degrade contract
+ * (KTD4): the per-connector flag off / chat unavailable / U1 returns null → today's
+ * raw passthrough; ANY non-abort throw (a poison capture, a transient backend
+ * hiccup) is caught and degrades THIS record to raw passthrough so the batch
+ * continues. AbortError propagates (graceful shutdown — never land mid-shutdown).
+ */
+async function landOneConsolidated(
+  engine: BrainEngine,
+  sourceId: string,
+  connector: SaaSConnector,
+  candidate: ConnectorCandidateItem,
+  deps: ConsolidationDeps,
+): Promise<boolean> {
+  const provider = candidate.provider ?? connector.provider;
+  const version = strip(candidate.version ?? '1');
+  try {
+    // Gate: per-connector flag (default false) + chat reachable. Either off →
+    // today's raw passthrough (no DB pre-check, no LLM). The POLL-only structural
+    // gate already held at the call site; this is the per-connector + availability
+    // layer. extractConsolidationFacts re-checks both internally (defense in depth).
+    if (!deps.enabled(provider, deps.sourceConfig) || !isAvailable('chat')) {
+      return (await toRow(engine, candidate)).written;
+    }
+
+    // Idempotency pre-check: a re-poll of an already-landed record must NOT re-pay
+    // the LLM. Existing (source_id, source_record_id, version) tuple → skip
+    // entirely (no extraction, no new row, not counted). The classifier judgment
+    // recorded on the first poll stands (NOOP rows are status='rejected'; the
+    // decision log is keyed on the same tuple).
+    if (await candidateExists(engine, sourceId, candidate.source_record_id, version)) {
+      return false;
+    }
+
+    // U1 → U2. extract reads the REDACTED capture summary (proposed_markdown,
+    // strip()'d so a secret in the capture never reaches the LLM input either).
+    const captureText = candidate.proposed_markdown ? strip(candidate.proposed_markdown) : '';
+    const extracted = await deps.extract({ captureText, provider, sourceConfig: deps.sourceConfig, engine });
+    if (!extracted) {
+      // U1 degrade (flag off / chat down / empty / malformed) → raw passthrough.
+      return (await toRow(engine, candidate)).written;
+    }
+    const verdict = await deps.classify({
+      facts: extracted.facts,
+      extractionConfidence: extracted.confidence,
+      provider,
+      sourceConfig: deps.sourceConfig,
+      engine,
+    });
+    if (!verdict) {
+      // Only the disabled-connector entry gate returns null here (already gated
+      // above) — defensive: degrade to raw passthrough.
+      return (await toRow(engine, candidate)).written;
+    }
+
+    return await persistConsolidated(engine, sourceId, candidate, version, verdict);
+  } catch (err) {
+    if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
+    // KTD4 degrade: any other throw isolates to THIS record. The raw candidate
+    // still lands (idempotent) so the capture is not lost, and the batch continues.
+    return (await toRow(engine, candidate)).written;
+  }
+}
+
+/**
+ * Persist a classified candidate: map the verdict onto the row columns (KTD6),
+ * enforce single-writer-per-page for UPDATE (KTD9), and write the decision-log row.
+ * The merged body / timeline line flow through toRow's strip() (redaction invariant).
+ */
+async function persistConsolidated(
+  engine: BrainEngine,
+  sourceId: string,
+  candidate: ConnectorCandidateItem,
+  version: string,
+  verdict: ConsolidationClassifyResult,
+): Promise<boolean> {
+  let final = verdict;
+  // Resolve the classifier's target SLUG → the receiver repo path (`<slug>.md`),
+  // only for a clean single-target UPDATE.
+  const resolvedPath =
+    verdict.classification === 'UPDATE' && verdict.target_path
+      ? slugToRepoPath(verdict.target_path)
+      : null;
+
+  // Single-writer-per-page (KTD9 inverse): if another pending-or-accepted
+  // update_page already targets this page, downgrade THIS record to NEEDS_REVIEW so
+  // two clean merges sharing one base_compiled_hash can't clobber each other. The
+  // lookup is non-indexed + non-atomic, but SAFE for the sequential poller (record
+  // N-1's row is committed + visible to record N's check); the receiver's
+  // base_compiled_hash guard backstops the rare concurrent-poll double-writer.
+  if (resolvedPath && (await hasInflightUpdatePage(engine, resolvedPath))) {
+    final = { ...verdict, classification: 'NEEDS_REVIEW' };
+  }
+
+  const item = buildConsolidatedItem(candidate, final, resolvedPath);
+  const { written } = await toRow(engine, item);
+
+  // Durable decision log (audit + Tier-1 calibration), keyed on the tuple +
+  // classification (idempotent). Records the FINAL classification — what the row
+  // actually became, including a single-writer downgrade.
+  await recordConsolidationDecision(engine, {
+    sourceId,
+    sourceRecordId: candidate.source_record_id,
+    version,
+    classification: final.classification,
+    confidence: final.confidence,
+    targetPath: resolvedPath ?? final.target_path,
+    tier1Cosine: final.tier1_cosine,
+    model: final.model,
+  });
+  return written;
+}
+
+/**
+ * Map a classifier verdict onto the candidate row columns (KTD6):
+ *   - NOOP  → status='rejected' + status_reason='NOOP' (off the pending queue),
+ *             classification recorded for audit.
+ *   - UPDATE → proposed_markdown = merged body, target_kind='update_page',
+ *             target_path = resolved `<slug>.md`, timeline_entry + base_compiled_hash.
+ *   - ADD / NEEDS_REVIEW → a plain pending candidate carrying the raw summary,
+ *             the classification, and the real confidence (target stays null).
+ */
+function buildConsolidatedItem(
+  base: ConnectorCandidateItem,
+  verdict: ConsolidationClassifyResult,
+  resolvedPath: string | null,
+): ConnectorCandidateItem {
+  switch (verdict.classification) {
+    case 'NOOP':
+      return {
+        ...base,
+        classification: 'NOOP',
+        status: 'rejected',
+        status_reason: 'NOOP',
+        confidence: verdict.confidence,
+      };
+    case 'UPDATE':
+      return {
+        ...base,
+        classification: 'UPDATE',
+        confidence: verdict.confidence,
+        // merged body → proposed_markdown; strip()'d at the toRow write boundary.
+        proposed_markdown: verdict.merged_body ?? base.proposed_markdown,
+        target_kind: 'update_page',
+        target_path: resolvedPath,
+        timeline_entry: verdict.timeline_entry,
+        base_compiled_hash: verdict.base_compiled_hash,
+      };
+    case 'ADD':
+      return { ...base, classification: 'ADD', confidence: verdict.confidence };
+    case 'NEEDS_REVIEW':
+      return { ...base, classification: 'NEEDS_REVIEW', confidence: verdict.confidence };
+  }
+}
+
+/**
+ * Resolve a classifier target SLUG (the page identity, e.g. `integrations/toast`)
+ * to the receiver repo path (`integrations/toast.md`). The inverse of
+ * techtris-brain's `stage1_seed_shared_pages.py:slug_for` (slug = repo path minus
+ * `.md`), so U4/U5 consume `target_path` directly. Idempotent on an already-`.md`
+ * slug.
+ */
+function slugToRepoPath(slug: string): string {
+  return slug.endsWith('.md') ? slug : `${slug}.md`;
+}
+
+/** Does a candidate with this exact (source, record, version) tuple already exist?
+ *  Used as the idempotency pre-check so a re-poll never re-pays the LLM. */
+async function candidateExists(
+  engine: BrainEngine,
+  sourceId: string,
+  sourceRecordId: string,
+  version: string,
+): Promise<boolean> {
+  const rows = await engine.executeRaw<{ one: number }>(
+    // The leading SQL comment is a stable in-statement marker (observability / tests).
+    `-- consolidation-idempotency-precheck
+     SELECT 1 AS one FROM connector_candidates
+      WHERE source_id = $1 AND source_record_id = $2 AND version = $3
+      LIMIT 1`,
+    [sourceId, sourceRecordId, version],
+  );
+  return rows.length > 0;
+}
+
+/** Is a pending-or-accepted `update_page` candidate already in flight for this
+ *  target page? (KTD9 single-writer-per-page; non-indexed, sequential-poller-safe.) */
+async function hasInflightUpdatePage(engine: BrainEngine, targetPath: string): Promise<boolean> {
+  const rows = await engine.executeRaw<{ one: number }>(
+    `SELECT 1 AS one FROM connector_candidates
+      WHERE target_kind = 'update_page' AND target_path = $1
+        AND status IN ('pending', 'accepted')
+      LIMIT 1`,
+    [targetPath],
+  );
+  return rows.length > 0;
+}
+
+/** True when `err` is (or reads as) an AbortError — re-thrown for graceful
+ *  shutdown. Mirrors consolidate.ts's isAbort. */
+function isAbortError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return err.name === 'AbortError' || /aborted|cancell?ed/i.test(err.message);
 }
 
 function safeParse(value: string): Record<string, unknown> | null {

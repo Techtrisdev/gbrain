@@ -16,6 +16,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { strip } from './redact.ts';
+import type { ConsolidationClassification } from './consolidation-decisions.ts';
 import {
   buildPromotionArtifact,
   canonicalizeArtifactForSigning,
@@ -53,6 +54,26 @@ export interface ConnectorCandidateItem {
   as_of?: Date;
   /** Reference to a rationale document slug or URL. */
   rationale_ref?: string;
+
+  // ── Memory Consolidation Engine (U3) — pre-computed promotion target ──────────
+  // Set ONLY by landRecords' consolidation path; absent on every non-consolidation
+  // candidate (today's passthrough, the webhook receiver, tombstones), where they
+  // all default to NULL — leaving such a row byte-identical to before U3.
+  /** The classifier verdict (ADD | UPDATE | NOOP | NEEDS_REVIEW). */
+  classification?: ConsolidationClassification | null;
+  /** Pre-computed promotion target kind. 'update_page' is the consolidation UPDATE mode. */
+  target_kind?: 'existing_page' | 'inbox' | 'update_page' | null;
+  /** Pre-computed promotion target path (the resolved `<slug>.md` repo path for update_page). */
+  target_path?: string | null;
+  /** The UPDATE timeline line. Classifier output → strip()'d at the write boundary. */
+  timeline_entry?: string | null;
+  /** sha256 of the compiled-truth gbrain merged against (the UPDATE staleness guard, KTD8).
+   *  A structural hash — persisted verbatim, NOT strip()'d. */
+  base_compiled_hash?: string | null;
+  /** Candidate status override. NOOP lands 'rejected' (off the pending queue). Default 'pending'. */
+  status?: 'pending' | 'accepted' | 'rejected';
+  /** Status reason. NOOP sets 'NOOP'. strip()'d. Default null. */
+  status_reason?: string | null;
 }
 
 // ── Row type (what we insert / return) ────────────────────────────────────────
@@ -81,13 +102,19 @@ export interface ConnectorCandidateRow {
   acted_at: Date | null;
   superseded_by: number | null;
   // TECH-2109 promotion bridge columns — all nullable; pre-promotion rows read null.
-  target_kind: 'existing_page' | 'inbox' | null;
+  // 'update_page' (U6) is the consolidation UPDATE receiver mode.
+  target_kind: 'existing_page' | 'inbox' | 'update_page' | null;
   target_path: string | null;
   promotion_status: 'pr_opened' | 'indexed' | 'promoted_to_inbox' | 'needs_fix' | 'failed' | null;
   promotion_pr_url: string | null;
   promotion_branch: string | null;
   promoted_at: Date | null;
   artifact_hash: string | null;
+  // Memory Consolidation Engine (U6 columns / U3 writer) — pre-computed UPDATE
+  // target + audit. All nullable; a non-consolidation row reads null.
+  base_compiled_hash: string | null;
+  timeline_entry: string | null;
+  classification: ConsolidationClassification | null;
   proposed_at: Date;
 }
 
@@ -130,13 +157,14 @@ function buildCandidateRow(
   item: ConnectorCandidateItem,
 ): Omit<
   ConnectorCandidateRow,
-  // 'id' / 'proposed_at' are DB-generated; the TECH-2109 promotion columns are
+  // 'id' / 'proposed_at' are DB-generated; the promotion-DISPATCH columns are
   // written later (at approval) by approveCandidate / the promotion bridge, never
-  // by the connector INSERT — they default to NULL here.
+  // by the connector INSERT — they default to NULL here. The pre-computed
+  // promotion TARGET (target_kind/target_path) + the consolidation columns
+  // (classification/timeline_entry/base_compiled_hash) ARE writable at land time
+  // by the U3 consolidation path; they stay NULL on a non-consolidation candidate.
   | 'id'
   | 'proposed_at'
-  | 'target_kind'
-  | 'target_path'
   | 'promotion_status'
   | 'promotion_pr_url'
   | 'promotion_branch'
@@ -165,11 +193,23 @@ function buildCandidateRow(
     expires_at: item.expires_at ?? null,
     as_of: item.as_of ?? null,
     rationale_ref: item.rationale_ref != null ? strip(item.rationale_ref) : null,
-    status: 'pending',
-    status_reason: null,
+    status: item.status ?? 'pending',
+    status_reason: item.status_reason != null ? strip(item.status_reason) : null,
     acted_by: null,
     acted_at: null,
     superseded_by: null,
+    // Memory Consolidation Engine (U3): the pre-computed promotion target. All
+    // NULL on a non-consolidation candidate (byte-identical to today's passthrough).
+    // proposed_markdown (above) already carries strip() — so an UPDATE merged_body
+    // routed through item.proposed_markdown is redacted here too. timeline_entry IS
+    // classifier output → strip()'d like the body. target_path (a repo path) and
+    // base_compiled_hash (a sha256 hex) are STRUCTURAL — persisted verbatim, never
+    // strip()'d (strip could corrupt the path or the hash the receiver compares).
+    target_kind: item.target_kind ?? null,
+    target_path: item.target_path ?? null,
+    classification: item.classification ?? null,
+    timeline_entry: item.timeline_entry != null ? strip(item.timeline_entry) : null,
+    base_compiled_hash: item.base_compiled_hash ?? null,
   };
 }
 
@@ -214,6 +254,11 @@ export async function toRow(
   //  $15  acted_by         TEXT
   //  $16  acted_at         TIMESTAMPTZ
   //  $17  superseded_by    BIGINT
+  //  $18  target_kind        TEXT     — U3 consolidation: pre-computed target (else NULL)
+  //  $19  target_path        TEXT
+  //  $20  classification     TEXT
+  //  $21  timeline_entry     TEXT
+  //  $22  base_compiled_hash TEXT
   const params: unknown[] = [
     candidate.source_id,            // $1
     candidate.source_record_id,     // $2
@@ -232,6 +277,11 @@ export async function toRow(
     candidate.acted_by,             // $15
     candidate.acted_at,             // $16
     candidate.superseded_by,        // $17
+    candidate.target_kind,          // $18
+    candidate.target_path,          // $19
+    candidate.classification,       // $20
+    candidate.timeline_entry,       // $21
+    candidate.base_compiled_hash,   // $22
   ];
 
   const insertSql = `
@@ -242,7 +292,8 @@ export async function toRow(
       confidence,
       redactions,
       expires_at, as_of, rationale_ref,
-      status, status_reason, acted_by, acted_at, superseded_by
+      status, status_reason, acted_by, acted_at, superseded_by,
+      target_kind, target_path, classification, timeline_entry, base_compiled_hash
     ) VALUES (
       $1, $2, $3,
       $4::text[],
@@ -250,7 +301,8 @@ export async function toRow(
       $8,
       $9::jsonb,
       $10, $11, $12,
-      $13, $14, $15, $16, $17
+      $13, $14, $15, $16, $17,
+      $18, $19, $20, $21, $22
     )
     ON CONFLICT (source_id, source_record_id, version) DO NOTHING
     RETURNING ${CANDIDATE_COLUMNS}
@@ -296,6 +348,8 @@ const CANDIDATE_COLS = [
   // TECH-2109 promotion bridge columns
   'target_kind', 'target_path', 'promotion_status', 'promotion_pr_url',
   'promotion_branch', 'promoted_at', 'artifact_hash',
+  // Memory Consolidation Engine (U6 columns / U3 writer)
+  'base_compiled_hash', 'timeline_entry', 'classification',
   'proposed_at',
 ] as const;
 /** Bare column list, for RETURNING / unqualified SELECT. */
