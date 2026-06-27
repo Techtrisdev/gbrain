@@ -520,9 +520,12 @@ export class PromotionTargetError extends Error {
  * that is obviously unsafe so a bad target never reaches the external repo.
  *
  *  - existing_page REQUIRES a non-empty target_path.
- *  - update_page (the machine consolidation UPDATE) REQUIRES a non-empty target_path AND a
+ *  - update_page (the machine consolidation UPDATE) REQUIRES a non-empty target_path, a
  *    non-empty base_compiled_hash (the KTD8 staleness guard the receiver compares HEAD's
- *    compiled-truth against — a missing hash would make the receiver fail closed / inert).
+ *    compiled-truth against — a missing hash would make the receiver fail closed / inert), AND
+ *    a non-empty timeline_entry — the receiver rejects an empty body/timeline_entry for
+ *    update_page (promote_candidate.py), so fail closed HERE rather than dispatch a doomed
+ *    artifact. (The body lives on the row, not the target, so approveCandidate guards it.)
  *  - ANY mode rejects a target_path with leading/trailing whitespace, a leading '/' or '~'
  *    (absolute), a backslash, a NUL, a URL scheme ('scheme://'), an empty path segment, or
  *    any dot-prefixed segment ('.', '..', '....', a dotfile, or a dot-directory like '.git'
@@ -554,6 +557,11 @@ export function validatePromotionTarget(target: PromotionTarget): void {
     }
     if (!(target.base_compiled_hash ?? '').trim()) {
       throw new PromotionTargetError('update_page target requires a non-empty base_compiled_hash');
+    }
+    // Mirror the receiver's update_page guard (promote_candidate.py): an empty timeline_entry
+    // would be rejected receiver-side, so reject it at approve and never dispatch.
+    if (!(target.timeline_entry ?? '').trim()) {
+      throw new PromotionTargetError('update_page target requires a non-empty timeline_entry');
     }
   }
   if (path) {
@@ -654,7 +662,9 @@ export interface ApproveResult {
  *     consolidation ADD/NEEDS_REVIEW rows that carry NO stored target (target_kind=null) — keeps
  *     today's behavior (resolveInboxTarget defaults a bare inbox path).
  *  3. Validate the EFFECTIVE target (NOT the reviewer's) before any write — for a consolidation
- *     UPDATE the reviewer target is empty/irrelevant, so validating IT would wrongly throw.
+ *     UPDATE the reviewer target is empty/irrelevant, so validating IT would wrongly throw. Also
+ *     fail closed on a malformed stored UPDATE (empty proposed_markdown body) so a doomed
+ *     artifact is never dispatched (the receiver would reject an empty update_page body).
  *  4. Build the artifact_hash from the CURRENT row + effective target (read-only, pre-UPDATE).
  *  5. ONE UPDATE sets status='accepted' + actor/time + artifact_hash, guarded by
  *     status='pending' (idempotency: a duplicate approve hits 0 rows). A reviewer-driven
@@ -699,6 +709,17 @@ export async function approveCandidate(
 
   // 3. Validate the EFFECTIVE (row-sourced or reviewer) target before any write.
   validatePromotionTarget(effectiveTarget);
+
+  // 3b. For a consolidation UPDATE the artifact body = row.proposed_markdown (the merged
+  //     compiled-truth), which is NOT carried on the target — so validatePromotionTarget can't
+  //     see it. The receiver rejects an empty body for update_page (promote_candidate.py), so
+  //     fail closed HERE (PromotionTargetError → 400, never dispatched) rather than emit a
+  //     doomed artifact that only bounces back as a receiver-side failed callback.
+  if (honorStored && !(current?.proposed_markdown ?? '').trim()) {
+    throw new PromotionTargetError(
+      'update_page candidate has an empty proposed_markdown (the merged compiled-truth body)',
+    );
+  }
 
   // 4. Compute the artifact hash off the current row + effective target (read-only).
   let hash: string | null = null;

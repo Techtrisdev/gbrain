@@ -481,14 +481,27 @@ describe('U4 buildPromotionArtifact: update_page mode-dependent shape', () => {
     );
   });
 
-  test('omit-not-null: the canonical update_page string carries base_compiled_hash; the 4-key string does NOT', () => {
-    // JSON.stringify drops an ABSENT key but KEEPS a null — so the omit (not null) is what
-    // keeps the 4-key modes free of the key on the wire.
-    const updJson = canonicalizeArtifactForSigning(buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET));
-    expect(updJson).toContain('"base_compiled_hash"');
-    expect(updJson).not.toContain('null');
-    const inboxJson = canonicalizeArtifactForSigning(buildPromotionArtifact(ROW, INBOX));
-    expect(inboxJson).not.toContain('base_compiled_hash');
+  test('omit-not-null survives serialization: the parsed canonical target has the exact mode key set', () => {
+    // Structural (not substring): round-trip through the canonical serializer and assert on the
+    // PARSED key set, so a future fixture body containing "null"/"base_compiled_hash" can't flip
+    // it. A null (vs an omitted key) would parse back as a PRESENT key → `in` true → fail here;
+    // JSON.stringify drops an absent key but keeps a null, so this pins the omit-not-null contract.
+    const updTarget = JSON.parse(
+      canonicalizeArtifactForSigning(buildPromotionArtifact(UPDATE_ROW, UPDATE_TARGET)),
+    ).target as Record<string, unknown>;
+    expect(new Set(Object.keys(updTarget))).toEqual(
+      new Set(['mode', 'path', 'timeline_entry', 'body', 'base_compiled_hash']),
+    );
+    expect(updTarget.base_compiled_hash).toBe(UPDATE_HASH);
+
+    const inboxTarget = JSON.parse(
+      canonicalizeArtifactForSigning(buildPromotionArtifact(ROW, INBOX)),
+    ).target as Record<string, unknown>;
+    expect(new Set(Object.keys(inboxTarget))).toEqual(
+      new Set(['mode', 'path', 'timeline_entry', 'body']),
+    );
+    // Truly ABSENT (omit), not present-as-null — `in` is the precise omit/null discriminator.
+    expect('base_compiled_hash' in inboxTarget).toBe(false);
   });
 });
 
@@ -503,6 +516,10 @@ describe('U4 validatePromotionTarget: update_page requires path + base_compiled_
   test('rejects update_page with a missing/blank base_compiled_hash', () => {
     expect(() => validatePromotionTarget({ kind: 'update_page', path: 'integrations/toast.md' })).toThrow(PromotionTargetError);
     expect(() => validatePromotionTarget({ kind: 'update_page', path: 'integrations/toast.md', base_compiled_hash: '   ' })).toThrow(PromotionTargetError);
+  });
+  test('rejects update_page with a missing/blank timeline_entry (mirrors the receiver guard)', () => {
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: 'integrations/toast.md', base_compiled_hash: UPDATE_HASH })).toThrow(PromotionTargetError);
+    expect(() => validatePromotionTarget({ kind: 'update_page', path: 'integrations/toast.md', base_compiled_hash: UPDATE_HASH, timeline_entry: '   ' })).toThrow(PromotionTargetError);
   });
   test('update_page path is still held to the canonical sandbox (traversal/absolute rejected)', () => {
     expect(() => validatePromotionTarget({ kind: 'update_page', path: '../escape.md', base_compiled_hash: UPDATE_HASH })).toThrow(PromotionTargetError);
@@ -639,5 +656,55 @@ describe('U4 approveCandidate: honor the stored consolidation UPDATE target (end
     expect('base_compiled_hash' in art.target).toBe(false);
     expect(Object.keys(art.target)).toHaveLength(4);
     expect(art.target.timeline_entry).toContain('Promoted from connector candidate');
+  });
+
+  // MINOR-1: fail CLOSED at approve on a malformed stored UPDATE (empty body or timeline_entry),
+  // mirroring the receiver's update_page guard — never dispatch a doomed artifact.
+  test('a stored update_page row with an EMPTY proposed_markdown (merged body) is rejected at approve — NO dispatch', async () => {
+    const { hook, getArtifact } = capturingHook();
+    registerPromotionHook(hook);
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'rec-upd-emptybody',
+      provider: 'granola',
+      proposed_markdown: '', // malformed: an empty merged compiled-truth body
+      classification: 'UPDATE',
+      target_kind: 'update_page',
+      target_path: 'integrations/toast.md',
+      timeline_entry: UPDATE_TIMELINE,
+      base_compiled_hash: UPDATE_HASH,
+      status: 'pending',
+    });
+    await expect(approveCandidate(engine, row.id, 'admin', INBOX)).rejects.toThrow(PromotionTargetError);
+    expect(getArtifact()).toBeNull(); // never dispatched
+    const [after] = await engine.executeRaw<{ status: string }>(
+      `SELECT status FROM connector_candidates WHERE id = $1`,
+      [row.id],
+    );
+    expect(after.status).toBe('pending'); // untouched (no accept write)
+  });
+
+  test('a stored update_page row with an EMPTY timeline_entry is rejected at approve — NO dispatch', async () => {
+    const { hook, getArtifact } = capturingHook();
+    registerPromotionHook(hook);
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'rec-upd-emptytl',
+      provider: 'granola',
+      proposed_markdown: MERGED_BODY,
+      classification: 'UPDATE',
+      target_kind: 'update_page',
+      target_path: 'integrations/toast.md',
+      timeline_entry: '', // malformed: an empty dated line
+      base_compiled_hash: UPDATE_HASH,
+      status: 'pending',
+    });
+    await expect(approveCandidate(engine, row.id, 'admin', INBOX)).rejects.toThrow(PromotionTargetError);
+    expect(getArtifact()).toBeNull(); // never dispatched
+    const [after] = await engine.executeRaw<{ status: string }>(
+      `SELECT status FROM connector_candidates WHERE id = $1`,
+      [row.id],
+    );
+    expect(after.status).toBe('pending');
   });
 });
