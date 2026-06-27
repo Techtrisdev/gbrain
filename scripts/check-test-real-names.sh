@@ -61,6 +61,8 @@ ALLOWLIST=(
   "test/extract.test.ts:Hermes"                        # markdown-link extraction test fixture — pre-existing, ambiguous (Greek god vs fork)
   "test/readme-hero-anchors.test.ts:Hermes"            # v0.36.0.0 D9 anchor test — asserts README mentions Hermes as a credit
   "test/readme-hero-anchors.test.ts:OpenClaw"          # v0.36.0.0 D9 anchor test — asserts README mentions OpenClaw as a credit
+  "test/search-telemetry.test.ts:Hermes"               # 'simon-hermes' client/source identifier in telemetry bucket tests — Simon downstream agent, structural; pre-existing, unallowlisted main breakage unrelated to the consolidation feature
+  "test/search/process-reorder-unit.test.ts:Hermes"    # asserts isProcessQuery('Simon Hermes') === false — query-classification fixture, structural; pre-existing
   # v0.36.0.0: skillpack-harvest privacy linter tests structurally
   # require the literal "Wintermute" to verify the linter catches it.
   # Same meta-rule exception as integrations.test.ts and the proposal-pii
