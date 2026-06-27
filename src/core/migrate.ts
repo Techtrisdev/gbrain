@@ -4407,6 +4407,154 @@ export const MIGRATIONS: Migration[] = [
         PRIMARY KEY (date, mode, intent, client, source_id);
     `,
   },
+  {
+    version: 97,
+    name: 'connector_candidates_consolidation_columns',
+    // Memory Consolidation Engine (U6). Two additive changes on
+    // connector_candidates:
+    //
+    //   (a) RELAX the `target_kind` CHECK to admit a new 'update_page' value
+    //       (the consolidation UPDATE receiver mode). The v95 CHECK is an
+    //       UNNAMED inline column constraint (migrate.ts:4372-4373, mirrored
+    //       unnamed in schema.sql / pglite-schema.ts / schema-embedded.ts), so
+    //       Postgres auto-named it (`connector_candidates_target_kind_check`).
+    //       We do NOT hardcode that assumed name in DROP CONSTRAINT — a wrong
+    //       literal makes `DROP CONSTRAINT IF EXISTS <wrong>` a SILENT no-op,
+    //       leaving prod rejecting 'update_page' while pglite tests (rebuilt
+    //       from the inline 3-value schema) pass green. Instead we RESOLVE the
+    //       real constraint name(s) from the catalog: every CHECK constraint
+    //       whose `conkey` references the `target_kind` column
+    //       (conrelid='connector_candidates'::regclass — same precedent as
+    //       migrate.ts:608/2329/2442), drop each, then ADD a NAMED 3-value
+    //       CHECK.
+    //
+    //   (b) ADD three nullable consolidation columns:
+    //         base_compiled_hash  sha256 of the compiled-truth gbrain merged
+    //                             against (the UPDATE staleness guard, KTD8)
+    //         timeline_entry      the LLM's real dated timeline line
+    //         classification      ADD | UPDATE | NOOP | NEEDS_REVIEW
+    //
+    // Both engines run the catalog-resolved DROP/ADD: PGLite is Postgres-in-WASM
+    // and supports pg_constraint + DO $$ blocks (precedent v47
+    // facts_notability_check). The ONLY engine difference is the Postgres
+    // NOT VALID / VALIDATE split (avoids a full-table write-lock scan on large
+    // tables — copied from v25 pages_page_kind, migrate.ts:925-947); PGLite adds
+    // the constraint inline. A FRESH DB already carries the 3-value CHECK from
+    // the updated schema files — this versioned migration is what relaxes
+    // EXISTING DBs (editing the v95 ADD COLUMN block alone would be a no-op on a
+    // live DB, since the column already exists there).
+    //
+    // Idempotent: ADD COLUMN IF NOT EXISTS is a no-op on re-run; the catalog
+    // DROP-loop re-finds + drops the named 3-value CHECK and re-adds the same
+    // one (the auto-name equals the chosen name, but we never RELY on it — the
+    // DROP resolves from the catalog).
+    idempotent: true,
+    sqlFor: {
+      postgres: `
+        ALTER TABLE connector_candidates
+          ADD COLUMN IF NOT EXISTS base_compiled_hash TEXT,
+          ADD COLUMN IF NOT EXISTS timeline_entry     TEXT,
+          ADD COLUMN IF NOT EXISTS classification     TEXT;
+
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'target_kind'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_target_kind_check
+          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page')) NOT VALID;
+        ALTER TABLE connector_candidates
+          VALIDATE CONSTRAINT connector_candidates_target_kind_check;
+      `,
+      pglite: `
+        ALTER TABLE connector_candidates
+          ADD COLUMN IF NOT EXISTS base_compiled_hash TEXT,
+          ADD COLUMN IF NOT EXISTS timeline_entry     TEXT,
+          ADD COLUMN IF NOT EXISTS classification     TEXT;
+
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'target_kind'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_target_kind_check
+          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page'));
+      `,
+    },
+    sql: '', // engine-specific via sqlFor
+  },
+  {
+    version: 98,
+    name: 'consolidation_decisions_log',
+    // Memory Consolidation Engine (U6) — decision-log telemetry. One durable
+    // row per classification, keyed on the candidate idempotency tuple
+    // (source_id, source_record_id, version) PLUS the classification, for audit
+    // + Tier-1 threshold calibration (KTD2). Mirrors SharedMemory's Postgres
+    // decision log. Written by recordConsolidationDecision() in
+    // src/core/connectors/consolidation-decisions.ts (U1-U3 call it).
+    //
+    //   classification  ADD | UPDATE | NOOP | NEEDS_REVIEW
+    //   confidence      the classifier's real confidence (nullable)
+    //   target_path     the resolved page path for UPDATE (nullable)
+    //   tier1_cosine    the Tier-1 dedup cosine (nullable — for calibration)
+    //   model           the model that produced the decision (nullable)
+    //
+    // The UNIQUE (source_id, source_record_id, version, classification) tuple +
+    // the writer's ON CONFLICT DO NOTHING make a repeat classification a safe
+    // no-op (idempotent — exactly one row per (tuple, classification)). This is
+    // a pure audit log: no JSONB, no PII (source ids only, never query text or
+    // capture bodies), no FK to connector_candidates (a decision is recorded
+    // even when the row degrades to raw passthrough). No RLS — internal
+    // telemetry, same posture as the migration-created search_telemetry.
+    //
+    // Idempotent: CREATE TABLE / INDEX IF NOT EXISTS.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS consolidation_decisions (
+        id                BIGSERIAL    PRIMARY KEY,
+        source_id         TEXT         NOT NULL,
+        source_record_id  TEXT         NOT NULL,
+        version           TEXT         NOT NULL DEFAULT '1',
+        classification    TEXT         NOT NULL,
+        confidence        REAL,
+        target_path       TEXT,
+        tier1_cosine      REAL,
+        model             TEXT,
+        decided_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        CONSTRAINT consolidation_decisions_tuple_unique
+          UNIQUE (source_id, source_record_id, version, classification)
+      );
+
+      CREATE INDEX IF NOT EXISTS consolidation_decisions_class_decided_idx
+        ON consolidation_decisions (classification, decided_at DESC);
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
