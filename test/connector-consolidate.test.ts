@@ -82,6 +82,15 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(pglite);
+  // Shard isolation: bun distributes individual TESTS across shards, so any test
+  // can run first in a shard process and inherit a leaked chat/embed transport or
+  // gateway config from a prior file. A describe-local afterEach only cleans up
+  // AFTER a test, which a first-in-shard test never benefits from — so establish a
+  // clean gateway baseline before EVERY test here. resetGateway() nulls _config +
+  // both transports; the explicit transport resets are belt-and-suspenders.
+  resetGateway();
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
 });
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1218,11 +1227,16 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
   });
 
   test('chat unavailable in the mid band → NEEDS_REVIEW (no silent verdict), model null', async () => {
-    configureEmbedding(); // embedding available, but NO chat transport + no chat model
+    // FORCE the premise deterministically rather than relying on ambient state:
+    // ZE-only embedding (isAvailable('embedding')===true) + NO chat transport, and
+    // the default chat_model (anthropic) has no ANTHROPIC_API_KEY in _config.env,
+    // so isAvailable('chat')===false regardless of what a prior shard test left set.
+    configureEmbedding();
+    __setChatTransportForTests(null); // explicit: chat is UNAVAILABLE for this test
     const { engine } = makeEngine({ hits: [fakeHit('clients/acme', 0.5)] });
-    const r = await callClassify(engine, { model: undefined }); // would resolve a model only past this guard
+    const r = await callClassify(engine, { model: undefined }); // model resolves ONLY past the chat-available guard
     expect(r!.classification).toBe('NEEDS_REVIEW');
-    expect(r!.model).toBeNull();
+    expect(r!.model).toBeNull(); // null ⇒ no Tier-2 chat call was attempted (contract)
     expect(r!.tier1_cosine).toBe(0.5);
   });
 

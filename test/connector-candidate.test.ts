@@ -65,6 +65,15 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // Shard isolation: bun distributes individual TESTS across shards, so the U3
+  // consolidation-seam tests can run first in a shard and inherit a leaked
+  // chat/embed transport or gateway config from a prior file. The U3 describe's
+  // afterEach only cleans up AFTER a test; establish a clean gateway baseline
+  // before EVERY test so none inherits ambient state. resetGateway() nulls
+  // _config + both transports; the explicit resets are belt-and-suspenders.
+  resetGateway();
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
 });
 
 // ─────────────────────────────────────────────────────────────────
