@@ -178,6 +178,17 @@ export async function extractConsolidationFacts(
 
   // Sanitize each fact OUT — the model can be steered into echoing injected
   // text; neutralize it before it can be persisted/embedded downstream.
+  //
+  // INVARIANT DEPENDENCY: the all-garbage→null protection lives upstream in
+  // `parseConsolidationJson` (had-items-but-zero-survived → null, never an
+  // empty-success NOOP). It is NOT re-checked here because this loop relies on
+  // the invariant that NO `INJECTION_PATTERNS` replacement is empty/whitespace
+  // — so a non-empty parsed fact can never collapse to "" via `sanitizeForPrompt`
+  // (the `if (!f) continue` above is unreachable for non-blank input today). If
+  // a future maintainer adds an empty/whitespace replacement to
+  // `think/sanitize.ts`, this consumer must re-add the guard here:
+  //   `if (parsed.facts.length > 0 && facts.length === 0) return null;`
+  // so a real-signal capture can't be silently buried as a NOOP.
   const facts: string[] = [];
   for (const candidate of parsed.facts) {
     let f = sanitizeForPrompt(candidate).trim();
