@@ -19,6 +19,7 @@ import {
   toRow,
   listCandidates,
   approveCandidate,
+  resolveInboxTarget,
   rejectCandidate,
   needsRationale,
   coerceCandidateRow,
@@ -398,6 +399,51 @@ describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retri
 // for enabled, and $::jsonb for an object — work against the engine and are surgical
 // (a sibling key like the webhook secret is preserved, never clobbered).
 // ─────────────────────────────────────────────────────────────────
+describe('resolveInboxTarget — default inbox path derivation (bridge inbox-path fix)', () => {
+  const mkRow = (over: Partial<ConnectorCandidateRow> = {}): ConnectorCandidateRow => ({
+    id: 11, source_id: 'default', source_record_id: 'rec', version: '1',
+    source_record_ids: [], provider: 'granola',
+    proposed_slug: 'granola-note-not_pIDrQnzk7ENW6c', proposed_markdown: 'x', confidence: 0.9,
+    redactions: [], expires_at: null, as_of: new Date('2026-06-18T15:02:03.441Z'),
+    rationale_ref: null, status: 'pending', status_reason: null, acted_by: null, acted_at: null,
+    superseded_by: null, target_kind: null, target_path: null, promotion_status: null,
+    promotion_pr_url: null, promotion_branch: null, promoted_at: null, artifact_hash: null,
+    proposed_at: new Date('2026-06-18T15:02:03.441Z'), ...over,
+  });
+  // The Brain receiver's contract (promote_candidate.py _INBOX_PATH_RE) that REJECTED the empty path.
+  const INBOX_RE = /^inbox\/\d{4}-\d{2}-\d{2}-[a-z0-9-]+\.md$/;
+
+  test('default inbox (empty path) → canonical inbox/YYYY-MM-DD-<slug>.md, slug sanitized', () => {
+    const out = resolveInboxTarget(mkRow(), { kind: 'inbox', path: '' });
+    expect(out.path).toBe('inbox/2026-06-18-granola-note-not-pidrqnzk7enw6c.md');
+    expect(out.path).toMatch(INBOX_RE); // now passes the schema that rejected ''
+  });
+
+  test('uses as_of, falling back to proposed_at when as_of is null', () => {
+    const out = resolveInboxTarget(
+      mkRow({ as_of: null, proposed_at: new Date('2026-01-05T00:00:00Z'), proposed_slug: 'foo' }),
+      { kind: 'inbox', path: '' },
+    );
+    expect(out.path).toBe('inbox/2026-01-05-foo.md');
+  });
+
+  test('null/blank slug → stable <provider>-<id> fallback, still schema-valid', () => {
+    const out = resolveInboxTarget(mkRow({ proposed_slug: null, id: 42 }), { kind: 'inbox', path: '' });
+    expect(out.path).toBe('inbox/2026-06-18-granola-42.md');
+    expect(out.path).toMatch(INBOX_RE);
+  });
+
+  test('inbox already pathed by the reviewer → returned unchanged', () => {
+    const t = { kind: 'inbox' as const, path: 'inbox/2026-06-18-custom.md' };
+    expect(resolveInboxTarget(mkRow(), t)).toBe(t);
+  });
+
+  test('existing_page → returned unchanged (never derived)', () => {
+    const t = { kind: 'existing_page' as const, path: 'projects/x.md' };
+    expect(resolveInboxTarget(mkRow(), t)).toBe(t);
+  });
+});
+
 describe('connector config jsonb_set (route SQL primitive)', () => {
   beforeEach(async () => {
     await engine.executeRaw(
