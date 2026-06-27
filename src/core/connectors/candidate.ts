@@ -513,6 +513,55 @@ export function validatePromotionTarget(target: PromotionTarget): void {
   }
 }
 
+/**
+ * Derive the canonical inbox path the Brain bridge requires. The Brain receiver enforces
+ * `inbox/YYYY-MM-DD-<slug>.md` (slug in [a-z0-9-]) and REJECTS an empty target.path, so a
+ * default inbox approval (reviewer picks 'inbox' with no path) must arrive with a concrete,
+ * safe path. We derive it from the candidate's date (as_of, else proposed_at) + a sanitized
+ * proposed_slug so the persisted target_path AND the HMAC-signed artifact carry the same
+ * canonical value. existing_page, or an inbox target already pathed by the reviewer, is
+ * returned unchanged.
+ */
+export function resolveInboxTarget(
+  candidate: ConnectorCandidateRow,
+  target: PromotionTarget,
+): PromotionTarget {
+  if (target.kind !== 'inbox' || (target.path ?? '').trim() !== '') return target;
+  return { kind: 'inbox', path: `inbox/${inboxDate(candidate)}-${inboxSlug(candidate)}.md` };
+}
+
+/**
+ * A guaranteed `YYYY-MM-DD` string for the inbox path (as_of, else proposed_at). Guards BOTH
+ * NaN dates AND valid-but-extreme dates whose toISOString() emits the expanded-year form
+ * (`+275760-09-13`, `-271821-...`) — those slice to a non-`\d{4}-\d{2}-\d{2}` prefix the Brain
+ * receiver REJECTS, re-introducing the very silent-no-PR failure this fix kills. Falls back to
+ * the epoch as a last resort so the derived path is ALWAYS receiver-valid, never blocking.
+ */
+function inboxDate(candidate: ConnectorCandidateRow): string {
+  const ymd = (value: Date | string | null): string | null => {
+    if (value == null) return null;
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return null;
+    const s = d.toISOString().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+  };
+  return ymd(candidate.as_of) ?? ymd(candidate.proposed_at) ?? '1970-01-01';
+}
+
+/**
+ * Sanitize a candidate into the receiver's [a-z0-9-] inbox slug charset: lowercase, collapse
+ * any run of non-alphanumerics to a single '-', trim leading/trailing '-', cap length. Falls
+ * back to a stable `<provider>-<id>` slug when proposed_slug is null/empty/all-punctuation.
+ */
+function inboxSlug(candidate: ConnectorCandidateRow): string {
+  const sanitize = (s: string): string =>
+    s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80).replace(/-+$/g, '');
+  const slug = sanitize(candidate.proposed_slug ?? '');
+  if (slug) return slug;
+  const fallback = sanitize(`${candidate.provider ?? 'connector'}-${candidate.id}`);
+  return fallback || `connector-${candidate.id}`;
+}
+
 export interface ApproveResult {
   /** The accepted row, or null when the id was not pending (not-found / already acted). */
   row: ConnectorCandidateRow | null;
@@ -552,9 +601,17 @@ export async function approveCandidate(
     `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates WHERE id = $1`,
     [id],
   );
+  // 2.5 Resolve a default inbox approval (kind='inbox' with no path) to the canonical
+  //     inbox/YYYY-MM-DD-<slug>.md the Brain bridge REQUIRES — it rejects an empty inbox path,
+  //     so the path must be concrete by the time the artifact is signed + persisted. An
+  //     existing_page target, or an inbox target the reviewer already pathed, passes through.
+  //     The derived path is re-validated (defense in depth) before any write.
+  const effectiveTarget = current ? resolveInboxTarget(current, target) : target;
+  if (effectiveTarget !== target) validatePromotionTarget(effectiveTarget);
+
   let hash: string | null = null;
   if (current) {
-    const artifact = buildPromotionArtifact(current, target);
+    const artifact = buildPromotionArtifact(current, effectiveTarget);
     const canonical = canonicalizeArtifactForSigning(artifact);
     hash = artifactHash(canonical);
   }
@@ -566,7 +623,7 @@ export async function approveCandidate(
             target_kind = $3, target_path = $4, artifact_hash = $5
       WHERE id = $1 AND status = 'pending'
       RETURNING ${CANDIDATE_COLUMNS}`,
-    [id, strip(actor), target.kind, target.path || null, hash],
+    [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
   );
   const row = rows[0] ? coerceCandidateRow(rows[0]) : null;
   if (!row) return { row: null, promotion: { invoked: false } };
@@ -575,7 +632,7 @@ export async function approveCandidate(
   const hook = getPromotionHook();
   if (!hook) return { row, promotion: { invoked: false, pending: true } };
   try {
-    const result = await hook(engine, row, actor, target);
+    const result = await hook(engine, row, actor, effectiveTarget);
     return { row, promotion: { invoked: true, prUrl: result.prUrl } };
   } catch (err) {
     // Bridge failure: the row stays 'accepted' (already committed) — retriable, never lost.
