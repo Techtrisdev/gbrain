@@ -102,8 +102,15 @@ const MAX_FACTS_CEILING = 25;
 const MAX_FACT_CHARS = 500;
 /** Confidence used when the model omits/garbles it but still produced facts. Neutral. */
 const DEFAULT_EXTRACT_CONFIDENCE = 0.5;
-/** Open/close of THIS module's <capture> data envelope (whitespace-tolerant). */
-const CAPTURE_TAG_RX = /<\s*\/?\s*capture\s*>/gi;
+/**
+ * Open/close of THIS module's <capture> data envelope. `\b[^>]*` also catches
+ * the attribute form (`<capture foo>` / `</capture bar>`) so a body can't break
+ * the envelope with a tag that carries attributes. ASCII-only by design — this
+ * matches the codebase-wide posture of `INJECTION_PATTERNS` (which does not
+ * handle fullwidth-bracket variants either); widening to Unicode here without
+ * doing the same there would be inconsistent.
+ */
+const CAPTURE_TAG_RX = /<\s*\/?\s*capture\b[^>]*>/gi;
 
 /**
  * Extract durable facts from a connector capture's redacted summary.
@@ -130,8 +137,13 @@ export async function extractConsolidationFacts(
   // Gate 2 — chat gateway reachable? Unavailable → passthrough.
   if (!isAvailable('chat')) return null;
 
+  // Gate 3 — a null/undefined/empty captureText has nothing to consolidate.
+  // This guards the `.slice()` below (which sits OUTSIDE the try/catch and would
+  // otherwise throw a TypeError on the live path); mirrors `extract.ts:149`.
+  if (!input.captureText) return null;
+
   // Sanitize the untrusted capture text IN (prompt-injection defense) + cap
-  // length. An empty capture has nothing to consolidate → passthrough.
+  // length. An empty capture (post-sanitize) has nothing to consolidate.
   const cleaned = sanitizeForPrompt(input.captureText.slice(0, MAX_CAPTURE_CHARS)).trim();
   if (!cleaned) return null;
 
@@ -174,7 +186,9 @@ export async function extractConsolidationFacts(
     facts.push(f);
   }
 
-  return { facts, confidence: parsed.confidence };
+  // Enforce the per-capture cap on OUTPUT too (the prompt only *requests* it);
+  // mirrors `extract.ts:196`'s `parsedRaw.slice(0, cap)`.
+  return { facts: facts.slice(0, cap), confidence: parsed.confidence };
 }
 
 /**
@@ -218,6 +232,17 @@ export function parseConsolidationJson(raw: string): ExtractedFacts | null {
     const t = s.trim();
     if (t) facts.push(t);
   }
+
+  // All-garbage degrade: the model emitted a NON-empty facts array but NOTHING
+  // survived normalization (e.g. {facts:[123]}, {facts:[""]}, {facts:[null]},
+  // {facts:[{fact:123}]}). That is malformed output, NOT a genuine no-signal
+  // capture (`rawFacts.length === 0`). Returning empty-success here would route
+  // the record to NOOP (status='rejected') and the idempotency pre-check would
+  // then suppress re-extraction — permanently burying a real-signal capture
+  // instead of giving it KTD4's raw passthrough (which the human reviews).
+  // Distinguish the two: had items + 0 survived → null; genuinely empty stays
+  // empty-success.
+  if (rawFacts.length > 0 && facts.length === 0) return null;
 
   return { facts, confidence: clampConfidence((obj as Record<string, unknown>).confidence) };
 }
