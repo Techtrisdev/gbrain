@@ -384,9 +384,11 @@ export interface ConsolidationClassifyInput {
   /** Abort signal — re-thrown for shutdown, never absorbed. */
   abortSignal?: AbortSignal;
   /**
-   * Source scope for the existing-page search. Omitted → search ALL sources
-   * (each hit's own `source_id` still scopes its `getPage`). Set to the shared
-   * Brain source to constrain candidates to the durable corpus.
+   * Override the durable-corpus search scope. Omitted → the
+   * `connectors.consolidation_search_source` config, else the `shared` source
+   * (the durable, human-reviewed corpus). NEVER searches "all sources" — that
+   * would dedup/update against non-durable content (raw captures, capture-events).
+   * Each hit's own `source_id` still scopes its `getPage` (H1-a).
    */
   searchSourceId?: string;
   /** Distinct candidate pages sent to Tier 2. Default 5, hard-capped at 10. */
@@ -469,6 +471,15 @@ const DEFAULT_CLASSIFY_CONFIDENCE = 0.5;
 const REVIEW_CONFIDENCE = 0.3;
 /** Debug flag for the Tier-1 calibration log (mirrors hybrid.ts's GBRAIN_SEARCH_DEBUG posture). */
 const CONSOLIDATION_DEBUG = process.env.GBRAIN_CONSOLIDATION_DEBUG === '1';
+/**
+ * Default search scope: the DURABLE, human-reviewed shared corpus — techtris-brain's
+ * seeded markdown-source-of-truth, bound to the shared-seeder write credential. NOT
+ * `default` (gbrain's federated base) nor `capture-events` (raw, non-federated). See
+ * the searchVector scoping comment in `classifyConsolidationFacts`.
+ */
+const DEFAULT_DURABLE_SOURCE = 'shared';
+/** Config key to override the durable-corpus search scope per deployment. */
+const CONSOLIDATION_SEARCH_SOURCE_KEY = 'connectors.consolidation_search_source';
 
 /**
  * `<page>` data-envelope tag matcher (open/close, attribute-tolerant) — the
@@ -530,6 +541,20 @@ export async function classifyConsolidationFacts(
   const topK = Math.max(1, Math.min(input.topK ?? DEFAULT_TOP_K, MAX_TOP_K));
   const searchLimit = Math.max(topK * 4, 12);
 
+  // Scope the candidate search to the DURABLE, human-reviewed corpus (MAJOR-2).
+  // An unscoped search also matches non-durable sources (raw connector captures,
+  // the non-federated `capture-events` source, agent memory) and would let a
+  // NOOP/UPDATE resolve against a page that never entered durable truth.
+  // Resolution: explicit caller override → `connectors.consolidation_search_source`
+  // config → the `shared` source — techtris-brain's seeded markdown-source-of-truth
+  // (bound to the shared-seeder write credential). `default` is gbrain's federated
+  // BASE source and `capture-events` is the raw-capture source — NEITHER is the
+  // durable corpus. A wrong/empty scope is FAIL-SAFE: 0 candidates → escalate to
+  // Tier 2 (human-reviewed), never a false dedup. Operators whose durable source
+  // id differs set the config key.
+  const configuredSource = (await input.engine.getConfig(CONSOLIDATION_SEARCH_SOURCE_KEY))?.trim();
+  const searchSource = input.searchSourceId?.trim() || configuredSource || DEFAULT_DURABLE_SOURCE;
+
   let hits: SearchResult[] = [];
   let topCosine: number | null = null;
   if (isAvailable('embedding')) {
@@ -544,14 +569,22 @@ export async function classifyConsolidationFacts(
       try {
         hits = await input.engine.searchVector(queryEmbedding, {
           limit: searchLimit,
-          sourceId: input.searchSourceId,
+          sourceId: searchSource,
+          // MAJOR-1: `detail:'high'` collapses searchVector's source-prefix boost
+          // (`buildSourceFactorCase` → literal '1.0', sql-ranking.ts:62) so `score`
+          // is the PURE cosine similarity (raw_score = 1 − cosine_distance), NOT a
+          // slug-prefix-boosted score. classify.ts's 0.95 dedup cutoff is a pure
+          // cosine; without this a `people/`/`deals/` page (×1.2) or `originals/`
+          // (×1.5) clears 0.95 at a real cosine of ~0.79 / 0.63 → silent false NOOP.
+          // (`detail:'high'` otherwise only skips the `low`-detail chunk filter.)
+          detail: 'high',
         });
       } catch (err) {
         if (isAbort(err)) throw err;
         hits = [];
       }
       if (hits.length > 0 && Number.isFinite(hits[0].score)) {
-        topCosine = hits[0].score;
+        topCosine = hits[0].score; // PURE cosine (prefix boost disabled via detail:'high')
       }
     }
   }
@@ -716,7 +749,7 @@ function interpretClassification(
       }
       // KTD7 provenance guard: a rewrite that drops the target's `## Citations`
       // would hard-block at PR-CI on a reviewed+external page. Fail safe.
-      if (hasCitations(targetPage.compiled_truth) && !hasCitations(body)) {
+      if (hasCitationsSection(targetPage.compiled_truth) && !hasCitationsSection(body)) {
         return result('NEEDS_REVIEW', conf, { ...meta, target_path: targetSlug });
       }
       return result('UPDATE', conf, {
@@ -798,9 +831,27 @@ function frameCandidatePage(c: CandidatePage): string {
   return `<page slug="${safeSlug}">\n${safeBody}\n</page>`;
 }
 
-/** True when `body` carries a `## Citations` heading (provenance section). */
-function hasCitations(body: string): boolean {
-  return /^\s{0,3}##\s+Citations\b/im.test(body);
+/**
+ * True when `body` carries a real `## Citations` heading — a faithful mirror of
+ * the PR-CI provenance gate's `has_citations_section` (techtris-brain
+ * `provenance.py:20` + `frontmatter.py:strip_code_fences`): blank out fenced code
+ * blocks, then match a line that, stripped + lowercased, EXACTLY equals
+ * `## citations`. Looser forms the gate does NOT credit — `## Citations and
+ * Sources`, `## Citations:`, or a heading inside a ``` fence — must NOT be
+ * credited here either, or a provenance-dropping UPDATE would slip through to a
+ * RED CI. Being exactly this strict keeps the KTD7 guard fail-safe.
+ */
+function hasCitationsSection(body: string): boolean {
+  let inFence = false;
+  for (const line of body.split(/\r\n|\r|\n/)) {
+    if (line.trim().startsWith('```')) {
+      inFence = !inFence; // a ``` delimiter line is blanked, like strip_code_fences
+      continue;
+    }
+    if (inFence) continue; // inside a fence → blanked
+    if (line.trim().toLowerCase() === '## citations') return true;
+  }
+  return false;
 }
 
 /** Clamp a finite number into [0, 1]; non-finite → 0. */

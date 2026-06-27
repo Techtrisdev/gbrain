@@ -28,7 +28,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { PostgresEngine } from '../src/core/postgres-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
-import type { Page, SearchResult } from '../src/core/types.ts';
+import type { Page, SearchResult, SearchOpts } from '../src/core/types.ts';
 import { MIGRATIONS } from '../src/core/migrate.ts';
 import {
   __setChatTransportForTests,
@@ -713,7 +713,9 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     return createHash('sha256').update(s, 'utf8').digest('hex');
   }
 
-  function fakePage(slug: string, compiled_truth: string, source_id = 'default'): Page {
+  // Default source is the durable 'shared' corpus (the classifier's default scope),
+  // so a canned hit/page survives the default source filter unless we say otherwise.
+  function fakePage(slug: string, compiled_truth: string, source_id = 'shared'): Page {
     return {
       id: 1,
       slug,
@@ -728,7 +730,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     };
   }
 
-  function fakeHit(slug: string, score: number, source_id = 'default'): SearchResult {
+  function fakeHit(slug: string, score: number, source_id = 'shared'): SearchResult {
     return {
       slug,
       page_id: 1,
@@ -744,19 +746,33 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     };
   }
 
-  /** A minimal BrainEngine that records getPage/searchVector calls. */
+  /**
+   * A minimal BrainEngine that records getPage/searchVector calls AND faithfully
+   * doubles the real `searchVector` ranking contract: it filters hits by the
+   * `sourceId` scope (MAJOR-2) and applies the slug-prefix source boost
+   * (`people/`,`deals/`×1.2, `originals/`×1.5) UNLESS `detail:'high'` disabled it
+   * (MAJOR-1) — so a classifier regression that drops either guard is caught here.
+   */
   function makeEngine(opts: {
     hits?: SearchResult[];
     pages?: Record<string, Page>;
     config?: Record<string, string>;
   }) {
     const getPageCalls: Array<{ slug: string; sourceId?: string }> = [];
-    let searchCalls = 0;
+    const searchOpts: SearchOpts[] = [];
     const engine = {
       kind: 'pglite',
-      searchVector: async (_emb: Float32Array): Promise<SearchResult[]> => {
-        searchCalls++;
-        return opts.hits ?? [];
+      searchVector: async (_emb: Float32Array, o?: SearchOpts): Promise<SearchResult[]> => {
+        searchOpts.push(o ?? {});
+        const scope = o?.sourceId;
+        const boostOff = o?.detail === 'high';
+        return (opts.hits ?? [])
+          .filter((h) => scope == null || (h.source_id ?? 'default') === scope)
+          .map((h) => {
+            if (boostOff) return h; // pure cosine
+            const f = /^(people|deals)\//.test(h.slug) ? 1.2 : /^originals\//.test(h.slug) ? 1.5 : 1.0;
+            return { ...h, score: h.score * f }; // mimic raw_score × source_factor
+          });
       },
       getPage: async (slug: string, o?: { sourceId?: string }): Promise<Page | null> => {
         getPageCalls.push({ slug, sourceId: o?.sourceId });
@@ -764,7 +780,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       },
       getConfig: async (key: string): Promise<string | null> => opts.config?.[key] ?? null,
     } as unknown as BrainEngine;
-    return { engine, getPageCalls, searchCalls: () => searchCalls };
+    return { engine, getPageCalls, searchOpts, searchCalls: () => searchOpts.length };
   }
 
   /** Configure a ZE embedding gateway so isAvailable('embedding') is true + embedOne won't throw. */
@@ -904,6 +920,87 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     expect(calls.length).toBe(0);
   });
 
+  // ── MAJOR-1: pure-cosine threshold (source-prefix boost disabled) ──────────
+  test('searchVector is called with detail:"high" so the threshold sees a PURE cosine (boost off)', async () => {
+    configureEmbedding();
+    stubChat('{"classification":"NOOP","confidence":0.6}');
+    const { engine, searchOpts } = makeEngine({
+      hits: [fakeHit('people/acme', 0.5)],
+      pages: { 'people/acme': fakePage('people/acme', 'Acme.') },
+    });
+    await callClassify(engine);
+    expect(searchOpts.length).toBe(1);
+    expect(searchOpts[0].detail).toBe('high'); // pins source-boost OFF (sql-ranking.ts:62)
+  });
+
+  test('a boosted-prefix hit at sub-threshold cosine does NOT false-NOOP (boost stays off)', async () => {
+    configureEmbedding();
+    const { calls } = stubChat('{"classification":"ADD","confidence":0.9}');
+    // Raw cosine 0.80 on a `people/` page. WITHOUT detail:'high' the real engine
+    // (and this fake double) boosts ×1.2 → 0.96 ≥ 0.95 → silent false NOOP. WITH
+    // the fix the score stays 0.80 → escalate.
+    const { engine } = makeEngine({
+      hits: [fakeHit('people/acme', 0.8)],
+      pages: { 'people/acme': fakePage('people/acme', 'Acme.') },
+    });
+    const r = await callClassify(engine);
+    expect(r!.classification).not.toBe('NOOP'); // escalated, not buried
+    expect(r!.tier1_cosine).toBe(0.8); // the PURE cosine, not 0.96
+    expect(calls.length).toBe(1); // Tier 2 ran
+  });
+
+  // ── MAJOR-2: candidate search scoped to the durable shared corpus ──────────
+  test('candidate search defaults to the durable "shared" source', async () => {
+    configureEmbedding();
+    stubChat('{"classification":"NOOP","confidence":0.6}');
+    const { engine, searchOpts } = makeEngine({
+      hits: [fakeHit('people/acme', 0.5)],
+      pages: { 'people/acme': fakePage('people/acme', 'Acme.') },
+    });
+    await callClassify(engine);
+    expect(searchOpts[0].sourceId).toBe('shared'); // NOT undefined / all-sources
+  });
+
+  test('a page under a NON-durable source (capture-events) is excluded — no false NOOP/UPDATE', async () => {
+    configureEmbedding();
+    const { calls } = stubChat('{"classification":"ADD","confidence":0.9}');
+    // A 0.99-cosine hit that WOULD dedup — but it lives under capture-events, not
+    // the durable shared corpus, so the default 'shared' scope filters it out.
+    const { engine, getPageCalls } = makeEngine({
+      hits: [fakeHit('capture/raw-note', 0.99, 'capture-events')],
+      pages: { 'capture/raw-note': fakePage('capture/raw-note', 'raw', 'capture-events') },
+    });
+    const r = await callClassify(engine);
+    expect(r!.classification).not.toBe('NOOP'); // no dedup against non-durable content
+    expect(r!.classification).not.toBe('UPDATE'); // and never an UPDATE target
+    expect(getPageCalls).toEqual([]); // the capture-events page was never resolved
+    expect(calls.length).toBe(1); // escalated to Tier 2 with zero candidates → LLM ADD
+  });
+
+  test('an operator config key overrides the durable-source scope', async () => {
+    configureEmbedding();
+    stubChat('{"classification":"NOOP","confidence":0.6}');
+    const { engine, searchOpts } = makeEngine({
+      hits: [fakeHit('people/acme', 0.97, 'tenant-x')],
+      pages: { 'people/acme': fakePage('people/acme', 'Acme.', 'tenant-x') },
+      config: { 'connectors.consolidation_search_source': 'tenant-x' },
+    });
+    const r = await callClassify(engine);
+    expect(searchOpts[0].sourceId).toBe('tenant-x');
+    expect(r!.classification).toBe('NOOP'); // the tenant-x hit was in scope
+  });
+
+  test('an explicit searchSourceId overrides both config and the default', async () => {
+    configureEmbedding();
+    stubChat('{"classification":"NOOP","confidence":0.6}');
+    const { engine, searchOpts } = makeEngine({
+      hits: [fakeHit('people/acme', 0.5)],
+      config: { 'connectors.consolidation_search_source': 'tenant-x' },
+    });
+    await callClassify(engine, { searchSourceId: 'explicit-src' });
+    expect(searchOpts[0].sourceId).toBe('explicit-src'); // explicit wins over config + default
+  });
+
   // ── Tier 2: UPDATE + base_compiled_hash parity ─────────────────────────────
   test('UPDATE: target_path matches a getPage candidate; base_compiled_hash = sha256(getPage(target).compiled_truth)', async () => {
     configureEmbedding();
@@ -996,6 +1093,56 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     const r = await callClassify(engine);
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.base_compiled_hash).toBeNull();
+  });
+
+  // MINOR: the Citations guard mirrors provenance.py's EXACT-LINE + fence-aware
+  // semantics — a merged body whose only "citations" heading is a looser form the
+  // PR-CI gate won't credit (## Citations and Sources / ## Citations: / fenced) is
+  // treated as a DROP → NEEDS_REVIEW (else it would slip through to a red CI).
+  const targetWithBareCitations = 'Acme background.\n\n## Citations\n- [meeting](meetings/acme.md)';
+  for (const [label, mergedCitations] of [
+    ['## Citations and Sources (trailing text)', '## Citations and Sources\n- x'],
+    ['## Citations: (trailing colon)', '## Citations:\n- x'],
+    ['a fenced ## Citations (inside ```)', '```\n## Citations\n- x\n```'],
+  ] as const) {
+    test(`UPDATE whose merged body has only ${label} → NEEDS_REVIEW (gate would not credit it)`, async () => {
+      configureEmbedding();
+      stubChat(
+        JSON.stringify({
+          classification: 'UPDATE',
+          targets: ['clients/acme'],
+          merged_body: `Acme background, updated.\n\n${mergedCitations}`,
+          timeline_entry: '2026-06-27 — Updated.',
+          confidence: 0.7,
+        }),
+      );
+      const { engine } = makeEngine({
+        hits: [fakeHit('clients/acme', 0.5)],
+        pages: { 'clients/acme': fakePage('clients/acme', targetWithBareCitations) },
+      });
+      const r = await callClassify(engine);
+      expect(r!.classification).toBe('NEEDS_REVIEW');
+    });
+  }
+
+  test('UPDATE whose merged body has a real (case/space-variant) bare ## Citations IS credited → UPDATE', async () => {
+    configureEmbedding();
+    stubChat(
+      JSON.stringify({
+        classification: 'UPDATE',
+        targets: ['clients/acme'],
+        // leading spaces + lowercase — strip()+lower() still equals "## citations".
+        merged_body: 'Acme background, updated.\n\n   ## citations  \n- [meeting](meetings/acme.md)',
+        timeline_entry: '2026-06-27 — Updated.',
+        confidence: 0.7,
+      }),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5)],
+      pages: { 'clients/acme': fakePage('clients/acme', targetWithBareCitations) },
+    });
+    const r = await callClassify(engine);
+    expect(r!.classification).toBe('UPDATE');
   });
 
   test('UPDATE missing the merged body or timeline line → NEEDS_REVIEW', async () => {
