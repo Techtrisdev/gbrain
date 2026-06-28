@@ -253,27 +253,39 @@ interface ConsolidationDeps {
   extract: typeof import('./consolidate.ts').extractConsolidationFacts;
   classify: typeof import('./consolidate.ts').classifyConsolidationFacts;
   enabled: typeof import('./consolidation-config.ts').consolidationEnabled;
+  /** U2 surfacing gate: the min confidence an ADD/UPDATE needs to land `pending`
+   *  (surfaced) rather than `rejected`/`low_confidence` (held back). Read ONCE per
+   *  batch here, not per record (matching the once-per-batch source-config load). */
+  surfaceMinConfidence: number;
 }
 
 /**
  * Dynamically load the consolidation runtime (cycle-safe) + this source's config,
  * ONCE per `landRecords` call. The dynamic imports resolve the already-evaluated
  * singletons after first use (cheap), and keep the static import graph acyclic.
+ *
+ * The U2 surfacing threshold is read here too — once per batch — so the gate costs
+ * one config read for the whole poll, not one per record. A malformed/missing value
+ * falls back to the default inside the reader (never throws); only a hard engine
+ * read failure propagates, and that already degrades the WHOLE batch to raw
+ * passthrough at the `landRecords` call site (same contract as the source-config
+ * read above), so the surfacing gate can never crash a poll.
  */
 async function loadConsolidation(engine: BrainEngine, sourceId: string): Promise<ConsolidationDeps> {
   const [consolidate, config] = await Promise.all([
     import('./consolidate.ts'),
     import('./consolidation-config.ts'),
   ]);
-  const rows = await engine.executeRaw<{ config: unknown }>(
-    `SELECT config FROM sources WHERE id = $1`,
-    [sourceId],
-  );
+  const [rows, surfaceMinConfidence] = await Promise.all([
+    engine.executeRaw<{ config: unknown }>(`SELECT config FROM sources WHERE id = $1`, [sourceId]),
+    config.consolidationSurfaceMinConfidence(engine),
+  ]);
   return {
     sourceConfig: rows[0]?.config ?? null,
     extract: consolidate.extractConsolidationFacts,
     classify: consolidate.classifyConsolidationFacts,
     enabled: config.consolidationEnabled,
+    surfaceMinConfidence,
   };
 }
 
@@ -333,7 +345,7 @@ async function landOneConsolidated(
       return (await toRow(engine, candidate)).written;
     }
 
-    return await persistConsolidated(engine, sourceId, candidate, version, verdict);
+    return await persistConsolidated(engine, sourceId, candidate, version, verdict, deps.surfaceMinConfidence);
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
     // KTD4 degrade: any other throw isolates to THIS record. Throws reach here only
@@ -358,6 +370,7 @@ async function persistConsolidated(
   candidate: ConnectorCandidateItem,
   version: string,
   verdict: ConsolidationClassifyResult,
+  surfaceMinConfidence: number,
 ): Promise<boolean> {
   let final = verdict;
   // Resolve the classifier's target SLUG → the receiver repo path (`<slug>.md`),
@@ -377,7 +390,7 @@ async function persistConsolidated(
     final = { ...verdict, classification: 'NEEDS_REVIEW' };
   }
 
-  const item = buildConsolidatedItem(candidate, final, resolvedPath);
+  const item = buildConsolidatedItem(candidate, final, resolvedPath, surfaceMinConfidence);
   const { written } = await toRow(engine, item);
 
   // Durable decision log (audit + Tier-1 calibration), keyed on the tuple +
@@ -412,19 +425,39 @@ async function persistConsolidated(
   return written;
 }
 
+/** TTL for a SURFACED (pending) consolidation candidate — 30 days (U3/KTD3). An
+ *  un-acted confident proposal auto-expires rather than guilt-piling forever. */
+const CONSOLIDATION_PENDING_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** TTL for a HELD-BACK consolidation candidate (NOOP / NEEDS_REVIEW / low_confidence)
+ *  — 7 days. Logged-and-hidden audit rows clean themselves up quickly. */
+const CONSOLIDATION_HELD_BACK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The `expires_at` to stamp on a consolidation candidate (U3). `now` is injectable
+ *  for deterministic tests; defaults to wall-clock. Held-back rows get the short TTL,
+ *  surfaced pending rows the long one. */
+function consolidationExpiry(heldBack: boolean, now: number = Date.now()): Date {
+  return new Date(now + (heldBack ? CONSOLIDATION_HELD_BACK_TTL_MS : CONSOLIDATION_PENDING_TTL_MS));
+}
+
 /**
- * Map a classifier verdict onto the candidate row columns (KTD6):
- *   - NOOP  → status='rejected' + status_reason='NOOP' (off the pending queue),
- *             classification recorded for audit.
- *   - UPDATE → proposed_markdown = merged body, target_kind='update_page',
- *             target_path = resolved `<slug>.md`, timeline_entry + base_compiled_hash.
- *   - ADD / NEEDS_REVIEW → a plain pending candidate carrying the raw summary,
- *             the classification, and the real confidence (target stays null).
+ * Map a classifier verdict onto the candidate row columns (KTD6 + U1/U2/U3). Only
+ * confident, unambiguous proposals reach the human; everything else is logged +
+ * persisted for audit but lands off the pending queue with a short self-cleaning TTL:
+ *   - NOOP → status='rejected' + status_reason='NOOP' (off the pending queue).
+ *   - NEEDS_REVIEW (U1) → status='rejected' + status_reason='NEEDS_REVIEW' — the
+ *             system absorbs the ambiguity; the human never triages it. Still recorded
+ *             in the decision log by `persistConsolidated` (audit + Tier-1 calibration).
+ *   - ADD / UPDATE with confidence < `surfaceMinConfidence` (U2) → status='rejected' +
+ *             status_reason='low_confidence'. The classification + UPDATE target fields
+ *             are KEPT (audit / later recovery); only the status (and TTL) change.
+ *   - ADD / UPDATE with confidence >= threshold → SURFACED as a pending candidate.
+ * Every consolidation row carries an `expires_at` (U3): 30 days surfaced, 7 days held back.
  */
 function buildConsolidatedItem(
   base: ConnectorCandidateItem,
   verdict: ConsolidationClassifyResult,
   resolvedPath: string | null,
+  surfaceMinConfidence: number,
 ): ConnectorCandidateItem {
   switch (verdict.classification) {
     case 'NOOP':
@@ -434,8 +467,24 @@ function buildConsolidatedItem(
         status: 'rejected',
         status_reason: 'NOOP',
         confidence: verdict.confidence,
+        expires_at: consolidationExpiry(true),
       };
-    case 'UPDATE':
+    case 'NEEDS_REVIEW':
+      // U1: NEEDS_REVIEW leaves the pending queue (mirrors NOOP). A downgraded
+      // single-writer UPDATE arrives here too — correctly also off-queue.
+      return {
+        ...base,
+        classification: 'NEEDS_REVIEW',
+        status: 'rejected',
+        status_reason: 'NEEDS_REVIEW',
+        confidence: verdict.confidence,
+        expires_at: consolidationExpiry(true),
+      };
+    case 'UPDATE': {
+      // U2: hold back a low-confidence UPDATE off the pending queue. Keep the full
+      // pre-computed target (path + body + timeline + base hash) for audit/recovery —
+      // only the status + TTL change.
+      const heldBack = verdict.confidence < surfaceMinConfidence;
       return {
         ...base,
         classification: 'UPDATE',
@@ -446,11 +495,21 @@ function buildConsolidatedItem(
         target_path: resolvedPath,
         timeline_entry: verdict.timeline_entry,
         base_compiled_hash: verdict.base_compiled_hash,
+        ...(heldBack ? { status: 'rejected' as const, status_reason: 'low_confidence' } : {}),
+        expires_at: consolidationExpiry(heldBack),
       };
-    case 'ADD':
-      return { ...base, classification: 'ADD', confidence: verdict.confidence };
-    case 'NEEDS_REVIEW':
-      return { ...base, classification: 'NEEDS_REVIEW', confidence: verdict.confidence };
+    }
+    case 'ADD': {
+      // U2: a low-confidence ADD is held back the same way (no target fields to keep).
+      const heldBack = verdict.confidence < surfaceMinConfidence;
+      return {
+        ...base,
+        classification: 'ADD',
+        confidence: verdict.confidence,
+        ...(heldBack ? { status: 'rejected' as const, status_reason: 'low_confidence' } : {}),
+        expires_at: consolidationExpiry(heldBack),
+      };
+    }
   }
 }
 

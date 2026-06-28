@@ -364,9 +364,11 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
     expect(insert!.params).toContain('rec-2');
     expect(insert!.params).toContain(`1:${TOMBSTONE_VERSION_SUFFIX}`);
 
-    // NEVER a delete of a page or candidate — the reconciliation contract.
-    const anyDelete = calls.find((c) => /DELETE\s+FROM/i.test(c.sql));
-    expect(anyDelete).toBeUndefined();
+    // Reconciliation NEVER deletes a record — it tombstones via INSERT. (The U3 TTL
+    // self-cleaning sweep is the ONLY DELETE the poll runs; it is unrelated to
+    // reconciliation and is excluded here by its `expires_at` predicate.)
+    const reconcileDelete = calls.find((c) => /DELETE\s+FROM/i.test(c.sql) && !/expires_at/i.test(c.sql));
+    expect(reconcileDelete).toBeUndefined();
   });
 
   test('idempotent re-run: tombstone ON CONFLICT surfaces tombstoned=0', async () => {
@@ -428,9 +430,10 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
       confirmedEmpty: true, // connector authoritatively saw zero current records
     }, NO_ENV);
     expect(result.tombstoned).toBe(2);
-    // Still tombstones via INSERT, never a delete.
+    // Still tombstones via INSERT; reconciliation issues no DELETE (the U3 TTL sweep,
+    // identified by its `expires_at` predicate, is the only — unrelated — DELETE).
     expect(calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql))).toBeDefined();
-    expect(calls.find((c) => /DELETE\s+FROM/i.test(c.sql))).toBeUndefined();
+    expect(calls.find((c) => /DELETE\s+FROM/i.test(c.sql) && !/expires_at/i.test(c.sql))).toBeUndefined();
   });
 });
 

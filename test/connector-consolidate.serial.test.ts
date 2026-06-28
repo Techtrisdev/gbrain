@@ -43,7 +43,9 @@ import {
   consolidationModel,
   consolidationNoopCosine,
   consolidationAddCosineFloor,
+  consolidationSurfaceMinConfidence,
   CONSOLIDATION_NOOP_COSINE_DEFAULT,
+  CONSOLIDATION_SURFACE_MIN_CONFIDENCE_DEFAULT,
   CONSOLIDATION_MODEL_FALLBACK,
 } from '../src/core/connectors/consolidation-config.ts';
 import {
@@ -380,6 +382,20 @@ describe('Tier-1 threshold readers', () => {
     // invalid → stays null (do not trust a bad value into a premature ADD)
     await pglite.setConfig('connectors.consolidation_add_cosine_floor', '1.5');
     expect(await consolidationAddCosineFloor(pglite)).toBeNull();
+  });
+
+  test('consolidationSurfaceMinConfidence (U2) defaults to 0.70 and overrides from config', async () => {
+    expect(await consolidationSurfaceMinConfidence(pglite)).toBe(CONSOLIDATION_SURFACE_MIN_CONFIDENCE_DEFAULT);
+    expect(CONSOLIDATION_SURFACE_MIN_CONFIDENCE_DEFAULT).toBe(0.7);
+
+    await pglite.setConfig('connectors.consolidation_surface_min_confidence', '0.9');
+    expect(await consolidationSurfaceMinConfidence(pglite)).toBe(0.9);
+
+    // out-of-[0,1] / non-numeric / empty → ignored, default restored (never throws).
+    await pglite.setConfig('connectors.consolidation_surface_min_confidence', '2.5');
+    expect(await consolidationSurfaceMinConfidence(pglite)).toBe(0.7);
+    await pglite.setConfig('connectors.consolidation_surface_min_confidence', 'abc');
+    expect(await consolidationSurfaceMinConfidence(pglite)).toBe(0.7);
   });
 });
 
