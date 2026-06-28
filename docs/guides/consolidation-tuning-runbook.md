@@ -59,9 +59,14 @@ by nature), a low cosine does not mean "novel" and a mid cosine does not mean
   weak/ambiguous ≈ 0.50–0.60). So `consolidation_surface_min_confidence` (0.70)
   is the working lever, not the cosine floor. The default cleanly surfaces the
   0.87–0.97 proposals and holds back the 0.50 ones.
-- A high NEEDS_REVIEW rate on meeting notes is **structural**, not a defect — you
-  cannot make the engine escalate less here. The fix is that escalations never
-  burden the human (they're held back + self-expiring), not that they stop.
+- **Superseded by fan-out (see "Multi-topic fan-out" below).** This 32/45
+  NEEDS_REVIEW share was measured under the **single-target** engine, where any
+  capture touching more than one page was *forced* to NEEDS_REVIEW — so the high
+  rate was mostly the single-target rule firing on ordinary multi-topic meetings,
+  not genuine conflict. With fan-out, each page gets its own targeted verdict and
+  NEEDS_REVIEW reverts to its real meaning (per-partition contradiction /
+  unplaceable). Re-measure on fan-out output before drawing tuning conclusions; the
+  cosine-bands finding above (cosine does not predict the verdict) still stands.
 
 Re-measure before touching any floor:
 
@@ -76,3 +81,58 @@ GROUP BY classification ORDER BY avg_cos;
 
 Set an ADD floor only if a low-cosine band emerges where the LLM verdict is
 overwhelmingly ADD (no NEEDS_REVIEW/NOOP overlap). Until then, escalate.
+
+## Multi-topic fan-out (one capture → one proposal per page)
+
+A real meeting note is almost always **multi-topic** (a client status change *and*
+an integration change *and* a new project). Earlier the classifier emitted a
+**single** verdict and any capture touching more than one page was forced to
+NEEDS_REVIEW — so the majority of real captures became review chores. That rule
+is **gone**. The classifier now **partitions the facts by page and emits one
+targeted ADD/UPDATE/NOOP/NEEDS_REVIEW verdict PER page** (a JSON array). One
+meeting about Acme (Series B) and Olo (webhook change) produces an UPDATE to
+`clients/acme` **and** an UPDATE to `integrations/olo` — two clean, independently
+promotable proposals.
+
+### What NEEDS_REVIEW means now
+
+NEEDS_REVIEW is no longer "this capture touched more than one page." It fires
+**per partition**, only when that partition:
+
+- **contradicts** a page's compiled truth in a way the model can't safely merge, or
+- **can't be confidently placed** on any page (and isn't clearly a clean new page).
+
+A partial fan-out is normal and fine: one partition can be NEEDS_REVIEW while its
+siblings proceed as ADD/UPDATE. So a high NEEDS_REVIEW *share* is now a real
+signal worth reading, not structural noise — expect it to drop toward the
+genuine-conflict rate (single digits).
+
+### Per-target keying (and why it needs no receiver change)
+
+Each fanned-out verdict becomes its own candidate row keyed
+`source_record_id = "<captureId>::<target>"` (the page slug for a placed verdict;
+the partition index for a placeless ADD). A single-topic capture keeps today's
+**bare** `captureId` (byte-identical to before). This one key makes the
+`(source_id, source_record_id, version)` unique constraint, the decision-log
+tuple, AND the techtris-brain receiver's branch name
+`promote/<provider>-<sha256("<source_id>|<source_record_id>")[:12]>` all **distinct
+per target** — so N verdicts from one capture become N ordinary, independent
+promotions. **The receiver is unchanged.** The `::` separator never occurs in a
+real provider record id or a path-like Brain slug.
+
+### Re-poll idempotency
+
+The trailing-window re-poll pre-check recognizes an already-consolidated capture
+by **either** the bare-id row **or** any `"<captureId>::"`-prefixed row, so a
+fanned-out capture is **never re-consolidated** — zero LLM calls on re-poll. (It
+is an indexed-friendly prefix `LIKE` with the captureId's LIKE metacharacters
+escaped; no migration, no `capture_id` column. Revisit only if it shows cost at
+scale.)
+
+### The recall knob
+
+A capture dominated by one topic must still carry a *second* topic's page into the
+candidate set, or that page can never be the UPDATE target. The Tier-1 candidate
+count `DEFAULT_TOP_K` was raised **5 → 10** (cap 12) for this. If a dominant-topic
+capture still misses a second page in practice, the deferred refinement is
+per-fact (per-cluster) embedding + search — measure top-K first.
