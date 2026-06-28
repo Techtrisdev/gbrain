@@ -14,7 +14,7 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
 import { isAvailable } from '../ai/gateway.ts';
-import { toRow, type ConnectorCandidateItem } from './candidate.ts';
+import { toRow, captureConsolidated, type ConnectorCandidateItem } from './candidate.ts';
 import { minimize, strip, type RawConnectorItem } from './redact.ts';
 import { recordConsolidationDecision } from './consolidation-decisions.ts';
 import type { ConsolidationClassifyResult } from './consolidate.ts';
@@ -236,10 +236,13 @@ export async function landRecords(
       redactions: [...(raw.redactions ?? []), ...min.redactions],
     };
 
-    const didWrite = consolidation
-      ? await landOneConsolidated(engine, sourceId, connector, candidate, consolidation)
-      : (await toRow(engine, candidate)).written;
-    if (didWrite) written += 1;
+    // The consolidation path may FAN OUT one capture into N candidate rows, so it
+    // returns the COUNT it wrote (not a boolean); the raw passthrough writes one.
+    if (consolidation) {
+      written += await landOneConsolidated(engine, sourceId, connector, candidate, consolidation);
+    } else if ((await toRow(engine, candidate)).written) {
+      written += 1;
+    }
   }
   return { written, total: records.length };
 }
@@ -290,12 +293,15 @@ async function loadConsolidation(engine: BrainEngine, sourceId: string): Promise
 }
 
 /**
- * Land ONE record through the consolidation pipeline. Returns whether a NEW row
- * was written (matching landRecords' `written` accounting). Degrade contract
- * (KTD4): the per-connector flag off / chat unavailable / U1 returns null → today's
- * raw passthrough; ANY non-abort throw (a poison capture, a transient backend
- * hiccup) is caught and degrades THIS record to raw passthrough so the batch
- * continues. AbortError propagates (graceful shutdown — never land mid-shutdown).
+ * Land ONE record through the consolidation pipeline. Returns the COUNT of NEW
+ * rows written for this record — `0` when skipped (idempotent re-poll), `1` for a
+ * raw passthrough or a single-verdict capture, and N for a multi-topic capture
+ * that FANS OUT into N targeted proposals (one per page it touches). Degrade
+ * contract (KTD4): the per-connector flag off / chat unavailable / U1 returns null
+ * → today's raw passthrough (1); ANY non-abort throw before persistence (a poison
+ * capture, a transient backend hiccup) is caught and degrades THIS record to raw
+ * passthrough so the batch continues. AbortError propagates (graceful shutdown —
+ * never land mid-shutdown).
  */
 async function landOneConsolidated(
   engine: BrainEngine,
@@ -303,25 +309,27 @@ async function landOneConsolidated(
   connector: SaaSConnector,
   candidate: ConnectorCandidateItem,
   deps: ConsolidationDeps,
-): Promise<boolean> {
+): Promise<number> {
   const provider = candidate.provider ?? connector.provider;
   const version = strip(candidate.version ?? '1');
+  const passthrough = async (): Promise<number> => ((await toRow(engine, candidate)).written ? 1 : 0);
   try {
     // Gate: per-connector flag (default false) + chat reachable. Either off →
     // today's raw passthrough (no DB pre-check, no LLM). The POLL-only structural
     // gate already held at the call site; this is the per-connector + availability
     // layer. extractConsolidationFacts re-checks both internally (defense in depth).
     if (!deps.enabled(provider, deps.sourceConfig) || !isAvailable('chat')) {
-      return (await toRow(engine, candidate)).written;
+      return await passthrough();
     }
 
-    // Idempotency pre-check: a re-poll of an already-landed record must NOT re-pay
-    // the LLM. Existing (source_id, source_record_id, version) tuple → skip
-    // entirely (no extraction, no new row, not counted). The classifier judgment
-    // recorded on the first poll stands (NOOP rows are status='rejected'; the
-    // decision log is keyed on the same tuple).
-    if (await candidateExists(engine, sourceId, candidate.source_record_id, version)) {
-      return false;
+    // Idempotency pre-check (KTD3, fan-out-aware): a re-poll of an already-
+    // consolidated CAPTURE must NOT re-pay the LLM. Under fan-out the capture lands
+    // under `<captureId>::<target>` rows (not the bare id), so this checks BOTH the
+    // bare-id row AND the `<captureId>::` prefix. A hit → skip entirely (no
+    // extraction, no new row, not counted); the first poll's verdicts + decision
+    // log stand.
+    if (await captureConsolidated(engine, sourceId, candidate.source_record_id, version)) {
+      return 0;
     }
 
     // U1 → U2. extract reads the REDACTED capture summary (proposed_markdown,
@@ -330,48 +338,107 @@ async function landOneConsolidated(
     const extracted = await deps.extract({ captureText, provider, sourceConfig: deps.sourceConfig, engine });
     if (!extracted) {
       // U1 degrade (flag off / chat down / empty / malformed) → raw passthrough.
-      return (await toRow(engine, candidate)).written;
+      return await passthrough();
     }
-    const verdict = await deps.classify({
+    const verdicts = await deps.classify({
       facts: extracted.facts,
       extractionConfidence: extracted.confidence,
       provider,
       sourceConfig: deps.sourceConfig,
       engine,
     });
-    if (!verdict) {
+    if (!verdicts) {
       // Only the disabled-connector entry gate returns null here (already gated
       // above) — defensive: degrade to raw passthrough.
-      return (await toRow(engine, candidate)).written;
+      return await passthrough();
     }
 
-    return await persistConsolidated(engine, sourceId, candidate, version, verdict, deps.surfaceMinConfidence);
+    const written = await persistConsolidated(
+      engine, sourceId, candidate, version, verdicts, deps.surfaceMinConfidence,
+    );
+    // If the fan-out landed NOTHING (every verdict's toRow threw or conflicted),
+    // preserve the capture via today's raw passthrough — idempotent, so a conflict
+    // is a no-op. A normal consolidation always writes ≥1 row, so this never
+    // double-writes alongside a successful fan-out.
+    return written > 0 ? written : await passthrough();
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
     // KTD4 degrade: any other throw isolates to THIS record. Throws reach here only
-    // from the PRE-persist steps (pre-check / extract / classify / single-writer
-    // lookup / the consolidated toRow itself) — the consolidated row was never
-    // written — so this raw candidate genuinely lands (idempotent), the capture is
-    // not lost, and the batch continues. The POST-persist decision-log write is
-    // non-fatal (handled inside persistConsolidated), so it never re-degrades an
-    // already-persisted consolidated row to a raw passthrough.
-    return (await toRow(engine, candidate)).written;
+    // from the PRE-persist steps (pre-check / extract / classify) — no consolidated
+    // row was written — so this raw candidate genuinely lands (idempotent), the
+    // capture is not lost, and the batch continues. Per-verdict persistence throws
+    // are contained INSIDE persistConsolidated (a poison verdict degrades only
+    // itself), and the decision-log write is non-fatal there, so neither re-degrades
+    // an already-persisted consolidated row to a raw passthrough.
+    return await passthrough();
   }
 }
 
 /**
- * Persist a classified candidate: map the verdict onto the row columns (KTD6),
- * enforce single-writer-per-page for UPDATE (KTD9), and write the decision-log row.
- * The merged body / timeline line flow through toRow's strip() (redaction invariant).
+ * Persist a classified capture by FANNING OUT its verdicts: each verdict becomes
+ * its own candidate row with a distinct, collision-free `source_record_id` (KTD2),
+ * its own single-writer-per-page guard, and its own decision-log row. Returns the
+ * COUNT of rows actually inserted across the fan-out.
+ *
+ * A single-verdict capture keeps today's BARE captureId (byte-compatible with v1 +
+ * the common single-topic case); a multi-topic capture keys each row
+ * `<captureId>::<target>`. Per-verdict isolation: a poison verdict (a toRow throw)
+ * degrades only itself — its siblings still land. AbortError propagates.
  */
 async function persistConsolidated(
   engine: BrainEngine,
   sourceId: string,
   candidate: ConnectorCandidateItem,
   version: string,
-  verdict: ConsolidationClassifyResult,
+  verdicts: ConsolidationClassifyResult[],
   surfaceMinConfidence: number,
-): Promise<boolean> {
+): Promise<number> {
+  const captureId = candidate.source_record_id;
+  const fanOut = verdicts.length > 1;
+  let written = 0;
+  for (const [index, verdict] of verdicts.entries()) {
+    try {
+      written += await persistOneVerdict(
+        engine, sourceId, candidate, captureId, version, verdict, index, fanOut, surfaceMinConfidence,
+      );
+    } catch (err) {
+      if (isAbortError(err)) throw err; // graceful shutdown still propagates.
+      // Per-verdict isolation: this verdict's row INSERT threw — log + skip it; the
+      // sibling verdicts (already written or still to come) are unaffected.
+      console.error(
+        `[consolidation] fan-out verdict persist failed for ` +
+          `${sourceId}/${fanoutRecordId(captureId, verdict, index, fanOut)} (${verdict.classification}): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  return written;
+}
+
+/**
+ * Persist ONE fanned-out verdict: derive its per-target `source_record_id` (KTD2),
+ * map the verdict onto the row columns (KTD6), enforce single-writer-per-page for
+ * UPDATE (KTD9), and write the per-target decision-log row. The merged body /
+ * timeline line flow through toRow's strip() (redaction invariant). Returns 1 if a
+ * new row was inserted, else 0 (ON CONFLICT — e.g. a duplicate target key).
+ */
+async function persistOneVerdict(
+  engine: BrainEngine,
+  sourceId: string,
+  candidate: ConnectorCandidateItem,
+  captureId: string,
+  version: string,
+  verdict: ConsolidationClassifyResult,
+  index: number,
+  fanOut: boolean,
+  surfaceMinConfidence: number,
+): Promise<number> {
+  const recordId = fanoutRecordId(captureId, verdict, index, fanOut);
+  // Re-key the per-target row only when fanning out (recordId === captureId for a
+  // single-verdict capture → reuse the base item unchanged, byte-identical to v1).
+  const base: ConnectorCandidateItem =
+    recordId === captureId ? candidate : { ...candidate, source_record_id: recordId };
+
   let final = verdict;
   // Resolve the classifier's target SLUG → the receiver repo path (`<slug>.md`),
   // only for a clean single-target UPDATE.
@@ -381,32 +448,34 @@ async function persistConsolidated(
       : null;
 
   // Single-writer-per-page (KTD9 inverse): if another pending-or-accepted
-  // update_page already targets this page, downgrade THIS record to NEEDS_REVIEW so
+  // update_page already targets this page, downgrade THIS verdict to NEEDS_REVIEW so
   // two clean merges sharing one base_compiled_hash can't clobber each other. The
-  // lookup is non-indexed + non-atomic, but SAFE for the sequential poller (record
-  // N-1's row is committed + visible to record N's check); the receiver's
-  // base_compiled_hash guard backstops the rare concurrent-poll double-writer.
+  // lookup is non-indexed + non-atomic, but SAFE for the sequential poller (a prior
+  // row is committed + visible to a later check); the receiver's base_compiled_hash
+  // guard backstops the rare concurrent-poll double-writer. The guard is per TARGET,
+  // so two captures racing one page collapse to one, while a fan-out's distinct
+  // targets each proceed independently.
   if (resolvedPath && (await hasInflightUpdatePage(engine, resolvedPath))) {
     final = { ...verdict, classification: 'NEEDS_REVIEW' };
   }
 
-  const item = buildConsolidatedItem(candidate, final, resolvedPath, surfaceMinConfidence);
+  const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence);
   const { written } = await toRow(engine, item);
 
-  // Durable decision log (audit + Tier-1 calibration), keyed on the tuple +
-  // classification (idempotent). Records the FINAL classification — what the row
-  // actually became, including a single-writer downgrade.
+  // Durable decision log (audit + Tier-1 calibration), keyed on the per-target
+  // (source_id, source_record_id, version) tuple + classification (idempotent).
+  // Records the FINAL classification — what the row actually became, including a
+  // single-writer downgrade.
   //
   // NON-FATAL: the consolidated candidate row above is ALREADY committed. A
-  // decision-log failure must NOT propagate to landOneConsolidated's outer catch —
-  // that catch is for PRE-persist throws and re-runs toRow(candidate), which here
-  // would be a no-op (ON CONFLICT) but would mislabel a successfully-consolidated
-  // row as a "raw passthrough". Worst case on failure is a lost audit row — never a
-  // re-degraded or duplicated candidate. (AbortError still propagates for shutdown.)
+  // decision-log failure must NOT propagate to persistConsolidated's per-verdict
+  // catch, which would otherwise log it as a "verdict persist failure" even though
+  // the candidate row landed fine. Worst case on failure is a lost audit row —
+  // never a re-degraded or duplicated candidate. (AbortError still propagates.)
   try {
     await recordConsolidationDecision(engine, {
       sourceId,
-      sourceRecordId: candidate.source_record_id,
+      sourceRecordId: recordId,
       version,
       classification: final.classification,
       confidence: final.confidence,
@@ -417,12 +486,40 @@ async function persistConsolidated(
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown still propagates.
     console.error(
-      `[consolidation] decision-log write failed for ${sourceId}/${candidate.source_record_id} ` +
+      `[consolidation] decision-log write failed for ${sourceId}/${recordId} ` +
         `(${final.classification}) — candidate row persisted, audit row dropped: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  return written;
+  return written ? 1 : 0;
+}
+
+/**
+ * The per-target `source_record_id` for a fanned-out verdict (KTD2) — the keying
+ * spine that makes the `(source_id, source_record_id, version)` unique constraint,
+ * the decision-log tuple, AND the receiver's branch name
+ * `sha256(source_id|source_record_id)` all distinct per target, so N verdicts from
+ * one capture become N independent, independently-promotable proposals with NO
+ * receiver change (KTD4).
+ *
+ *  - Single-verdict capture (`!fanOut`) → today's BARE captureId (byte-identical to
+ *    v1; also the `= '<captureId>'` idempotency anchor in {@link captureConsolidated}).
+ *  - Fan-out → `<captureId>::<discriminator>`: the page slug for a placed verdict
+ *    (UPDATE, or a NEEDS_REVIEW the model placed), else the partition INDEX for a
+ *    placeless verdict (ADD / NOOP / unplaced). The `::` separator never occurs in a
+ *    real provider captureId (record ids are opaque tokens) or a Brain slug
+ *    (path-like `[a-z0-9/_.-]`, no colon) — so the key is unambiguous.
+ */
+function fanoutRecordId(
+  captureId: string,
+  verdict: ConsolidationClassifyResult,
+  index: number,
+  fanOut: boolean,
+): string {
+  if (!fanOut) return captureId;
+  const slug = verdict.target_path?.trim();
+  const discriminator = slug && slug.length > 0 ? slug : String(index);
+  return `${captureId}::${discriminator}`;
 }
 
 /** TTL for a SURFACED (pending) consolidation candidate — 30 days (U3/KTD3). An
@@ -527,25 +624,6 @@ function buildConsolidatedItem(
  */
 function slugToRepoPath(slug: string): string {
   return slug.endsWith('.md') ? slug : `${slug}.md`;
-}
-
-/** Does a candidate with this exact (source, record, version) tuple already exist?
- *  Used as the idempotency pre-check so a re-poll never re-pays the LLM. */
-async function candidateExists(
-  engine: BrainEngine,
-  sourceId: string,
-  sourceRecordId: string,
-  version: string,
-): Promise<boolean> {
-  const rows = await engine.executeRaw<{ one: number }>(
-    // The leading SQL comment is a stable in-statement marker (observability / tests).
-    `-- consolidation-idempotency-precheck
-     SELECT 1 AS one FROM connector_candidates
-      WHERE source_id = $1 AND source_record_id = $2 AND version = $3
-      LIMIT 1`,
-    [sourceId, sourceRecordId, version],
-  );
-  return rows.length > 0;
 }
 
 /** Is a pending-or-accepted `update_page` candidate already in flight for this

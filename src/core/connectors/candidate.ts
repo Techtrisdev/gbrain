@@ -330,6 +330,53 @@ export async function toRow(
   return { written: true, row: rows[0] };
 }
 
+/**
+ * Has this CAPTURE already been consolidated? (KTD3 — re-poll idempotency under
+ * multi-topic fan-out.)
+ *
+ * Before fan-out, a consolidated capture always landed under its bare `captureId`,
+ * so the re-poll pre-check was a plain `(source_id, source_record_id, version)`
+ * existence test. Under fan-out a multi-topic capture no longer carries the bare
+ * id — it decomposes into rows keyed `<captureId>::<target>` (KTD2). So the
+ * pre-check must recognize EITHER:
+ *   - the bare-id row (single-verdict / raw-passthrough case), OR
+ *   - any fanned-out row whose `source_record_id` starts `<captureId>::`.
+ *
+ * The prefix test is an indexed-friendly `LIKE '<captureId>::%'`: the existing
+ * `(source_id, source_record_id, version)` unique index serves the `source_id` +
+ * `version` equality, and the per-source candidate set is small, so the residual
+ * `source_record_id` scan is cheap — NO migration and NO `capture_id` column
+ * needed (OQ2; revisit only if this shows cost at scale). LIKE metacharacters in
+ * the captureId (`\ % _`) are escaped so an id like `not_abc` is matched
+ * literally, not as a wildcard.
+ *
+ * Contract: a capture consolidated once is never re-consolidated on a re-poll —
+ * zero classify/LLM calls for it. Returns true iff ≥1 such candidate row exists.
+ */
+export async function captureConsolidated(
+  engine: BrainEngine,
+  sourceId: string,
+  captureId: string,
+  version: string,
+): Promise<boolean> {
+  const likePattern = `${escapeLikePattern(captureId)}::%`;
+  const rows = await engine.executeRaw<{ one: number }>(
+    // The leading SQL comment is a stable in-statement marker (observability / tests).
+    `-- consolidation-idempotency-precheck
+     SELECT 1 AS one FROM connector_candidates
+      WHERE source_id = $1 AND version = $3
+        AND (source_record_id = $2 OR source_record_id LIKE $4 ESCAPE '\\')
+      LIMIT 1`,
+    [sourceId, captureId, version, likePattern],
+  );
+  return rows.length > 0;
+}
+
+/** Escape SQL-LIKE wildcards (`\ % _`) so the value matches verbatim under `ESCAPE '\'`. */
+function escapeLikePattern(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => `\\${c}`);
+}
+
 // ── Review queue (TECH-2036): list + act on pending candidates ────────────────────
 //
 // The admin review queue (admin/src/pages/ReviewQueue.tsx) and its agent-callable

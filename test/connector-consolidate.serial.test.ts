@@ -60,6 +60,7 @@ import {
   parseConsolidationClassifyJson,
   compiledTruthHash,
   CONSOLIDATION_CLASSIFY_SYSTEM,
+  type ConsolidationClassifyResult,
 } from '../src/core/connectors/consolidate.ts';
 
 let pglite: PGLiteEngine;
@@ -853,6 +854,18 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     });
   }
 
+  /**
+   * Assert the classifier returned a 1-element verdict LIST (the back-compat /
+   * single-topic shape) and return that one verdict. The classifier is now a
+   * multi-topic fan-out: it always returns a list (or null at the disabled gate).
+   * Tests that exercise a single-verdict path use this to read the lone verdict.
+   */
+  function only(r: ConsolidationClassifyResult[] | null): ConsolidationClassifyResult {
+    expect(r).not.toBeNull();
+    expect(r!.length).toBe(1);
+    return r![0];
+  }
+
   afterEach(() => {
     __setChatTransportForTests(null);
     __setEmbedTransportForTests(null);
@@ -873,7 +886,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     configureEmbedding();
     const { calls } = stubChat('{"classification":"ADD"}');
     const { engine, searchCalls } = makeEngine({ hits: [fakeHit('p', 0.99)] });
-    const r = await callClassify(engine, { facts: [], extractionConfidence: 0.71 });
+    const r = only(await callClassify(engine, { facts: [], extractionConfidence: 0.71 }));
     expect(r).not.toBeNull();
     expect(r!.classification).toBe('NOOP');
     expect(r!.confidence).toBe(0.71); // carried from extraction
@@ -888,7 +901,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     configureEmbedding();
     const { calls } = stubChat('{"classification":"UPDATE","targets":["x"]}');
     const { engine } = makeEngine({ hits: [fakeHit('people/acme', 0.97), fakeHit('other', 0.4)] });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NOOP');
     expect(r!.tier1_cosine).toBe(0.97);
     expect(r!.model).toBeNull(); // no LLM ran
@@ -902,7 +915,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('people/acme', 0.5)],
       pages: { 'people/acme': fakePage('people/acme', 'Acme is a customer.') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(calls.length).toBe(1); // escalated
     expect(r!.classification).toBe('NOOP');
     expect(r!.tier1_cosine).toBe(0.5);
@@ -913,7 +926,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     configureEmbedding();
     const { calls } = stubChat('{"classification":"ADD","confidence":0.9}');
     const { engine } = makeEngine({ hits: [fakeHit('people/acme', 0.08)] });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     // floor defaults to null → escalate, NOT a Tier-1 auto-ADD.
     expect(calls.length).toBe(1);
     expect(r!.classification).toBe('ADD'); // ADD came from the LLM, not the floor
@@ -927,7 +940,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('people/acme', 0.08)],
       config: { 'connectors.consolidation_add_cosine_floor': '0.2' },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('ADD');
     expect(r!.model).toBeNull(); // Tier-1 fast-path, no LLM
     expect(calls.length).toBe(0);
@@ -940,7 +953,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('people/acme', 0.6)],
       config: { 'connectors.consolidation_noop_cosine': '0.5' },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NOOP'); // 0.6 ≥ configured 0.5
     expect(calls.length).toBe(0);
   });
@@ -968,7 +981,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('people/acme', 0.8)],
       pages: { 'people/acme': fakePage('people/acme', 'Acme.') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).not.toBe('NOOP'); // escalated, not buried
     expect(r!.tier1_cosine).toBe(0.8); // the PURE cosine, not 0.96
     expect(calls.length).toBe(1); // Tier 2 ran
@@ -995,7 +1008,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('capture/raw-note', 0.99, 'capture-events')],
       pages: { 'capture/raw-note': fakePage('capture/raw-note', 'raw', 'capture-events') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).not.toBe('NOOP'); // no dedup against non-durable content
     expect(r!.classification).not.toBe('UPDATE'); // and never an UPDATE target
     expect(getPageCalls).toEqual([]); // the capture-events page was never resolved
@@ -1010,7 +1023,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       pages: { 'people/acme': fakePage('people/acme', 'Acme.', 'tenant-x') },
       config: { 'connectors.consolidation_search_source': 'tenant-x' },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(searchOpts[0].sourceId).toBe('tenant-x');
     expect(r!.classification).toBe('NOOP'); // the tenant-x hit was in scope
   });
@@ -1043,7 +1056,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.55, 'shared'), fakeHit('clients/acme', 0.5, 'shared')],
       pages: { 'clients/acme': fakePage('clients/acme', targetBody, 'shared') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('UPDATE');
     expect(r!.target_path).toBe('clients/acme');
     expect(r!.merged_body).toContain('SIGNED (Q3)');
@@ -1072,7 +1085,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.base_compiled_hash).toBeNull();
     expect(r!.merged_body).toBeNull();
@@ -1094,7 +1107,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', body) },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('UPDATE');
     expect(r!.merged_body).toContain('## Citations');
   });
@@ -1115,7 +1128,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', body) },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.base_compiled_hash).toBeNull();
   });
@@ -1145,7 +1158,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
         hits: [fakeHit('clients/acme', 0.5)],
         pages: { 'clients/acme': fakePage('clients/acme', targetWithBareCitations) },
       });
-      const r = await callClassify(engine);
+      const r = only(await callClassify(engine));
       expect(r!.classification).toBe('NEEDS_REVIEW');
     });
   }
@@ -1166,7 +1179,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', targetWithBareCitations) },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('UPDATE');
   });
 
@@ -1177,12 +1190,17 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NEEDS_REVIEW');
   });
 
   // ── Tier 2: multi-target + NEEDS_REVIEW + degrade ──────────────────────────
-  test('facts resolving to > 1 distinct target → NEEDS_REVIEW (KTD9, single-target v1)', async () => {
+  // A SINGLE verdict object naming >1 page is malformed under the fan-out contract
+  // (each partition concerns exactly ONE page; multi-page captures fan out across
+  // ARRAY ELEMENTS, not by stuffing slugs into one verdict). That one verdict →
+  // NEEDS_REVIEW. (The real multi-topic path — the model emitting a LIST of
+  // verdicts — is covered by the fan-out tests below.)
+  test('a single verdict naming > 1 distinct page → that partition NEEDS_REVIEW (per-verdict guard)', async () => {
     configureEmbedding();
     stubChat(
       JSON.stringify({
@@ -1200,7 +1218,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
         'people/jane': fakePage('people/jane', 'Jane body.'),
       },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.base_compiled_hash).toBeNull();
   });
@@ -1212,7 +1230,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.confidence).toBe(0.45);
   });
@@ -1221,11 +1239,11 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     configureEmbedding();
     stubChat(JSON.stringify({ classification: 'ADD', confidence: 1.9 }));
     const { engine } = makeEngine({ hits: [fakeHit('clients/acme', 0.5)] });
-    const r1 = await callClassify(engine);
+    const r1 = only(await callClassify(engine));
     expect(r1!.confidence).toBe(1);
 
     stubChat(JSON.stringify({ classification: 'ADD', confidence: -0.5 }));
-    const r2 = await callClassify(engine);
+    const r2 = only(await callClassify(engine));
     expect(r2!.confidence).toBe(0);
   });
 
@@ -1236,7 +1254,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.') },
     });
-    const r = await callClassify(engine);
+    const r = only(await callClassify(engine));
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.confidence).toBeGreaterThanOrEqual(0);
     expect(r!.confidence).toBeLessThanOrEqual(1);
@@ -1250,7 +1268,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     configureEmbedding();
     __setChatTransportForTests(null); // explicit: chat is UNAVAILABLE for this test
     const { engine } = makeEngine({ hits: [fakeHit('clients/acme', 0.5)] });
-    const r = await callClassify(engine, { model: undefined }); // model resolves ONLY past the chat-available guard
+    const r = only(await callClassify(engine, { model: undefined })); // model resolves ONLY past the chat-available guard
     expect(r!.classification).toBe('NEEDS_REVIEW');
     expect(r!.model).toBeNull(); // null ⇒ no Tier-2 chat call was attempted (contract)
     expect(r!.tier1_cosine).toBe(0.5);
@@ -1286,37 +1304,271 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       hits: [fakeHit('clients/acme', 0.5)],
       pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.') },
     });
-    const r = await callClassify(engine, { model: undefined });
+    const r = only(await callClassify(engine, { model: undefined }));
     expect(r!.classification).toBe('NOOP');
     expect(r!.model).toBe('anthropic:claude-sonnet-4-6'); // consolidationModel fallback
+  });
+
+  // ── Multi-topic FAN-OUT: the model partitions facts → a LIST of verdicts ────
+  test('2-topic capture → 2 UPDATE verdicts, each with its own target + base_compiled_hash, no NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    const acmeBody = 'Acme is a Series B customer.\n\nRenewal: pending.';
+    const oloBody = 'Olo webhook integration.\n\nContract: v1.';
+    stubChat(
+      JSON.stringify([
+        {
+          classification: 'UPDATE',
+          target: 'clients/acme',
+          merged_body: 'Acme is a Series B customer.\n\nRenewal: SIGNED (Q3).',
+          timeline_entry: '2026-06-27 — Acme renewal signed.',
+          confidence: 0.84,
+        },
+        {
+          classification: 'UPDATE',
+          target: 'integrations/olo',
+          merged_body: 'Olo webhook integration.\n\nContract: v2 (breaking).',
+          timeline_entry: '2026-06-27 — Olo webhook contract changed to v2.',
+          confidence: 0.8,
+        },
+      ]),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.55, 'shared'), fakeHit('integrations/olo', 0.5, 'shared')],
+      pages: {
+        'clients/acme': fakePage('clients/acme', acmeBody, 'shared'),
+        'integrations/olo': fakePage('integrations/olo', oloBody, 'shared'),
+      },
+    });
+    const r = await callClassify(engine, { facts: ['Acme signed', 'Olo webhook changed'] });
+    expect(r).not.toBeNull();
+    expect(r!.length).toBe(2);
+    expect(r!.every((v) => v.classification === 'UPDATE')).toBe(true);
+    const acme = r!.find((v) => v.target_path === 'clients/acme')!;
+    const olo = r!.find((v) => v.target_path === 'integrations/olo')!;
+    expect(acme.base_compiled_hash).toBe(compiledTruthHash(acmeBody));
+    expect(olo.base_compiled_hash).toBe(compiledTruthHash(oloBody));
+    expect(acme.base_compiled_hash).not.toBe(olo.base_compiled_hash);
+    expect(r!.some((v) => v.classification === 'NEEDS_REVIEW')).toBe(false);
+  });
+
+  test('mixed fan-out: one fact updates an existing page, one is novel → [UPDATE, ADD]', async () => {
+    configureEmbedding();
+    const acmeBody = 'Acme is a customer.';
+    stubChat(
+      JSON.stringify([
+        {
+          classification: 'UPDATE',
+          target: 'clients/acme',
+          merged_body: 'Acme is a customer. Renewal signed.',
+          timeline_entry: '2026-06-27 — Renewal signed.',
+          confidence: 0.82,
+        },
+        { classification: 'ADD', target: 'projects/new-thing', confidence: 0.9 },
+      ]),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', acmeBody, 'shared') },
+    });
+    const r = await callClassify(engine);
+    expect(r!.length).toBe(2);
+    expect(r!.map((v) => v.classification)).toEqual(['UPDATE', 'ADD']);
+    expect(r![0].target_path).toBe('clients/acme');
+    // ADD carries no resolved UPDATE target (target_path null) — it stays reviewer-driven.
+    expect(r![1].target_path).toBeNull();
+  });
+
+  test('partial fan-out: one partition contradicts (NEEDS_REVIEW), the sibling still UPDATEs', async () => {
+    configureEmbedding();
+    stubChat(
+      JSON.stringify([
+        {
+          classification: 'UPDATE',
+          target: 'clients/acme',
+          merged_body: 'Acme updated.',
+          timeline_entry: '2026-06-27 — Updated.',
+          confidence: 0.8,
+        },
+        { classification: 'NEEDS_REVIEW', target: 'integrations/olo', confidence: 0.4 },
+      ]),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.55, 'shared'), fakeHit('integrations/olo', 0.5, 'shared')],
+      pages: {
+        'clients/acme': fakePage('clients/acme', 'Acme.', 'shared'),
+        'integrations/olo': fakePage('integrations/olo', 'Olo.', 'shared'),
+      },
+    });
+    const r = await callClassify(engine);
+    expect(r!.length).toBe(2);
+    expect(r![0].classification).toBe('UPDATE'); // sibling proceeds
+    expect(r![1].classification).toBe('NEEDS_REVIEW'); // contradiction held back
+  });
+
+  test('a hallucinated target in ONE fan-out verdict → that verdict NEEDS_REVIEW, the sibling is unaffected', async () => {
+    configureEmbedding();
+    stubChat(
+      JSON.stringify([
+        {
+          classification: 'UPDATE',
+          target: 'clients/acme',
+          merged_body: 'Acme updated.',
+          timeline_entry: '2026-06-27 — Updated.',
+          confidence: 0.8,
+        },
+        {
+          classification: 'UPDATE',
+          target: 'clients/does-not-exist', // not in the candidate set
+          merged_body: 'ghost',
+          timeline_entry: '2026-06-27 — x',
+          confidence: 0.9,
+        },
+      ]),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme.', 'shared') },
+    });
+    const r = await callClassify(engine);
+    expect(r!.length).toBe(2);
+    expect(r![0].classification).toBe('UPDATE');
+    expect(r![0].target_path).toBe('clients/acme');
+    expect(r![1].classification).toBe('NEEDS_REVIEW'); // hallucinated sibling
+    expect(r![1].base_compiled_hash).toBeNull();
+  });
+
+  test('a dropped ## Citations in one fan-out verdict → that verdict NEEDS_REVIEW, sibling proceeds', async () => {
+    configureEmbedding();
+    const cited = 'Acme.\n\n## Citations\n- [m](meetings/acme.md)';
+    stubChat(
+      JSON.stringify([
+        {
+          classification: 'UPDATE',
+          target: 'clients/acme',
+          merged_body: 'Acme updated — citations dropped.',
+          timeline_entry: '2026-06-27 — Updated.',
+          confidence: 0.8,
+        },
+        {
+          classification: 'UPDATE',
+          target: 'integrations/olo',
+          merged_body: 'Olo updated.',
+          timeline_entry: '2026-06-27 — Updated.',
+          confidence: 0.8,
+        },
+      ]),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.55, 'shared'), fakeHit('integrations/olo', 0.5, 'shared')],
+      pages: {
+        'clients/acme': fakePage('clients/acme', cited, 'shared'),
+        'integrations/olo': fakePage('integrations/olo', 'Olo.', 'shared'),
+      },
+    });
+    const r = await callClassify(engine);
+    const acme = r!.find((v) => v.target_path === 'clients/acme' || v.classification === 'NEEDS_REVIEW');
+    const olo = r!.find((v) => v.target_path === 'integrations/olo');
+    expect(acme!.classification).toBe('NEEDS_REVIEW'); // provenance-stripping rewrite held back
+    expect(olo!.classification).toBe('UPDATE'); // clean sibling proceeds
+  });
+
+  test('back-compat: a single bare object (v1 shape) → a 1-element verdict list', async () => {
+    configureEmbedding();
+    stubChat(
+      JSON.stringify({
+        classification: 'UPDATE',
+        targets: ['clients/acme'],
+        merged_body: 'Acme updated.',
+        timeline_entry: '2026-06-27 — Updated.',
+        confidence: 0.8,
+      }),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme.', 'shared') },
+    });
+    const r = await callClassify(engine);
+    expect(r!.length).toBe(1);
+    expect(r![0].classification).toBe('UPDATE');
+    expect(r![0].target_path).toBe('clients/acme');
+  });
+
+  test('the model emits a genuinely empty array for non-empty facts → a single NOOP (capture lands, idempotency-recorded)', async () => {
+    configureEmbedding();
+    stubChat('[]');
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme.', 'shared') },
+    });
+    const r = await callClassify(engine);
+    expect(r!.length).toBe(1);
+    expect(r![0].classification).toBe('NOOP');
   });
 });
 
 // ── 8. U2 — classifier output parser (parseConsolidationClassifyJson) ──────────
 
-describe('parseConsolidationClassifyJson — U2 robust output parse', () => {
-  test('strips ```json fences and parses a full UPDATE', () => {
+describe('parseConsolidationClassifyJson — U2 robust output parse (fan-out: returns a LIST)', () => {
+  test('strips ```json fences and parses a bare object as a 1-element list (back-compat)', () => {
     const p = parseConsolidationClassifyJson(
       '```json\n{"classification":"UPDATE","targets":["a"],"merged_body":"b","timeline_entry":"c","confidence":0.5}\n```',
     );
-    expect(p).toEqual({
-      classification: 'UPDATE',
-      targets: ['a'],
-      merged_body: 'b',
-      timeline_entry: 'c',
-      confidence: 0.5,
-    });
+    expect(p).toEqual([
+      {
+        classification: 'UPDATE',
+        targets: ['a'],
+        merged_body: 'b',
+        timeline_entry: 'c',
+        confidence: 0.5,
+      },
+    ]);
   });
 
-  test('classification is case-insensitive and tolerates synonyms', () => {
-    expect(parseConsolidationClassifyJson('{"classification":"add"}')!.classification).toBe('ADD');
-    expect(parseConsolidationClassifyJson('{"classification":"DUPLICATE"}')!.classification).toBe('NOOP');
-    expect(parseConsolidationClassifyJson('{"classification":"needs-review"}')!.classification).toBe('NEEDS_REVIEW');
+  test('a top-level JSON ARRAY of verdicts parses to a multi-element list', () => {
+    const p = parseConsolidationClassifyJson(
+      '[{"classification":"UPDATE","target":"clients/acme","merged_body":"b","timeline_entry":"t","confidence":0.8},' +
+        '{"classification":"ADD","target":"projects/x","confidence":0.9}]',
+    );
+    expect(p!.length).toBe(2);
+    expect(p![0].classification).toBe('UPDATE');
+    expect(p![0].targets).toEqual(['clients/acme']); // singular `target` collected
+    expect(p![1].classification).toBe('ADD');
+    expect(p![1].targets).toEqual(['projects/x']);
   });
 
-  test('targets collected from the array AND a singular target_path', () => {
-    expect(parseConsolidationClassifyJson('{"classification":"UPDATE","targets":["a","b"]}')!.targets).toEqual(['a', 'b']);
-    expect(parseConsolidationClassifyJson('{"classification":"UPDATE","target_path":"solo"}')!.targets).toEqual(['solo']);
+  test('an embedded array wrapped in prose is extracted', () => {
+    const p = parseConsolidationClassifyJson(
+      'Here are the verdicts: [{"classification":"NOOP"},{"classification":"add"}] — done.',
+    );
+    expect(p!.length).toBe(2);
+    expect(p![0].classification).toBe('NOOP');
+    expect(p![1].classification).toBe('ADD');
+  });
+
+  test('an array with one invalid element drops only that element', () => {
+    const p = parseConsolidationClassifyJson(
+      '[{"classification":"UPDATE","target":"a"},{"classification":"FROBNICATE"},{"classification":"NOOP"}]',
+    );
+    expect(p!.length).toBe(2);
+    expect(p!.map((v) => v.classification)).toEqual(['UPDATE', 'NOOP']);
+  });
+
+  test('a genuinely empty array → [] (caller maps to NOOP); items-but-none-valid → null', () => {
+    expect(parseConsolidationClassifyJson('[]')).toEqual([]);
+    // every element invalid → null (degrade to NEEDS_REVIEW), NOT an empty list.
+    expect(parseConsolidationClassifyJson('[{"classification":"FROBNICATE"}]')).toBeNull();
+  });
+
+  test('classification is case-insensitive and tolerates synonyms (per element)', () => {
+    expect(parseConsolidationClassifyJson('{"classification":"add"}')![0].classification).toBe('ADD');
+    expect(parseConsolidationClassifyJson('{"classification":"DUPLICATE"}')![0].classification).toBe('NOOP');
+    expect(parseConsolidationClassifyJson('{"classification":"needs-review"}')![0].classification).toBe('NEEDS_REVIEW');
+  });
+
+  test('targets collected from the array, a singular target_path, AND a singular target', () => {
+    expect(parseConsolidationClassifyJson('{"classification":"UPDATE","targets":["a","b"]}')![0].targets).toEqual(['a', 'b']);
+    expect(parseConsolidationClassifyJson('{"classification":"UPDATE","target_path":"solo"}')![0].targets).toEqual(['solo']);
+    expect(parseConsolidationClassifyJson('{"classification":"UPDATE","target":"one"}')![0].targets).toEqual(['one']);
   });
 
   test('missing / unrecognized classification → null', () => {
@@ -1326,11 +1578,11 @@ describe('parseConsolidationClassifyJson — U2 robust output parse', () => {
     expect(parseConsolidationClassifyJson('not json')).toBeNull();
   });
 
-  test('non-string merged_body/timeline_entry and bad confidence become null', () => {
+  test('non-string merged_body/timeline_entry and bad confidence become null (per element)', () => {
     const p = parseConsolidationClassifyJson('{"classification":"UPDATE","targets":["a"],"merged_body":123,"confidence":"high"}');
-    expect(p!.merged_body).toBeNull();
-    expect(p!.timeline_entry).toBeNull();
-    expect(p!.confidence).toBeNull();
+    expect(p![0].merged_body).toBeNull();
+    expect(p![0].timeline_entry).toBeNull();
+    expect(p![0].confidence).toBeNull();
   });
 });
 
