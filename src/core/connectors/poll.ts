@@ -56,6 +56,13 @@ export interface ConnectorSourceRow {
 export interface ConnectorEntryConfig {
   /** Off by default — a configured-but-not-enabled connector is never polled. */
   enabled?: boolean;
+  /**
+   * Memory Consolidation Engine (U6): opt-in per-connector consolidation
+   * (extract → classify → pre-compute the promotion target). Off by default;
+   * gated ON TOP OF `enabled` + the kill-switch, never a bypass. Read via
+   * `consolidationEnabled()` in connectors/consolidation-config.ts.
+   */
+  consolidation_enabled?: boolean;
   /** Provider key (defaults to the map key when absent). */
   provider?: string;
   /** Pagination cursor / watermark — the connector's resume anchor. */

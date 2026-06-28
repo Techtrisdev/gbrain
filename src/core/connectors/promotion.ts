@@ -23,8 +23,13 @@
  *    keyed by PROMOTION_HMAC_SECRET (utf-8 bytes).
  *  - The artifact has EXACTLY 5 top-level keys (the Brain's validate_artifact fails closed
  *    on BOTH missing and unknown keys): provider, source_id, source_record_id,
- *    redaction_attestation, target. target has EXACTLY 4 keys: mode, path, timeline_entry,
- *    body. gbrain does NOT compute the PR branch (the Brain derives it).
+ *    redaction_attestation, target. `target` is MODE-DEPENDENT (the Brain's validate_artifact
+ *    is mode-aware): inbox/existing_page carry EXACTLY 4 keys (mode, path, timeline_entry,
+ *    body); update_page carries EXACTLY 5 (those + base_compiled_hash, the KTD8 compiled-truth
+ *    staleness hash — REQUIRED iff update_page, FORBIDDEN otherwise). base_compiled_hash is
+ *    OMITTED (never null) for the 4-key modes — JSON.stringify drops an absent key but KEEPS a
+ *    null, so a null would land in the receiver's t_unknown and reject. gbrain does NOT compute
+ *    the PR branch (the Brain derives it).
  *  - canonicalizeArtifactForSigning is deterministic: sorted keys (recursively), no
  *    insignificant whitespace, so the same artifact always yields the same bytes.
  *    artifact_hash (stored, idempotency) = lowercase hex sha256 of that canonical string.
@@ -43,19 +48,38 @@ import { mintAppJwt } from './github-app-jwt.ts';
 
 // ── The locked artifact shape ────────────────────────────────────────────────────
 
-/** Reviewer-selected promotion target. `existing_page` requires a non-empty path. */
+/**
+ * The promotion target. `existing_page`/`inbox` are reviewer-selected; `update_page` is the
+ * MACHINE-pre-computed Memory-Consolidation UPDATE target — its `path`, `timeline_entry`, and
+ * `base_compiled_hash` are sourced from the stored candidate row at approve time (U4), NEVER
+ * from the reviewer HTTP request. `existing_page` and `update_page` both require a non-empty
+ * path; `update_page` ALSO requires a non-empty `base_compiled_hash` (KTD8 staleness guard).
+ */
 export interface PromotionTarget {
-  kind: 'existing_page' | 'inbox';
-  /** The reviewer-selected target path (validated server-side in approveCandidate). */
+  kind: 'existing_page' | 'inbox' | 'update_page';
+  /** The target path (validated server-side in approveCandidate). For update_page this is the
+   *  classifier-resolved `<slug>.md` content path carried from the row. */
   path: string;
+  /** update_page ONLY: the classifier's real dated timeline line (carried from the row). */
+  timeline_entry?: string;
+  /** update_page ONLY: sha256 of the compiled-truth gbrain merged against (KTD8 staleness
+   *  guard). A structural hash — emitted verbatim, never strip()'d. */
+  base_compiled_hash?: string;
 }
 
-/** The artifact's `target` object — EXACTLY these 4 keys (Brain TARGET_SCHEMA). */
+/**
+ * The artifact's `target` object. MODE-DEPENDENT key set (matches the Brain's mode-aware
+ * TARGET_SCHEMA): inbox/existing_page carry EXACTLY {mode, path, timeline_entry, body} (4
+ * keys); update_page carries those + `base_compiled_hash` (5 keys). `base_compiled_hash` is
+ * present ONLY for update_page and OMITTED (never null) otherwise.
+ */
 export interface PromotionArtifactTarget {
-  mode: 'existing_page' | 'inbox';
+  mode: 'existing_page' | 'inbox' | 'update_page';
   path: string;
   timeline_entry: string;
   body: string;
+  /** update_page ONLY (the KTD8 compiled-truth staleness hash). Omitted for the 4-key modes. */
+  base_compiled_hash?: string;
 }
 
 /** The minimized approval artifact — EXACTLY these 5 keys (Brain ARTIFACT_SCHEMA). */
@@ -77,12 +101,22 @@ export const PROMOTION_EVENT_TYPE = 'connector-promotion';
 // ── Build ─────────────────────────────────────────────────────────────────────────
 
 /**
- * Build the minimized 5-key artifact from a candidate row + reviewer target.
+ * Build the minimized artifact from a candidate row + effective target.
  *
  * Minimization: the artifact carries NO candidate body beyond `target.body` /
  * `target.timeline_entry`. Both of those run through the existing strip() redaction at
  * THIS write boundary (defense in depth — proposed_markdown was already stripped at
  * toRow, but the artifact is a fresh egress surface to an external repo).
+ *
+ * MODE-DEPENDENT shape (U4): for inbox/existing_page the `target` is the historical 4-key
+ * object with a HARDCODED provenance `timeline_entry`. For `update_page` (the machine
+ * consolidation UPDATE) the `target` carries the classifier's REAL dated `timeline_entry`
+ * (from the effective target, which approveCandidate sourced from the stored row) plus a 5th
+ * key `base_compiled_hash` — added by CONDITIONAL SPREAD so the key is OMITTED (not null) for
+ * the 4-key modes (JSON.stringify drops an absent key but keeps a null, which the receiver's
+ * mode-aware schema would reject as an unknown key). `base_compiled_hash` is NOT strip()'d: a
+ * sha256 hex is structural and strip() could corrupt the byte-for-byte value the receiver
+ * compares.
  *
  * source_record_id is the FULL id — never hashed here (the Brain hashes it for the branch
  * + PR body; gbrain hands over the real id so the Brain can detect idempotent reuse).
@@ -94,6 +128,7 @@ export function buildPromotionArtifact(
   row: Pick<ConnectorCandidateRow, 'provider' | 'source_id' | 'source_record_id' | 'proposed_markdown'>,
   target: PromotionTarget,
 ): PromotionArtifact {
+  const isUpdate = target.kind === 'update_page';
   return {
     provider: row.provider ?? '',
     source_id: row.source_id,
@@ -107,11 +142,18 @@ export function buildPromotionArtifact(
       // segment), so what reaches here is a clean relative content path. strip() is for
       // PII/secrets in page-body content; running it on a path could corrupt a valid slug.
       path: target.path,
-      // timeline_entry: a one-line provenance note, redacted at this boundary.
-      timeline_entry: strip(`Promoted from connector candidate ${row.source_record_id} (${row.provider ?? 'unknown'}).`),
+      // timeline_entry: for update_page, the classifier's real dated line (carried on the
+      // effective target from the row); for inbox/existing_page, the hardcoded provenance
+      // note. Redacted at this boundary (idempotent — the row line was stripped at toRow).
+      timeline_entry: isUpdate
+        ? strip(target.timeline_entry ?? '')
+        : strip(`Promoted from connector candidate ${row.source_record_id} (${row.provider ?? 'unknown'}).`),
       // body: the candidate's proposed markdown (already stripped at toRow; re-stripped
       // here because strip() is idempotent and the artifact is a fresh external egress).
       body: strip(row.proposed_markdown ?? ''),
+      // base_compiled_hash: present ONLY for update_page (KTD8). CONDITIONAL SPREAD so the key
+      // is OMITTED (not null) for the 4-key modes. NOT strip()'d (structural sha256 hex).
+      ...(isUpdate ? { base_compiled_hash: target.base_compiled_hash ?? '' } : {}),
     },
   };
 }

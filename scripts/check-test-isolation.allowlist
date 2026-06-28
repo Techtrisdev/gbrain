@@ -72,3 +72,17 @@ test/supervisor.test.ts
 test/sync-failures.test.ts
 test/sync-parallel.test.ts
 test/transcription.test.ts
+# --- Pre-existing baseline gap (NOT introduced by the Memory Consolidation
+# Engine feature). These 7 connector/telemetry test files violate the
+# isolation lint and were never allow-listed, so `check:test-isolation` (and
+# thus `verify`) is red on origin/main itself — proven by running the check at
+# base 96a706d6 before any feature change. Added here per operator decision to
+# unblock the feature PR. TODO(repo-health): properly fix isolation or rename
+# each to *.serial.test.ts (the policy-preferred fix) and remove these entries.
+test/connector-calendar.test.ts
+test/connector-credentials.test.ts
+test/connector-github.test.ts
+test/connector-granola.test.ts
+test/connector-linear.test.ts
+test/connector-slack.test.ts
+test/telemetry-cache-miss.test.ts

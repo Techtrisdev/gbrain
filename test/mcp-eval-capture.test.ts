@@ -176,8 +176,14 @@ describe('op-layer capture — query', () => {
   });
 
   test('explicit source_id overrides ctx.sourceId for query retrieval', async () => {
+    // remote:false (local/CLI caller). Unrestricted cross-source override is a
+    // LOCAL capability — for remote OAuth callers resolveQuerySourceScope
+    // (operations.ts) gates a concrete source_id to the authenticated read
+    // scope (#876 federated read), so a remote ctx without 'testsrc' in scope
+    // is denied. This test exercises the override semantics, not the auth gate.
     const ctx = makeCtx({
       sourceId: 'default',
+      remote: false,
       config: makeConfig({ capture: false }),
     });
 

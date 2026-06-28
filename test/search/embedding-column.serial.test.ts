@@ -13,7 +13,7 @@
  *     throw on unknown string.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, beforeEach } from 'bun:test';
 import {
   resolveEmbeddingColumn,
   getEmbeddingColumnRegistry,
@@ -32,8 +32,29 @@ import {
   isCacheSafe,
   isBuiltinColumn,
 } from '../../src/core/search/embedding-column.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
 import type { GBrainConfig } from '../../src/core/config.ts';
 import type { ResolvedColumn } from '../../src/core/types.ts';
+
+// Shard isolation: the registry + isCacheSafe baseline is `cfg > gateway >
+// DEFAULT_EMBEDDING_*`. With empty cfg these tests read the GATEWAY tier and
+// assert the legacy OpenAI/1536 default that bunfig.toml's
+// `legacy-embedding-preload.ts` pins. That preload only RESTORES the legacy
+// config when the gateway slot is EMPTY (its beforeEach early-outs when
+// `getEmbeddingDimensions()` succeeds). An upstream shard-1 file that leaves
+// the gateway configured to a NON-legacy model (e.g. ZE/1280) and never resets
+// it survives the preload's guard, so these tests would resolve 1280/ZE and
+// fail. resetGateway() would NOT fix it (a null gateway falls through to the
+// v0.37 production DEFAULT, which is ZE/1280 — the same wrong answer). Re-pin
+// the legacy OpenAI/1536 config (mirroring the preload) before every test so
+// the baseline is deterministic regardless of upstream pollution.
+beforeEach(() => {
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { ...process.env },
+  });
+});
 
 function cfg(overrides: Partial<GBrainConfig> = {}): GBrainConfig {
   return { engine: 'pglite', ...overrides };

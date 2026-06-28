@@ -16,6 +16,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { strip } from './redact.ts';
+import type { ConsolidationClassification } from './consolidation-decisions.ts';
 import {
   buildPromotionArtifact,
   canonicalizeArtifactForSigning,
@@ -53,6 +54,26 @@ export interface ConnectorCandidateItem {
   as_of?: Date;
   /** Reference to a rationale document slug or URL. */
   rationale_ref?: string;
+
+  // ── Memory Consolidation Engine (U3) — pre-computed promotion target ──────────
+  // Set ONLY by landRecords' consolidation path; absent on every non-consolidation
+  // candidate (today's passthrough, the webhook receiver, tombstones), where they
+  // all default to NULL — leaving such a row byte-identical to before U3.
+  /** The classifier verdict (ADD | UPDATE | NOOP | NEEDS_REVIEW). */
+  classification?: ConsolidationClassification | null;
+  /** Pre-computed promotion target kind. 'update_page' is the consolidation UPDATE mode. */
+  target_kind?: 'existing_page' | 'inbox' | 'update_page' | null;
+  /** Pre-computed promotion target path (the resolved `<slug>.md` repo path for update_page). */
+  target_path?: string | null;
+  /** The UPDATE timeline line. Classifier output → strip()'d at the write boundary. */
+  timeline_entry?: string | null;
+  /** sha256 of the compiled-truth gbrain merged against (the UPDATE staleness guard, KTD8).
+   *  A structural hash — persisted verbatim, NOT strip()'d. */
+  base_compiled_hash?: string | null;
+  /** Candidate status override. NOOP lands 'rejected' (off the pending queue). Default 'pending'. */
+  status?: 'pending' | 'accepted' | 'rejected';
+  /** Status reason. NOOP sets 'NOOP'. strip()'d. Default null. */
+  status_reason?: string | null;
 }
 
 // ── Row type (what we insert / return) ────────────────────────────────────────
@@ -81,13 +102,19 @@ export interface ConnectorCandidateRow {
   acted_at: Date | null;
   superseded_by: number | null;
   // TECH-2109 promotion bridge columns — all nullable; pre-promotion rows read null.
-  target_kind: 'existing_page' | 'inbox' | null;
+  // 'update_page' (U6) is the consolidation UPDATE receiver mode.
+  target_kind: 'existing_page' | 'inbox' | 'update_page' | null;
   target_path: string | null;
   promotion_status: 'pr_opened' | 'indexed' | 'promoted_to_inbox' | 'needs_fix' | 'failed' | null;
   promotion_pr_url: string | null;
   promotion_branch: string | null;
   promoted_at: Date | null;
   artifact_hash: string | null;
+  // Memory Consolidation Engine (U6 columns / U3 writer) — pre-computed UPDATE
+  // target + audit. All nullable; a non-consolidation row reads null.
+  base_compiled_hash: string | null;
+  timeline_entry: string | null;
+  classification: ConsolidationClassification | null;
   proposed_at: Date;
 }
 
@@ -130,13 +157,14 @@ function buildCandidateRow(
   item: ConnectorCandidateItem,
 ): Omit<
   ConnectorCandidateRow,
-  // 'id' / 'proposed_at' are DB-generated; the TECH-2109 promotion columns are
+  // 'id' / 'proposed_at' are DB-generated; the promotion-DISPATCH columns are
   // written later (at approval) by approveCandidate / the promotion bridge, never
-  // by the connector INSERT — they default to NULL here.
+  // by the connector INSERT — they default to NULL here. The pre-computed
+  // promotion TARGET (target_kind/target_path) + the consolidation columns
+  // (classification/timeline_entry/base_compiled_hash) ARE writable at land time
+  // by the U3 consolidation path; they stay NULL on a non-consolidation candidate.
   | 'id'
   | 'proposed_at'
-  | 'target_kind'
-  | 'target_path'
   | 'promotion_status'
   | 'promotion_pr_url'
   | 'promotion_branch'
@@ -165,11 +193,23 @@ function buildCandidateRow(
     expires_at: item.expires_at ?? null,
     as_of: item.as_of ?? null,
     rationale_ref: item.rationale_ref != null ? strip(item.rationale_ref) : null,
-    status: 'pending',
-    status_reason: null,
+    status: item.status ?? 'pending',
+    status_reason: item.status_reason != null ? strip(item.status_reason) : null,
     acted_by: null,
     acted_at: null,
     superseded_by: null,
+    // Memory Consolidation Engine (U3): the pre-computed promotion target. All
+    // NULL on a non-consolidation candidate (byte-identical to today's passthrough).
+    // proposed_markdown (above) already carries strip() — so an UPDATE merged_body
+    // routed through item.proposed_markdown is redacted here too. timeline_entry IS
+    // classifier output → strip()'d like the body. target_path (a repo path) and
+    // base_compiled_hash (a sha256 hex) are STRUCTURAL — persisted verbatim, never
+    // strip()'d (strip could corrupt the path or the hash the receiver compares).
+    target_kind: item.target_kind ?? null,
+    target_path: item.target_path ?? null,
+    classification: item.classification ?? null,
+    timeline_entry: item.timeline_entry != null ? strip(item.timeline_entry) : null,
+    base_compiled_hash: item.base_compiled_hash ?? null,
   };
 }
 
@@ -214,6 +254,11 @@ export async function toRow(
   //  $15  acted_by         TEXT
   //  $16  acted_at         TIMESTAMPTZ
   //  $17  superseded_by    BIGINT
+  //  $18  target_kind        TEXT     — U3 consolidation: pre-computed target (else NULL)
+  //  $19  target_path        TEXT
+  //  $20  classification     TEXT
+  //  $21  timeline_entry     TEXT
+  //  $22  base_compiled_hash TEXT
   const params: unknown[] = [
     candidate.source_id,            // $1
     candidate.source_record_id,     // $2
@@ -232,6 +277,11 @@ export async function toRow(
     candidate.acted_by,             // $15
     candidate.acted_at,             // $16
     candidate.superseded_by,        // $17
+    candidate.target_kind,          // $18
+    candidate.target_path,          // $19
+    candidate.classification,       // $20
+    candidate.timeline_entry,       // $21
+    candidate.base_compiled_hash,   // $22
   ];
 
   const insertSql = `
@@ -242,7 +292,8 @@ export async function toRow(
       confidence,
       redactions,
       expires_at, as_of, rationale_ref,
-      status, status_reason, acted_by, acted_at, superseded_by
+      status, status_reason, acted_by, acted_at, superseded_by,
+      target_kind, target_path, classification, timeline_entry, base_compiled_hash
     ) VALUES (
       $1, $2, $3,
       $4::text[],
@@ -250,7 +301,8 @@ export async function toRow(
       $8,
       $9::jsonb,
       $10, $11, $12,
-      $13, $14, $15, $16, $17
+      $13, $14, $15, $16, $17,
+      $18, $19, $20, $21, $22
     )
     ON CONFLICT (source_id, source_record_id, version) DO NOTHING
     RETURNING ${CANDIDATE_COLUMNS}
@@ -296,6 +348,8 @@ const CANDIDATE_COLS = [
   // TECH-2109 promotion bridge columns
   'target_kind', 'target_path', 'promotion_status', 'promotion_pr_url',
   'promotion_branch', 'promoted_at', 'artifact_hash',
+  // Memory Consolidation Engine (U6 columns / U3 writer)
+  'base_compiled_hash', 'timeline_entry', 'classification',
   'proposed_at',
 ] as const;
 /** Bare column list, for RETURNING / unqualified SELECT. */
@@ -466,6 +520,12 @@ export class PromotionTargetError extends Error {
  * that is obviously unsafe so a bad target never reaches the external repo.
  *
  *  - existing_page REQUIRES a non-empty target_path.
+ *  - update_page (the machine consolidation UPDATE) REQUIRES a non-empty target_path, a
+ *    non-empty base_compiled_hash (the KTD8 staleness guard the receiver compares HEAD's
+ *    compiled-truth against — a missing hash would make the receiver fail closed / inert), AND
+ *    a non-empty timeline_entry — the receiver rejects an empty body/timeline_entry for
+ *    update_page (promote_candidate.py), so fail closed HERE rather than dispatch a doomed
+ *    artifact. (The body lives on the row, not the target, so approveCandidate guards it.)
  *  - ANY mode rejects a target_path with leading/trailing whitespace, a leading '/' or '~'
  *    (absolute), a backslash, a NUL, a URL scheme ('scheme://'), an empty path segment, or
  *    any dot-prefixed segment ('.', '..', '....', a dotfile, or a dot-directory like '.git'
@@ -486,6 +546,23 @@ export function validatePromotionTarget(target: PromotionTarget): void {
   const path = target.path ?? '';
   if (target.kind === 'existing_page' && !path.trim()) {
     throw new PromotionTargetError('existing_page target requires a non-empty target_path');
+  }
+  if (target.kind === 'update_page') {
+    // A machine-pre-computed UPDATE: the receiver's KTD8 staleness guard needs BOTH a concrete
+    // target page AND the compiled-truth hash gbrain merged against. Reject either missing —
+    // an empty hash would route every UPDATE to NEEDS_REVIEW (feature-inert), an empty path
+    // has no page to rewrite.
+    if (!path.trim()) {
+      throw new PromotionTargetError('update_page target requires a non-empty target_path');
+    }
+    if (!(target.base_compiled_hash ?? '').trim()) {
+      throw new PromotionTargetError('update_page target requires a non-empty base_compiled_hash');
+    }
+    // Mirror the receiver's update_page guard (promote_candidate.py): an empty timeline_entry
+    // would be rejected receiver-side, so reject it at approve and never dispatch.
+    if (!(target.timeline_entry ?? '').trim()) {
+      throw new PromotionTargetError('update_page target requires a non-empty timeline_entry');
+    }
   }
   if (path) {
     if (path !== path.trim()) {
@@ -571,17 +648,31 @@ export interface ApproveResult {
 }
 
 /**
- * Approve a PENDING candidate with a reviewer-selected promotion target.
+ * Approve a PENDING candidate, honoring a MACHINE-pre-computed consolidation UPDATE target when
+ * the stored row carries one (U4) and otherwise the reviewer-selected target.
  *
- * Order (AC3):
- *  1. validatePromotionTarget — rejects an unsafe target BEFORE any write (throws).
- *  2. Build the minimized artifact + its canonical string + artifact_hash from the CURRENT
- *     row (fetched read-only) so the hash is computed before the accept UPDATE.
- *  3. ONE UPDATE sets status='accepted' + actor/time AND persists target_kind / target_path /
- *     artifact_hash, guarded by status='pending' (idempotency: a duplicate approve hits 0 rows
- *     and is a safe no-op). The decision + target are committed BEFORE the bridge runs.
- *  4. Hand the accepted row + target to the promotion hook. A hook failure leaves the row
- *     accepted-pending (retriable) — never throws out of approve, never marks promoted.
+ * Order:
+ *  1. Read the CURRENT row FIRST — its `classification` / `target_kind` decide whether this is
+ *     a machine consolidation UPDATE (target sourced FROM the row) or a reviewer-driven
+ *     candidate (target from the request).
+ *  2. Compute the EFFECTIVE target. A consolidation UPDATE row (classification set AND
+ *     target_kind='update_page') carries the full pre-computed target — kind/path/
+ *     timeline_entry/base_compiled_hash all come from the STORED ROW, never the reviewer HTTP
+ *     request (a reviewer cannot drive update_page). Everything else — reviewer approvals, and
+ *     consolidation ADD/NEEDS_REVIEW rows that carry NO stored target (target_kind=null) — keeps
+ *     today's behavior (resolveInboxTarget defaults a bare inbox path).
+ *  3. Validate the EFFECTIVE target (NOT the reviewer's) before any write — for a consolidation
+ *     UPDATE the reviewer target is empty/irrelevant, so validating IT would wrongly throw. Also
+ *     fail closed on a malformed stored UPDATE (empty proposed_markdown body) so a doomed
+ *     artifact is never dispatched (the receiver would reject an empty update_page body).
+ *  4. Build the artifact_hash from the CURRENT row + effective target (read-only, pre-UPDATE).
+ *  5. ONE UPDATE sets status='accepted' + actor/time + artifact_hash, guarded by
+ *     status='pending' (idempotency: a duplicate approve hits 0 rows). A reviewer-driven
+ *     approval ALSO persists the chosen target_kind/target_path; a consolidation UPDATE does
+ *     NOT touch them — the classifier already set target_kind='update_page' + target_path at
+ *     land time and they must NOT be clobbered.
+ *  6. Hand the accepted row + effective target to the promotion hook. A hook failure leaves the
+ *     row accepted-pending (retriable) — never throws out of approve, never marks promoted.
  *
  * A non-pending id (not found / already acted) returns { row: null }.
  */
@@ -591,24 +682,46 @@ export async function approveCandidate(
   actor: string,
   target: PromotionTarget,
 ): Promise<ApproveResult> {
-  // 1. Reject an unsafe target before touching the DB.
-  validatePromotionTarget(target);
-
-  // 2. Read the current row to compute the artifact hash. If it is not pending, the accept
-  //    UPDATE below will no-op anyway; computing the hash off a stale/absent row is harmless
-  //    because it is only written inside the status='pending'-guarded UPDATE.
+  // 1. Read the current row FIRST — its classification/target_kind drive the target decision
+  //    and the artifact hash. If it is not pending, the accept UPDATE below no-ops anyway.
   const [current] = await engine.executeRaw<ConnectorCandidateRow>(
     `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates WHERE id = $1`,
     [id],
   );
-  // 2.5 Resolve a default inbox approval (kind='inbox' with no path) to the canonical
-  //     inbox/YYYY-MM-DD-<slug>.md the Brain bridge REQUIRES — it rejects an empty inbox path,
-  //     so the path must be concrete by the time the artifact is signed + persisted. An
-  //     existing_page target, or an inbox target the reviewer already pathed, passes through.
-  //     The derived path is re-validated (defense in depth) before any write.
-  const effectiveTarget = current ? resolveInboxTarget(current, target) : target;
-  if (effectiveTarget !== target) validatePromotionTarget(effectiveTarget);
 
+  // 2. Honor a machine-pre-computed consolidation UPDATE target straight from the stored row.
+  //    Only an UPDATE row carries a complete target (target_kind='update_page' + path +
+  //    timeline_entry + base_compiled_hash); ADD/NEEDS_REVIEW rows have target_kind=null and
+  //    stay reviewer-driven. resolveInboxTarget defaults a bare reviewer inbox path to the
+  //    canonical inbox/YYYY-MM-DD-<slug>.md the Brain bridge REQUIRES.
+  const honorStored =
+    current != null && current.classification != null && current.target_kind === 'update_page';
+  const effectiveTarget: PromotionTarget = honorStored
+    ? {
+        kind: 'update_page',
+        path: current.target_path ?? '',
+        timeline_entry: current.timeline_entry ?? undefined,
+        base_compiled_hash: current.base_compiled_hash ?? undefined,
+      }
+    : current
+      ? resolveInboxTarget(current, target)
+      : target;
+
+  // 3. Validate the EFFECTIVE (row-sourced or reviewer) target before any write.
+  validatePromotionTarget(effectiveTarget);
+
+  // 3b. For a consolidation UPDATE the artifact body = row.proposed_markdown (the merged
+  //     compiled-truth), which is NOT carried on the target — so validatePromotionTarget can't
+  //     see it. The receiver rejects an empty body for update_page (promote_candidate.py), so
+  //     fail closed HERE (PromotionTargetError → 400, never dispatched) rather than emit a
+  //     doomed artifact that only bounces back as a receiver-side failed callback.
+  if (honorStored && !(current?.proposed_markdown ?? '').trim()) {
+    throw new PromotionTargetError(
+      'update_page candidate has an empty proposed_markdown (the merged compiled-truth body)',
+    );
+  }
+
+  // 4. Compute the artifact hash off the current row + effective target (read-only).
   let hash: string | null = null;
   if (current) {
     const artifact = buildPromotionArtifact(current, effectiveTarget);
@@ -616,15 +729,25 @@ export async function approveCandidate(
     hash = artifactHash(canonical);
   }
 
-  // 3. SAME UPDATE: accept + persist target + artifact_hash, guarded for idempotency.
-  const rows = await engine.executeRaw<ConnectorCandidateRow>(
-    `UPDATE connector_candidates
-        SET status = 'accepted', acted_by = $2, acted_at = now(),
-            target_kind = $3, target_path = $4, artifact_hash = $5
-      WHERE id = $1 AND status = 'pending'
-      RETURNING ${CANDIDATE_COLUMNS}`,
-    [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
-  );
+  // 5. Accept UPDATE, guarded by status='pending' for idempotency. A consolidation UPDATE row
+  //    keeps its classifier-set target_kind/target_path (do NOT clobber the 'update_page' the
+  //    classifier wrote at land time); a reviewer-driven row persists the chosen target.
+  const rows = honorStored
+    ? await engine.executeRaw<ConnectorCandidateRow>(
+        `UPDATE connector_candidates
+            SET status = 'accepted', acted_by = $2, acted_at = now(), artifact_hash = $3
+          WHERE id = $1 AND status = 'pending'
+          RETURNING ${CANDIDATE_COLUMNS}`,
+        [id, strip(actor), hash],
+      )
+    : await engine.executeRaw<ConnectorCandidateRow>(
+        `UPDATE connector_candidates
+            SET status = 'accepted', acted_by = $2, acted_at = now(),
+                target_kind = $3, target_path = $4, artifact_hash = $5
+          WHERE id = $1 AND status = 'pending'
+          RETURNING ${CANDIDATE_COLUMNS}`,
+        [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
+      );
   const row = rows[0] ? coerceCandidateRow(rows[0]) : null;
   if (!row) return { row: null, promotion: { invoked: false } };
 

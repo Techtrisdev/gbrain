@@ -788,13 +788,20 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   superseded_by      BIGINT        REFERENCES connector_candidates(id) ON DELETE SET NULL,
   -- TECH-2109 promotion bridge: reviewer-selected target + dispatch state.
   -- All additive + nullable; old rows read NULL. Does NOT touch the status CHECK.
-  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox')),
+  -- 'update_page' (U6) is the consolidation UPDATE receiver mode; relaxed on
+  -- existing DBs by migration v97 (catalog-resolved DROP/ADD).
+  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page')),
   target_path        TEXT,
   promotion_status   TEXT          CHECK (promotion_status IS NULL OR promotion_status IN ('pr_opened','indexed','promoted_to_inbox','needs_fix','failed')),
   promotion_pr_url   TEXT,
   promotion_branch   TEXT,
   promoted_at        TIMESTAMPTZ,
   artifact_hash      TEXT,
+  -- Memory Consolidation Engine (U6): pre-computed UPDATE target + audit.
+  -- All additive + nullable; migration v97 adds them to existing DBs.
+  base_compiled_hash TEXT,
+  timeline_entry     TEXT,
+  classification     TEXT,
   proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
   CONSTRAINT connector_candidates_source_record_version_unique
     UNIQUE (source_id, source_record_id, version)
@@ -802,6 +809,30 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
 
 CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
   ON connector_candidates (source_id, status, proposed_at DESC);
+
+-- ============================================================
+-- consolidation_decisions (U6): decision-log telemetry. One durable row per
+-- classification, keyed on the candidate idempotency tuple + classification,
+-- for audit + Tier-1 calibration. PGLite parity with src/schema.sql. No RLS
+-- (PGLite has no role system). See schema.sql for design rationale.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS consolidation_decisions (
+  id                BIGSERIAL    PRIMARY KEY,
+  source_id         TEXT         NOT NULL,
+  source_record_id  TEXT         NOT NULL,
+  version           TEXT         NOT NULL DEFAULT '1',
+  classification    TEXT         NOT NULL,
+  confidence        REAL,
+  target_path       TEXT,
+  tier1_cosine      REAL,
+  model             TEXT,
+  decided_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  CONSTRAINT consolidation_decisions_tuple_unique
+    UNIQUE (source_id, source_record_id, version, classification)
+);
+
+CREATE INDEX IF NOT EXISTS consolidation_decisions_class_decided_idx
+  ON consolidation_decisions (classification, decided_at DESC);
 
 -- ============================================================
 -- connector_tokens (TECH-2033): encrypted outbound-OAuth credential custody.

@@ -1184,13 +1184,24 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   superseded_by      BIGINT        REFERENCES connector_candidates(id) ON DELETE SET NULL,
   -- TECH-2109 promotion bridge: reviewer-selected target + dispatch state.
   -- All additive + nullable; old rows read NULL. Does NOT touch the \`status\` CHECK.
-  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox')),
+  -- 'update_page' (U6) is the consolidation UPDATE receiver mode; relaxed on
+  -- existing DBs by migration v97 (catalog-resolved DROP/ADD).
+  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page')),
   target_path        TEXT,
   promotion_status   TEXT          CHECK (promotion_status IS NULL OR promotion_status IN ('pr_opened','indexed','promoted_to_inbox','needs_fix','failed')),
   promotion_pr_url   TEXT,
   promotion_branch   TEXT,
   promoted_at        TIMESTAMPTZ,
   artifact_hash      TEXT,
+  -- Memory Consolidation Engine (U6): pre-computed UPDATE target + audit.
+  -- All additive + nullable; migration v97 adds them to existing DBs.
+  --   base_compiled_hash  sha256 of the compiled-truth gbrain merged against
+  --                       (the UPDATE staleness guard, KTD8)
+  --   timeline_entry      the LLM's real dated timeline line
+  --   classification      ADD | UPDATE | NOOP | NEEDS_REVIEW
+  base_compiled_hash TEXT,
+  timeline_entry     TEXT,
+  classification     TEXT,
   -- audit
   proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
   -- idempotency key: same upstream record + version never produces two rows
@@ -1201,6 +1212,48 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
 -- hot path: list pending candidates for a source, newest first
 CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
   ON connector_candidates (source_id, status, proposed_at DESC);
+
+-- ============================================================
+-- consolidation_decisions (U6): Memory Consolidation Engine decision log.
+-- One durable row per classification, keyed on the candidate idempotency
+-- tuple (source_id, source_record_id, version) PLUS the classification, for
+-- audit + Tier-1 threshold calibration (KTD2). Mirrors SharedMemory's
+-- Postgres decision log. Written by recordConsolidationDecision()
+-- (src/core/connectors/consolidation-decisions.ts).
+--
+-- The UNIQUE (source_id, source_record_id, version, classification) tuple +
+-- the writer's ON CONFLICT DO NOTHING make a repeat classification a safe
+-- no-op (idempotent — exactly one row per (tuple, classification)). Pure
+-- audit log: no JSONB, no PII (source ids only — never query text or capture
+-- bodies), no FK to connector_candidates (a decision is recorded even when
+-- the row degrades to raw passthrough). No explicit RLS POLICY — on Postgres
+-- the v35 auto-RLS event trigger ENABLEs row-level security on it like every
+-- other public table (a BYPASSRLS role still reads/writes it); same posture as
+-- search_telemetry / connector_candidates.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS consolidation_decisions (
+  id                BIGSERIAL    PRIMARY KEY,
+  source_id         TEXT         NOT NULL,
+  source_record_id  TEXT         NOT NULL,
+  version           TEXT         NOT NULL DEFAULT '1',
+  -- ADD | UPDATE | NOOP | NEEDS_REVIEW
+  classification    TEXT         NOT NULL,
+  -- the classifier's real confidence (nullable)
+  confidence        REAL,
+  -- the resolved page path for an UPDATE (nullable)
+  target_path       TEXT,
+  -- the Tier-1 dedup cosine (nullable — for calibrating the ADD/NOOP bands)
+  tier1_cosine      REAL,
+  -- the model that produced the decision (nullable)
+  model             TEXT,
+  decided_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  CONSTRAINT consolidation_decisions_tuple_unique
+    UNIQUE (source_id, source_record_id, version, classification)
+);
+
+-- calibration scan: classifications over time, newest first
+CREATE INDEX IF NOT EXISTS consolidation_decisions_class_decided_idx
+  ON consolidation_decisions (classification, decided_at DESC);
 
 -- ============================================================
 -- connector_tokens (TECH-2033): encrypted outbound-OAuth credential custody.

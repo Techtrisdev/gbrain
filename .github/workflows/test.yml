@@ -16,9 +16,14 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc  # v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The gitleaks GitHub Action requires a paid GITLEAKS_LICENSE for org
+      # repos. Run the OSS gitleaks CLI directly instead — identical scan
+      # (same rules + .gitleaks.toml allowlist), no license required.
+      - name: Run gitleaks (OSS CLI)
+        run: |
+          VERSION=8.30.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks git . --config .gitleaks.toml --no-banner --redact --exit-code 1
 
   test:
     # ubuntu-latest is free 2-core/7GB. Larger runners (16-cores, etc.) require

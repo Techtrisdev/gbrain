@@ -52,7 +52,9 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // graph-off; cross-pack contamination structurally impossible).
     // v0.40.3.0 (D8): 4→5 to fold contextual_retrieval + kill switch,
     // sequenced behind salem's v=4 graph-signals.
-    expect(KNOBS_HASH_VERSION).toBe(5);
+    // Source bumped 5→6 in search/mode.ts; this stale assertion pre-dated the
+    // consolidation feature and was never updated. See search-mode.test.ts (6).
+    expect(KNOBS_HASH_VERSION).toBe(6);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

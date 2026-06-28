@@ -6,10 +6,15 @@
  *   - put_page backstop on dream_generated:true frontmatter → skipped:dream_generated
  */
 
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import { extractFactsFromTurn } from '../src/core/facts/extract.ts';
+import {
+  configureGateway,
+  __setChatTransportForTests,
+  __setEmbedTransportForTests,
+} from '../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -21,6 +26,27 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+});
+
+// Shard isolation: put_page reads `isAvailable('embedding')` (operations.ts:780)
+// to decide whether to embed the written page. The bunfig.toml preload pins the
+// gateway to legacy OpenAI/1536 BEFORE every test, but only RESTORES it when the
+// slot is empty — an upstream shard-1 file that leaves the gateway configured to
+// a different model (and possibly a leaked embed transport) survives that guard.
+// These tests assert the facts backstop's response shape, not embedding output,
+// so pin a deterministic baseline where embedding is UNAVAILABLE (gateway
+// configured but no auth key → put_page takes the no-embed path, exactly as in
+// isolation) and clear any leaked test transports. Keeping the gateway
+// configured (vs. resetGateway()'s null) avoids a requireConfig() throw on any
+// downstream gateway read.
+beforeEach(() => {
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: {}, // no OPENAI_API_KEY → isAvailable('embedding') === false → noEmbed
+  });
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
 });
 
 describe('anti-loop dream_generated marker', () => {
