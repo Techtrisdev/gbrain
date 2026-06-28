@@ -719,6 +719,23 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // only via the eval-replay CLI, not via SQL filters that would force a
   // bootstrap probe.
   'eval_candidates.schema_pack_per_source',
+  // v0.40.x (migration v96 search_telemetry_caller_attribution) — caller
+  // attribution. Same exemption posture as query_cache.* above: the
+  // `search_telemetry` table is MIGRATION-CREATED (migration v57
+  // search_telemetry_rollup) and is NOT in PGLITE_SCHEMA_SQL, so the schema
+  // blob never replays a CREATE TABLE / CREATE INDEX for it — there is no
+  // forward reference for the bootstrap to defend. The v96 migration adds
+  // `client` (TEXT NOT NULL DEFAULT 'unknown') AND repoints the PRIMARY KEY to
+  // (date, mode, intent, client, source_id) in the SAME migration, so the
+  // column and its only constraint are co-defined (no schema-blob-replay gap).
+  // The lone consumer (src/core/search/telemetry.ts ON CONFLICT (date, mode,
+  // intent, client, source_id)) runs only on a fully-migrated brain — old
+  // brains never reach it before v96 applies — so no downstream filter breaks.
+  // The migration itself documents this: "search_telemetry is migration-created
+  // (v57) — not in the base schema — so this one migration covers fresh +
+  // existing installs." (source_id rides the same multi-ADD COLUMN ALTER; the
+  // extractor only surfaces the first column, but it shares this exact posture.)
+  'search_telemetry.client',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

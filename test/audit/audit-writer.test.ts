@@ -219,11 +219,24 @@ describe('createAuditWriter — readRecent()', () => {
       const inWin2 = new Date(now.getTime() - 6 * 86400000).toISOString();
       const outOfWin = new Date(now.getTime() - 8 * 86400000).toISOString();
 
-      // All written to current-week file for simplicity (the readRecent
-      // window filter is what we're testing, not the cross-week walk).
-      writer.log({ ts: inWin1, message: 'in window 1' });
-      writer.log({ ts: inWin2, message: 'in window 2' });
-      writer.log({ ts: outOfWin, message: 'out of window' });
+      // All written to the current-week file for simplicity (the readRecent
+      // window filter is what we're testing, not the cross-week walk). Write
+      // directly to computeFilename(now) rather than via writer.log(): log()
+      // partitions by REAL wall-clock (computeFilename() with no arg → new
+      // Date()), so it would land these in a different ISO-week file than
+      // readRecent(now) reads whenever the test runs outside `now`'s week —
+      // making the test wall-clock-dependent. Writing to computeFilename(now)
+      // keeps it deterministic against the injected `now`.
+      const file = path.join(dir, writer.computeFilename(now));
+      fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(
+        file,
+        [
+          JSON.stringify({ ts: inWin1, message: 'in window 1' }),
+          JSON.stringify({ ts: inWin2, message: 'in window 2' }),
+          JSON.stringify({ ts: outOfWin, message: 'out of window' }),
+        ].join('\n') + '\n',
+      );
 
       const recent = writer.readRecent(7, now);
       expect(recent.length).toBe(2);
@@ -249,9 +262,13 @@ describe('createAuditWriter — readRecent()', () => {
       fs.mkdirSync(dir, { recursive: true });
       fs.appendFileSync(previousFile, JSON.stringify({ ts: previousTs, message: 'previous' }) + '\n');
 
-      // Write a current-week event.
+      // Write a current-week event directly to computeFilename(now) (matching
+      // the previous-week write above) rather than via writer.log(), which
+      // partitions by REAL wall-clock and would miss readRecent(now)'s window
+      // whenever the test runs outside `now`'s ISO week.
       const currentTs = new Date(now.getTime() - 1 * 86400000).toISOString();
-      writer.log({ ts: currentTs, message: 'current' });
+      const currentFile = path.join(dir, writer.computeFilename(now));
+      fs.appendFileSync(currentFile, JSON.stringify({ ts: currentTs, message: 'current' }) + '\n');
 
       const recent = writer.readRecent(7, now);
       const messages = recent.map(e => e.message).sort();
