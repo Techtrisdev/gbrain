@@ -266,32 +266,44 @@ export function renderReviewHuman(items: ReviewItem[]): string {
   items.forEach((it, i) => {
     lines.push(`  [${i + 1}] ${it.classification.padEnd(6)} conf ${fmtConf(it.confidence)}  ·  id ${it.id}`);
     if (it.classification === 'UPDATE') {
+      // An UPDATE carries a stored update_page target; a bare approve rewrites THAT page.
       lines.push(`      page:   ${it.target_path ?? '(unknown)'}`);
       lines.push(`      change: ${it.summary}`);
+      lines.push(`      accept: POST /admin/api/candidates/${it.id}/approve   → rewrites ${it.target_path ?? 'the page above'}`);
     } else {
-      lines.push(`      slug:   ${it.proposed_slug ?? '(unspecified)'}`);
+      // A bare ADD approve defaults to target_kind:'inbox' → lands at inbox/<date>-<slug>.md
+      // for triage, NOT at the slug shown. Filing it at the slug needs an explicit body.
+      const slug = it.proposed_slug;
+      lines.push(`      slug:   ${slug ?? '(unspecified)'}`);
       lines.push(`      add:    ${it.summary}`);
+      lines.push(`      accept: POST /admin/api/candidates/${it.id}/approve   → lands in inbox/ for triage`);
+      if (slug) {
+        lines.push(`              (to file at ${slug} instead, add body {"target_kind":"existing_page","target_path":"${slug}.md"})`);
+      }
     }
-    lines.push(`      action: accept → POST /admin/api/candidates/${it.id}/approve`);
-    lines.push(`              reject → POST /admin/api/candidates/${it.id}/reject`);
+    // reject HARD-REQUIRES a reason body (serve-http → 400 reason_required on a bare POST).
+    lines.push(`      reject: POST /admin/api/candidates/${it.id}/reject    {"reason":"…"}  (reason required)`);
     lines.push('');
   });
   lines.push(
-    `${n} proposal${n === 1 ? '' : 's'} · read-only digest — accept/reject runs through the admin review API; nothing is written here.`,
+    `${n} proposal${n === 1 ? '' : 's'} · read-only digest — this command never writes; accept/reject run through the admin review API above.`,
   );
   return lines.join('\n') + '\n';
 }
 
 /**
  * Machine surface. STABLE shape — exactly these keys, in this order:
- *   id, classification, target_path, confidence, summary, source_id
- * (for ADD, `target_path` is null and the "where" lives in `summary`/the slug).
+ *   id, classification, target_path, proposed_slug, confidence, summary, source_id
+ * The destination is verdict-specific and ALWAYS machine-readable from a dedicated
+ * key (never dug out of free-text `summary`): an UPDATE lands at `target_path`
+ * (`proposed_slug` null); an ADD lands at `proposed_slug` (`target_path` null).
  */
 export function renderReviewJson(items: ReviewItem[]): string {
   const shaped = items.map((it) => ({
     id: it.id,
     classification: it.classification,
     target_path: it.target_path,
+    proposed_slug: it.proposed_slug,
     confidence: it.confidence,
     summary: it.summary,
     source_id: it.source_id,
@@ -315,8 +327,16 @@ export function renderReviewDigest(items: ReviewItem[]): string {
     const where = it.classification === 'UPDATE'
       ? (it.target_path ?? '(unknown)')
       : (it.proposed_slug ?? '(unspecified)');
-    lines.push(`- **${it.classification}** \`${where}\` (${fmtConf(it.confidence)}) — ${it.summary} · accept/reject id=${it.id}`);
+    lines.push(`- **${it.classification}** \`${where}\` (${fmtConf(it.confidence)}) — ${it.summary} · id ${it.id}`);
   }
+  // Act-mechanics, stated once (keeps each bullet glanceable while still accurate):
+  // a bare ADD approve lands in inbox/ (NOT the shown slug); reject needs a reason body.
+  lines.push('');
+  lines.push(
+    '_Act via the admin API — accept: `POST /admin/api/candidates/<id>/approve` ' +
+      '(UPDATE rewrites the shown page; a bare ADD approve lands in `inbox/` for triage). ' +
+      'reject: `POST /admin/api/candidates/<id>/reject` with a required `{"reason":"…"}` body._',
+  );
   return lines.join('\n') + '\n';
 }
 
@@ -371,7 +391,8 @@ poll options:
 review options:
   --source <id>                     Only this brain source's pending queue.
   --json                            Stable machine shape (keys: id, classification,
-                                    target_path, confidence, summary, source_id).
+                                    target_path, proposed_slug, confidence, summary,
+                                    source_id).
   --digest                          Compact markdown (heading + a bullet per item),
                                     suitable for scheduled delivery. The delivery
                                     channel (Slack/email/Brain page) is out of scope.

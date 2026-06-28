@@ -170,6 +170,12 @@ describe('renderReviewHuman', () => {
     expect(out).toContain('Jane Doe');                             // ADD excerpt
     expect(out).toContain(`/admin/api/candidates/${add.id}/approve`);
 
+    // Action signifiers match outcomes: reject signposts the REQUIRED reason body,
+    // and a bare ADD approve is shown landing in inbox/ (not at the displayed slug).
+    expect(out).toContain('{"reason":"…"}');
+    expect(out).toContain('inbox/ for triage');
+    expect(out).toContain('"target_kind":"existing_page"');        // the file-at-slug payload
+
     // Hidden dispositions never appear.
     expect(out).not.toContain('ambiguous multi-topic');
     expect(out).not.toContain('people/expired');
@@ -189,11 +195,14 @@ describe('renderReviewJson — stable shape', () => {
 
     expect(parsed.length).toBe(2);
     expect(Object.keys(parsed[0]).sort()).toEqual(
-      ['classification', 'confidence', 'id', 'source_id', 'summary', 'target_path'],
+      ['classification', 'confidence', 'id', 'proposed_slug', 'source_id', 'summary', 'target_path'],
     );
     expect(parsed.map((p) => p.classification)).toEqual(['UPDATE', 'ADD']);
+    // UPDATE lands at target_path; ADD lands at proposed_slug — each from its own key.
     expect(parsed[0].target_path).toBe('clients/acme.md');
-    expect(parsed[1].target_path).toBeNull(); // ADD carries no target_path
+    expect(parsed[0].proposed_slug).toBeNull();
+    expect(parsed[1].target_path).toBeNull();
+    expect(parsed[1].proposed_slug).toBe('people/jane-doe');
   });
 
   test('empty queue → []', () => {
@@ -212,6 +221,9 @@ describe('renderReviewDigest', () => {
     expect(out).toContain('**UPDATE**');
     expect(out).toContain('`clients/acme.md`');
     expect(out).toContain('**ADD**');
+    // The act-mechanics footer signposts the required reject reason + the ADD→inbox outcome.
+    expect(out).toContain('{"reason":"…"}');
+    expect(out).toContain('`inbox/`');
   });
 
   test('empty queue → "nothing to review" marker, no bullets', () => {
@@ -250,5 +262,25 @@ describe('runConnector review — dispatch', () => {
       spy.mockRestore();
     }
     expect(logs.join('\n')).toContain('review options');
+  });
+
+  test('`connector review` with no DB (not --help) exits 1', async () => {
+    const errs: string[] = [];
+    const errSpy = spyOn(console, 'error').mockImplementation((...a: unknown[]) => {
+      errs.push(a.join(' '));
+    });
+    let exitCode: number | undefined;
+    const exitSpy = spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      exitCode = code;
+      return undefined as never;
+    }) as typeof process.exit);
+    try {
+      await runConnector(null, ['review']);
+    } finally {
+      errSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+    expect(exitCode).toBe(1);
+    expect(errs.join('\n')).toContain('requires a database');
   });
 });
