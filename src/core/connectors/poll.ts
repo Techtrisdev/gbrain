@@ -36,7 +36,7 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { getConnector, type ConnectorSource } from './base.ts';
-import { toRow, type ConnectorCandidateItem } from './candidate.ts';
+import { toRow, sweepExpiredCandidates, type ConnectorCandidateItem } from './candidate.ts';
 
 // ── Config shapes (read-only views over sources.config) ──────────────────────
 
@@ -408,6 +408,26 @@ export async function runConnectorPoll(
       const { written } = await toRow(engine, t);
       if (written) tombstoned += 1;
     }
+  }
+
+  // Self-cleaning queue (U3): after landing, hard-delete expired non-accepted
+  // candidates so the table stays bounded across polls. This is the ONE deletion the
+  // poll performs and it is TTL-driven — distinct from reconciliation, which never
+  // deletes a record (it tombstones). Idempotent (a second poll deletes 0) and
+  // NON-FATAL: the poll's real work (backfill + tombstones) is already committed, so a
+  // sweep failure is logged, never propagated.
+  try {
+    const swept = await sweepExpiredCandidates(engine);
+    if (swept > 0) {
+      // Operational diagnostic on stderr (keeps stdout clean for structured output,
+      // matching serve-http's sweepExpiredTokens + eval's cache sweep).
+      console.error(`[connector] swept ${swept} expired candidate(s) after ${provider} poll of ${sourceId}`);
+    }
+  } catch (err) {
+    console.error(
+      `[connector] candidate sweep failed for ${sourceId}/${provider} ` +
+        `(poll work already committed): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   return { ...base, landed, tombstoned };

@@ -18,6 +18,7 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import {
   toRow,
   listCandidates,
+  sweepExpiredCandidates,
   approveCandidate,
   resolveInboxTarget,
   rejectCandidate,
@@ -344,6 +345,62 @@ describe('review queue: listCandidates (AC3)', () => {
     const rejected = await listCandidates(engine, { status: 'rejected' });
     expect(rejected.total).toBe(1);
     expect(rejected.rows[0].id).toBe(target.id);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// U3 — self-cleaning queue: listCandidates expiry filter + the sweep
+// ─────────────────────────────────────────────────────────────────
+describe('U3 — listCandidates expiry filter', () => {
+  test('excludes expired rows from BOTH the row list and the count; NULL + future still list', async () => {
+    const past = new Date(Date.now() - 60_000); // expired a minute ago
+    const future = new Date(Date.now() + 60 * 60 * 1000); // expires in an hour
+    await toRow(engine, { source_id: 'default', source_record_id: 'exp-past', proposed_markdown: 'x', expires_at: past });
+    await toRow(engine, { source_id: 'default', source_record_id: 'exp-future', proposed_markdown: 'x', expires_at: future });
+    await toRow(engine, { source_id: 'default', source_record_id: 'exp-null', proposed_markdown: 'x' }); // expires_at NULL (back-compat)
+
+    const { rows, total } = await listCandidates(engine, { status: 'pending' });
+    const ids = rows.map((r) => r.source_record_id);
+    expect(ids).toContain('exp-future');
+    expect(ids).toContain('exp-null'); // legacy/non-consolidation rows always list
+    expect(ids).not.toContain('exp-past'); // expired → filtered even before the sweep
+    // Count query and row query agree (no "shows 3, returns 2" skew) — the predicate
+    // is applied to both.
+    expect(total).toBe(rows.length);
+    expect(total).toBe(2);
+  });
+});
+
+describe('U3 — sweepExpiredCandidates (self-cleaning)', () => {
+  test('hard-deletes expired non-accepted rows, NEVER accepted, idempotent + counts', async () => {
+    const past = new Date(Date.now() - 60_000);
+    const future = new Date(Date.now() + 60 * 60 * 1000);
+    // expired pending → swept
+    await toRow(engine, { source_id: 'default', source_record_id: 'sw-pending', status: 'pending', proposed_markdown: 'x', expires_at: past });
+    // expired rejected → swept
+    await toRow(engine, { source_id: 'default', source_record_id: 'sw-rejected', status: 'rejected', proposed_markdown: 'x', expires_at: past });
+    // expired ACCEPTED → NEVER swept (may have an in-flight/merged promotion PR)
+    await toRow(engine, { source_id: 'default', source_record_id: 'sw-accepted', status: 'accepted', proposed_markdown: 'x', expires_at: past });
+    // not yet expired + NULL TTL → survive
+    await toRow(engine, { source_id: 'default', source_record_id: 'sw-future', status: 'pending', proposed_markdown: 'x', expires_at: future });
+    await toRow(engine, { source_id: 'default', source_record_id: 'sw-null', status: 'pending', proposed_markdown: 'x' });
+
+    const n1 = await sweepExpiredCandidates(engine);
+    expect(n1).toBe(2); // the expired pending + the expired rejected
+
+    const survivors = await engine.executeRaw<{ source_record_id: string }>(
+      `SELECT source_record_id FROM connector_candidates WHERE source_id = 'default' ORDER BY source_record_id`,
+    );
+    const ids = survivors.map((r) => r.source_record_id);
+    expect(ids).toContain('sw-accepted'); // the load-bearing guard: accepted survives expiry
+    expect(ids).toContain('sw-future');
+    expect(ids).toContain('sw-null');
+    expect(ids).not.toContain('sw-pending');
+    expect(ids).not.toContain('sw-rejected');
+
+    // Idempotent: a second sweep with nothing newly expired removes 0.
+    const n2 = await sweepExpiredCandidates(engine);
+    expect(n2).toBe(0);
   });
 });
 
@@ -860,15 +917,23 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     // Two captures in ONE batch, both resolving to clients/acme.
     const res = await landRecords(wrapped, 'default', granolaLike, [rec('sw-a', 'cap a'), rec('sw-b', 'cap b')], { consolidate: true });
     expect(res.written).toBe(2);
-    const rows = await engine.executeRaw<{ source_record_id: string; classification: string; target_kind: string | null }>(
-      `SELECT source_record_id, classification, target_kind FROM connector_candidates WHERE source_record_id IN ('sw-a', 'sw-b')`,
+    const rows = await engine.executeRaw<{ source_record_id: string; classification: string; target_kind: string | null; status: string; status_reason: string | null }>(
+      `SELECT source_record_id, classification, target_kind, status, status_reason FROM connector_candidates WHERE source_record_id IN ('sw-a', 'sw-b')`,
     );
     const a = rows.find((r) => r.source_record_id === 'sw-a')!;
     const b = rows.find((r) => r.source_record_id === 'sw-b')!;
     expect(a.classification).toBe('UPDATE'); // first wins the page
     expect(a.target_kind).toBe('update_page');
+    expect(a.status).toBe('pending'); // surfaced (0.8 >= 0.70 default)
     expect(b.classification).toBe('NEEDS_REVIEW'); // second downgraded (no competing writer)
     expect(b.target_kind).toBeNull();
+    // U1: the single-writer downgrade lands OFF the pending queue too — a downgraded
+    // double-writer should not pester the human either.
+    expect(b.status).toBe('rejected');
+    expect(b.status_reason).toBe('NEEDS_REVIEW');
+    const pending = await listCandidates(engine, { status: 'pending' });
+    expect(pending.rows.find((r) => r.source_record_id === 'sw-a')).toBeDefined();
+    expect(pending.rows.find((r) => r.source_record_id === 'sw-b')).toBeUndefined();
     const [{ n }] = await engine.executeRaw<{ n: number }>(
       `SELECT count(*)::int AS n FROM connector_candidates WHERE target_kind = 'update_page' AND target_path = 'clients/acme.md'`,
     );
@@ -1035,5 +1100,161 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     );
     expect(Number(d)).toBe(0);
     errSpy.mockRestore();
+  });
+
+  // ── U1: NEEDS_REVIEW leaves the human review queue (the system absorbs ambiguity) ──
+  test('U1: a NEEDS_REVIEW verdict lands rejected/NEEDS_REVIEW, OFF the pending queue, still logged', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['an ambiguous multi-topic fact'], confidence: 0.8 }),
+      classify: () => JSON.stringify({ classification: 'NEEDS_REVIEW', confidence: 0.45 }),
+    });
+    const wrapped = withClassifierIO(engine, {
+      hits: [fakeHit('clients/acme', 0.5, 'shared')], // mid-band → escalate to the LLM
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.', 'shared') },
+    });
+    const res = await landRecords(wrapped, 'default', granolaLike, [rec('nr-1', 'cap')], { consolidate: true });
+    expect(res.written).toBe(1);
+    const [row] = await engine.executeRaw<{ classification: string; status: string; status_reason: string; target_kind: string | null }>(
+      `SELECT classification, status, status_reason, target_kind FROM connector_candidates WHERE source_record_id = 'nr-1'`,
+    );
+    expect(row.classification).toBe('NEEDS_REVIEW'); // classification preserved for audit
+    expect(row.status).toBe('rejected'); // mirrors NOOP — off the pending queue
+    expect(row.status_reason).toBe('NEEDS_REVIEW');
+    expect(row.target_kind).toBeNull();
+    // Absent from the default pending review (the human never triages it).
+    const pending = await listCandidates(engine, { status: 'pending' });
+    expect(pending.rows.find((r) => r.source_record_id === 'nr-1')).toBeUndefined();
+    // Still recorded in the decision log (audit + Tier-1 calibration unaffected).
+    const [{ n }] = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM consolidation_decisions WHERE source_record_id = 'nr-1' AND classification = 'NEEDS_REVIEW'`,
+    );
+    expect(Number(n)).toBe(1);
+  });
+
+  // ── U2: confidence-gate ADD/UPDATE surfacing ──────────────────────────────
+  test('U2: a low-confidence ADD (0.50 < 0.70 default) lands rejected/low_confidence, OFF pending, still logged', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a novel fact'], confidence: 0.8 }),
+      classify: () => JSON.stringify({ classification: 'ADD', confidence: 0.5 }),
+    });
+    const wrapped = withClassifierIO(engine, { hits: [fakeHit('clients/acme', 0.5, 'shared')] });
+    const res = await landRecords(wrapped, 'default', granolaLike, [rec('lc-add-1', 'cap')], { consolidate: true });
+    expect(res.written).toBe(1);
+    const [row] = await engine.executeRaw<{ classification: string; status: string; status_reason: string; confidence: number }>(
+      `SELECT classification, status, status_reason, confidence FROM connector_candidates WHERE source_record_id = 'lc-add-1'`,
+    );
+    expect(row.classification).toBe('ADD'); // classification KEPT (only the status changes)
+    expect(row.status).toBe('rejected');
+    expect(row.status_reason).toBe('low_confidence');
+    expect(row.confidence).toBeCloseTo(0.5, 5);
+    const pending = await listCandidates(engine, { status: 'pending' });
+    expect(pending.rows.find((r) => r.source_record_id === 'lc-add-1')).toBeUndefined();
+    const [{ n }] = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM consolidation_decisions WHERE source_record_id = 'lc-add-1' AND classification = 'ADD'`,
+    );
+    expect(Number(n)).toBe(1); // decision log records it despite being held back
+  });
+
+  test('U2: a high-confidence ADD (0.93 >= 0.70) surfaces as a pending candidate (no over-suppression)', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a novel durable fact'], confidence: 0.9 }),
+      classify: () => JSON.stringify({ classification: 'ADD', confidence: 0.93 }),
+    });
+    const wrapped = withClassifierIO(engine, { hits: [fakeHit('clients/acme', 0.5, 'shared')] });
+    await landRecords(wrapped, 'default', granolaLike, [rec('hc-add-1', 'cap')], { consolidate: true });
+    const [row] = await engine.executeRaw<{ classification: string; status: string; status_reason: string | null; confidence: number }>(
+      `SELECT classification, status, status_reason, confidence FROM connector_candidates WHERE source_record_id = 'hc-add-1'`,
+    );
+    expect(row.classification).toBe('ADD');
+    expect(row.status).toBe('pending');
+    expect(row.status_reason).toBeNull();
+    expect(row.confidence).toBeCloseTo(0.93, 5);
+    const pending = await listCandidates(engine, { status: 'pending' });
+    expect(pending.rows.find((r) => r.source_record_id === 'hc-add-1')).toBeDefined();
+  });
+
+  test('U2: the surface threshold is read from config — raising it to 0.90 holds back a 0.87 UPDATE (target fields kept)', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    await engine.setConfig('connectors.consolidation_surface_min_confidence', '0.90');
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a fact'], confidence: 0.8 }),
+      classify: () =>
+        JSON.stringify({
+          classification: 'UPDATE',
+          targets: ['clients/acme'],
+          merged_body: 'Acme body, updated.',
+          timeline_entry: '2026-06-27 — change.',
+          confidence: 0.87,
+        }),
+    });
+    const wrapped = withClassifierIO(engine, {
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme body.', 'shared') },
+    });
+    await landRecords(wrapped, 'default', granolaLike, [rec('cfg-upd-1', 'cap')], { consolidate: true });
+    const [row] = await engine.executeRaw<{
+      classification: string; status: string; status_reason: string;
+      target_kind: string; target_path: string; base_compiled_hash: string; timeline_entry: string;
+    }>(
+      `SELECT classification, status, status_reason, target_kind, target_path, base_compiled_hash, timeline_entry
+         FROM connector_candidates WHERE source_record_id = 'cfg-upd-1'`,
+    );
+    // 0.87 < configured 0.90 → held back, but the full UPDATE target survives for audit/recovery.
+    expect(row.classification).toBe('UPDATE');
+    expect(row.status).toBe('rejected');
+    expect(row.status_reason).toBe('low_confidence');
+    expect(row.target_kind).toBe('update_page');
+    expect(row.target_path).toBe('clients/acme.md');
+    expect(row.base_compiled_hash).not.toBeNull();
+    expect(row.timeline_entry).toBe('2026-06-27 — change.');
+    const pending = await listCandidates(engine, { status: 'pending' });
+    expect(pending.rows.find((r) => r.source_record_id === 'cfg-upd-1')).toBeUndefined();
+  });
+
+  // ── U3: TTL stamped per disposition ───────────────────────────────────────
+  test('U3: surfaced pending gets ~30d TTL; a held-back disposition gets ~7d TTL', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    const DAY = 24 * 60 * 60 * 1000;
+
+    // (a) a surfaced ADD (0.93 >= 0.70) → ~30 days.
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['a novel fact'], confidence: 0.9 }),
+      classify: () => JSON.stringify({ classification: 'ADD', confidence: 0.93 }),
+    });
+    const wrapped = withClassifierIO(engine, { hits: [fakeHit('clients/acme', 0.5, 'shared')] });
+    const before = Date.now();
+    await landRecords(wrapped, 'default', granolaLike, [rec('ttl-surf', 'cap')], { consolidate: true });
+    const after = Date.now();
+
+    // (b) a held-back NOOP (empty facts) → ~7 days.
+    stubChatRouting({ extract: () => JSON.stringify({ facts: [], confidence: 0.7 }) });
+    await landRecords(engine, 'default', granolaLike, [rec('ttl-held', 'hi — thanks, talk soon')], { consolidate: true });
+
+    const [surf] = await engine.executeRaw<{ expires_at: Date | string | null; status: string }>(
+      `SELECT expires_at, status FROM connector_candidates WHERE source_record_id = 'ttl-surf'`,
+    );
+    const [held] = await engine.executeRaw<{ expires_at: Date | string | null; status: string }>(
+      `SELECT expires_at, status FROM connector_candidates WHERE source_record_id = 'ttl-held'`,
+    );
+    expect(surf.status).toBe('pending');
+    expect(held.status).toBe('rejected');
+    expect(surf.expires_at).not.toBeNull();
+    expect(held.expires_at).not.toBeNull();
+    const surfMs = new Date(surf.expires_at as Date | string).getTime();
+    const heldMs = new Date(held.expires_at as Date | string).getTime();
+    // ~30 days out (generous window around the land time).
+    expect(surfMs).toBeGreaterThan(before + 29 * DAY);
+    expect(surfMs).toBeLessThan(after + 31 * DAY);
+    // ~7 days out — distinctly shorter than the surfaced TTL.
+    expect(heldMs).toBeGreaterThan(before + 6 * DAY);
+    expect(heldMs).toBeLessThan(after + 8 * DAY);
   });
 });

@@ -425,7 +425,11 @@ export async function listCandidates(
   const pageSize = Math.min(200, Math.max(1, Math.floor(opts.pageSize ?? 50)));
   const offset = (page - 1) * pageSize;
 
-  const filters: string[] = ['c.status = $1'];
+  // Self-cleaning queue (U3): an expired candidate never lists, even before the
+  // sweep hard-deletes it. NULL `expires_at` (legacy / non-consolidation rows) always
+  // lists (back-compat). Applied to BOTH the row and the count query below via the
+  // shared `where`, so the two never skew ("shows 5, returns 3").
+  const filters: string[] = ['c.status = $1', '(c.expires_at IS NULL OR c.expires_at > now())'];
   const params: unknown[] = [status];
   if (opts.sourceId) {
     params.push(opts.sourceId);
@@ -455,6 +459,31 @@ export async function listCandidates(
     page,
     pages: Math.max(1, Math.ceil(total / pageSize)),
   };
+}
+
+/**
+ * Self-cleaning sweep (U3 / KTD3): hard-delete every EXPIRED candidate that is not
+ * `accepted`, so the `connector_candidates` table stays bounded across polls. Returns
+ * the number of rows removed.
+ *
+ *  - `expires_at < now()` only — NULL `expires_at` (legacy / non-consolidation rows)
+ *    is never swept (the comparison is NULL → not TRUE).
+ *  - `status <> 'accepted'` is the load-bearing guard: an accepted candidate may have
+ *    an in-flight or merged promotion PR (promotion_status='pr_opened'/'indexed'), so
+ *    it MUST survive expiry — its promotion bridge owns its lifecycle, not the TTL.
+ *
+ * Idempotent: a second run with nothing newly expired deletes 0. Safe to call every
+ * poll. `RETURNING id` makes the count engine-portable (Postgres + PGLite) rather than
+ * relying on a driver-specific rowCount.
+ */
+export async function sweepExpiredCandidates(engine: BrainEngine): Promise<number> {
+  const rows = await engine.executeRaw<{ id: number }>(
+    `DELETE FROM connector_candidates
+      WHERE expires_at IS NOT NULL AND expires_at < now() AND status <> 'accepted'
+      RETURNING id`,
+    [],
+  );
+  return rows.length;
 }
 
 /**

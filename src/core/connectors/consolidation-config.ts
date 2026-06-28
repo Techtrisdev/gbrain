@@ -47,6 +47,13 @@ export const CONSOLIDATION_NOOP_COSINE_DEFAULT = 0.95;
 /** Global config key for the low-cosine "ADD, no close match" floor. */
 export const CONSOLIDATION_ADD_COSINE_FLOOR_KEY = 'connectors.consolidation_add_cosine_floor';
 
+/** Global config key for the minimum confidence at which an ADD/UPDATE SURFACES
+ *  to the human review queue (U2). Below it, the verdict is logged but held back. */
+export const CONSOLIDATION_SURFACE_MIN_CONFIDENCE_KEY = 'connectors.consolidation_surface_min_confidence';
+/** Default surfacing floor — chosen from the prod sample (keeps the 0.87/0.92/0.97
+ *  UPDATEs + ~0.93 ADDs, drops the 0.50 UPDATE). A starting point, not a tuned value. */
+export const CONSOLIDATION_SURFACE_MIN_CONFIDENCE_DEFAULT = 0.7;
+
 // ── 1. Enablement gate ───────────────────────────────────────────────────────
 
 /**
@@ -106,6 +113,23 @@ export async function consolidationModel(engine: BrainEngine | null): Promise<st
  */
 export async function consolidationNoopCosine(engine: BrainEngine): Promise<number> {
   return await readUnitFloat(engine, CONSOLIDATION_NOOP_COSINE_KEY, CONSOLIDATION_NOOP_COSINE_DEFAULT);
+}
+
+/**
+ * The minimum confidence at which an ADD/UPDATE verdict SURFACES to the human
+ * review queue (U2 surfacing gate). Reads
+ * `connectors.consolidation_surface_min_confidence`; falls back to 0.70. A
+ * malformed / out-of-[0,1] value is ignored (returns the default) rather than
+ * trusted — exactly mirroring {@link consolidationNoopCosine}. Below this floor
+ * the verdict is still logged + the candidate persisted (audit), it is just not
+ * pushed at the human.
+ */
+export async function consolidationSurfaceMinConfidence(engine: BrainEngine): Promise<number> {
+  return await readUnitFloat(
+    engine,
+    CONSOLIDATION_SURFACE_MIN_CONFIDENCE_KEY,
+    CONSOLIDATION_SURFACE_MIN_CONFIDENCE_DEFAULT,
+  );
 }
 
 /**
