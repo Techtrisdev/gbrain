@@ -1334,6 +1334,26 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
       expect(b2).toMatch(/^promote\/granola-[0-9a-f]{12}$/);
     });
 
+    test('KTD2 guard: a captureId containing "::" degrades to raw passthrough — no fan-out keying, no false idempotency (review finding 1)', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      // classify WOULD fan out into 2 rows if the guard did not fire first.
+      stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['x', 'y'], confidence: 0.8 }),
+        classify: twoTopicFanout,
+      });
+      const res = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('evil::id', 'cap')], { consolidate: true });
+      // The `::`-in-captureId guard fires BEFORE extract/classify → a single raw
+      // passthrough row, NOT a fan-out (which would collide the prefix idempotency).
+      expect(res.written).toBe(1);
+      const rows = await engine.executeRaw<{ source_record_id: string; classification: string | null }>(
+        `SELECT source_record_id, classification FROM connector_candidates WHERE source_id='default' AND source_record_id LIKE 'evil%'`,
+      );
+      expect(rows.length).toBe(1); // not the 2 fan-out rows
+      expect(rows[0].source_record_id).toBe('evil::id'); // landed verbatim under the bare id
+      expect(rows[0].classification).toBeNull(); // raw passthrough — NOT consolidated
+    });
+
     test('U2: a held-back (low-confidence) verdict lands rejected while its sibling lands pending (per-verdict disposition)', async () => {
       await enableGranolaConsolidation();
       configureEmbedding();

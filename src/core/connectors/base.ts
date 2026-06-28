@@ -322,6 +322,23 @@ async function landOneConsolidated(
       return await passthrough();
     }
 
+    // KTD2 invariant guard. The fan-out key `<captureId>::<target>` AND the
+    // prefix-based re-poll idempotency both ASSUME `::` never appears in a
+    // captureId. Granola note ids are opaque tokens (safe), but sibling connectors
+    // build colon-delimited ids (Linear `id:take:…`, Slack `channel:ts`) — enabling
+    // consolidation for one without this guard could collide two captures on one
+    // key, or cause a false idempotency hit (a silently-skipped, permanently-lost
+    // capture). Fail-safe: a captureId containing `::` degrades to raw passthrough
+    // (no fan-out keying, no prefix idempotency). Enforces the invariant the review
+    // flagged as unguarded; pairs with enabling any second connector.
+    if (candidate.source_record_id.includes('::')) {
+      console.error(
+        `[consolidation] captureId contains '::' for ${sourceId}/${provider} — ` +
+          `degrading to raw passthrough (fan-out keying requires no '::' in the capture id)`,
+      );
+      return await passthrough();
+    }
+
     // Idempotency pre-check (KTD3, fan-out-aware): a re-poll of an already-
     // consolidated CAPTURE must NOT re-pay the LLM. Under fan-out the capture lands
     // under `<captureId>::<target>` rows (not the bare id), so this checks BOTH the
@@ -353,14 +370,18 @@ async function landOneConsolidated(
       return await passthrough();
     }
 
-    const written = await persistConsolidated(
+    const { written, threw } = await persistConsolidated(
       engine, sourceId, candidate, version, verdicts, deps.surfaceMinConfidence,
     );
-    // If the fan-out landed NOTHING (every verdict's toRow threw or conflicted),
-    // preserve the capture via today's raw passthrough — idempotent, so a conflict
-    // is a no-op. A normal consolidation always writes ≥1 row, so this never
-    // double-writes alongside a successful fan-out.
-    return written > 0 ? written : await passthrough();
+    if (written > 0) return written;
+    // Nothing landed. Preserve via raw passthrough ONLY when the capture genuinely got
+    // nothing persisted: empty verdicts (no durable facts → land the idempotency marker
+    // so a re-poll skips it) or a verdict that THREW (its INSERT failed). If verdicts
+    // existed and ALL merely CONFLICTED (no throw), a concurrent poll already
+    // consolidated this capture — return 0, do NOT write a spurious bare-id raw
+    // candidate (review finding 3: the all-conflict fallback double-write under a race).
+    if (verdicts.length === 0 || threw) return await passthrough();
+    return 0;
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
     // KTD4 degrade: any other throw isolates to THIS record. Throws reach here only
@@ -392,10 +413,11 @@ async function persistConsolidated(
   version: string,
   verdicts: ConsolidationClassifyResult[],
   surfaceMinConfidence: number,
-): Promise<number> {
+): Promise<{ written: number; threw: boolean }> {
   const captureId = candidate.source_record_id;
   const fanOut = verdicts.length > 1;
   let written = 0;
+  let threw = false;
   for (const [index, verdict] of verdicts.entries()) {
     try {
       written += await persistOneVerdict(
@@ -405,6 +427,13 @@ async function persistConsolidated(
       if (isAbortError(err)) throw err; // graceful shutdown still propagates.
       // Per-verdict isolation: this verdict's row INSERT threw — log + skip it; the
       // sibling verdicts (already written or still to come) are unaffected.
+      // KNOWN LIMITATION (review finding 2): a thrown verdict is NOT retried — once a
+      // sibling lands, the per-capture prefix idempotency treats the whole capture as
+      // consolidated, so the failed partition is stranded. Rare (a transient row-INSERT
+      // throw), the human still sees the other partitions, and the loud log is the
+      // alert. A full fix (per-partition completion tracking / transactional fan-out)
+      // is a deferred follow-up.
+      threw = true;
       console.error(
         `[consolidation] fan-out verdict persist failed for ` +
           `${sourceId}/${fanoutRecordId(captureId, verdict, index, fanOut)} (${verdict.classification}): ` +
@@ -412,7 +441,7 @@ async function persistConsolidated(
       );
     }
   }
-  return written;
+  return { written, threw };
 }
 
 /**
@@ -489,6 +518,16 @@ async function persistOneVerdict(
       `[consolidation] decision-log write failed for ${sourceId}/${recordId} ` +
         `(${final.classification}) — candidate row persisted, audit row dropped: ` +
         `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (fanOut && !written) {
+    // Swallowed ON CONFLICT inside a fan-out (review finding 4): the model named one
+    // page in two partitions → both derive the same `<captureId>::<slug>` key →
+    // ON CONFLICT DO NOTHING drops the second body. The decision-log row above still
+    // records it; this makes the silent drop visible.
+    console.warn(
+      `[consolidation] fan-out verdict for ${sourceId}/${recordId} (${final.classification}) ` +
+        `conflicted on an existing key — body dropped (duplicate target in one capture)`,
     );
   }
   return written ? 1 : 0;
