@@ -494,6 +494,11 @@ function buildConsolidatedItem(
         target_kind: 'update_page',
         target_path: resolvedPath,
         timeline_entry: verdict.timeline_entry,
+        // base_compiled_hash is the KTD8 staleness guard. On a held-back
+        // (rejected/low_confidence) UPDATE it is RETAINED but INERT today — nothing
+        // reopens a rejected candidate. Any future "reopen rejected" admin action MUST
+        // re-validate this hash against current compiled-truth before promoting: the
+        // target page may have moved on while the row sat held-back/expiring.
         base_compiled_hash: verdict.base_compiled_hash,
         ...(heldBack ? { status: 'rejected' as const, status_reason: 'low_confidence' } : {}),
         expires_at: consolidationExpiry(heldBack),

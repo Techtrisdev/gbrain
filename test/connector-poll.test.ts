@@ -208,6 +208,19 @@ function makeStubConnector(provider: string, landed: number) {
   return { connector, backfillCalls };
 }
 
+/** True when `sql` is the U3 self-cleaning sweep DELETE — identified by its FULL
+ *  signature (a connector_candidates DELETE carrying BOTH the `expires_at` expiry
+ *  predicate AND the never-delete-`accepted` guard), not a bare substring. Used to
+ *  positively assert the sweep ran AND to exclude it from the "reconciliation never
+ *  deletes" guards without letting those guards go soft. */
+function isSweepDelete(sql: string): boolean {
+  return (
+    /DELETE\s+FROM\s+connector_candidates/i.test(sql) &&
+    /expires_at/i.test(sql) &&
+    /status\s*<>\s*'accepted'/i.test(sql)
+  );
+}
+
 describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
   test('AC3: resolves provider + calls the connector backfill, returns landed count', async () => {
     const { backfillCalls } = makeStubConnector('poll-probe-a', 7);
@@ -366,8 +379,9 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
 
     // Reconciliation NEVER deletes a record — it tombstones via INSERT. (The U3 TTL
     // self-cleaning sweep is the ONLY DELETE the poll runs; it is unrelated to
-    // reconciliation and is excluded here by its `expires_at` predicate.)
-    const reconcileDelete = calls.find((c) => /DELETE\s+FROM/i.test(c.sql) && !/expires_at/i.test(c.sql));
+    // reconciliation and is excluded here by its full sweep signature — expiry
+    // predicate + never-delete-accepted guard.)
+    const reconcileDelete = calls.find((c) => /DELETE\s+FROM/i.test(c.sql) && !isSweepDelete(c.sql));
     expect(reconcileDelete).toBeUndefined();
   });
 
@@ -431,9 +445,41 @@ describe('runConnectorPoll reconciliation — writes a tombstone, never a delete
     }, NO_ENV);
     expect(result.tombstoned).toBe(2);
     // Still tombstones via INSERT; reconciliation issues no DELETE (the U3 TTL sweep,
-    // identified by its `expires_at` predicate, is the only — unrelated — DELETE).
+    // identified by its full signature, is the only — unrelated — DELETE).
     expect(calls.find((c) => /INSERT INTO connector_candidates/.test(c.sql))).toBeDefined();
-    expect(calls.find((c) => /DELETE\s+FROM/i.test(c.sql) && !/expires_at/i.test(c.sql))).toBeUndefined();
+    expect(calls.find((c) => /DELETE\s+FROM/i.test(c.sql) && !isSweepDelete(c.sql))).toBeUndefined();
+  });
+});
+
+// ── U3: the poll actually runs the self-cleaning sweep ───────────────────────
+
+describe('runConnectorPoll — U3 self-cleaning sweep is wired into the poll', () => {
+  test('a completed poll issues the TTL sweep DELETE (expires_at + status<>accepted)', async () => {
+    makeStubConnector('poll-sweep-a', 2);
+    const { engine, calls } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-sweep-a', true) },
+    });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-sweep-a' }, NO_ENV);
+    // The poll reached the landing path (not skipped) …
+    expect(result.skippedReason).toBeUndefined();
+    expect(result.landed).toBe(2);
+    // … and the sweep fired: exactly the U3 TTL DELETE carrying BOTH the expiry
+    // predicate AND the never-delete-accepted guard was issued. (Positive proof the
+    // sweep runs — the negative reconciliation guards above would pass even if it
+    // never fired.)
+    const sweep = calls.find((c) => isSweepDelete(c.sql));
+    expect(sweep).toBeDefined();
+  });
+
+  test('a SKIPPED poll (disabled connector) runs no sweep — the sweep is after landing', async () => {
+    makeStubConnector('poll-sweep-b', 0);
+    const { engine, calls } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-sweep-b', false) }, // disabled → skipped
+    });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-sweep-b' }, NO_ENV);
+    expect(result.skippedReason).toBe('connector_not_enabled');
+    // No landing path → no sweep (the early-return skip paths never delete).
+    expect(calls.find((c) => isSweepDelete(c.sql))).toBeUndefined();
   });
 });
 
