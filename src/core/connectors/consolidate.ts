@@ -865,6 +865,16 @@ function interpretOneClassification(
       // matched target instead. (`Page.timeline` is already the trimmed decomposed
       // timeline; '' for a no-sentinel page. ~4 of 93 live `shared` pages — under
       // docs/ and handoffs/ — have no `## Timeline`.)
+      //
+      // `timeline === ''` is a deliberately CONSERVATIVE proxy, not an exact one: a
+      // degenerate page whose only timeline structure is a bare `<!-- timeline -->`
+      // sentinel with nothing after it also decomposes to `timeline: ''`, yet the
+      // receiver's `_split_page_for_update` WOULD split it (it finds the sentinel and
+      // does not raise). Guarding on '' over-fires that case to NEEDS_REVIEW — but it
+      // is unreachable in practice (serializeMarkdown only emits the sentinel for a
+      // non-empty timeline; human pages use the `## Timeline` heading form whose
+      // region is never empty) AND fail-safe (over-firing yields human review, never a
+      // bad write). Accepted over a cross-boundary `hasTimelineSentinel` signal.
       if (!(targetPage.timeline ?? '').trim()) {
         return result('NEEDS_REVIEW', conf, { ...meta, target_path: targetSlug });
       }
