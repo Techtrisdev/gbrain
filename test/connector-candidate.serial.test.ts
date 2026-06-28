@@ -17,6 +17,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import {
   toRow,
+  captureConsolidated,
   listCandidates,
   sweepExpiredCandidates,
   approveCandidate,
@@ -1256,5 +1257,243 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     // ~7 days out — distinctly shorter than the surfaced TTL.
     expect(heldMs).toBeGreaterThan(before + 6 * DAY);
     expect(heldMs).toBeLessThan(after + 8 * DAY);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Multi-topic FAN-OUT (this plan): one capture → N targeted proposals.
+  //   U2 — per-target keying (`<captureId>::<slug>`), distinct receiver branch
+  //        names, per-verdict disposition + single-writer.
+  //   U3 — re-poll idempotency: the prefix/`=` pre-check recognizes a fanned-out
+  //        capture so a re-poll re-pays ZERO LLM calls.
+  // ──────────────────────────────────────────────────────────────────────────
+  describe('multi-topic fan-out — keying (U2) + re-poll idempotency (U3)', () => {
+    /** Receiver branch name — a faithful replica of techtris-brain
+     *  promote_candidate.py:branch_name (`promote/<provider>-<sha256("<sid>|<srid>")[:12]>`),
+     *  used to assert that fan-out candidates land on DISTINCT branches (KTD4). */
+    function receiverBranch(provider: string, sourceId: string, srid: string): string {
+      const safe = provider.replace(/[^a-zA-Z0-9-]/g, '-');
+      return `promote/${safe}-${compiledTruthHash(`${sourceId}|${srid}`).slice(0, 12)}`;
+    }
+
+    /** A classify handler emitting a 2-topic fan-out (UPDATE clients/acme + UPDATE integrations/olo). */
+    const twoTopicFanout = (): string =>
+      JSON.stringify([
+        { classification: 'UPDATE', target: 'clients/acme', merged_body: 'Acme updated.', timeline_entry: '2026-06-27 — Acme.', confidence: 0.84 },
+        { classification: 'UPDATE', target: 'integrations/olo', merged_body: 'Olo updated.', timeline_entry: '2026-06-27 — Olo.', confidence: 0.8 },
+      ]);
+
+    /** Classifier I/O exposing both topic pages as candidates. */
+    const twoTopicIO = (): BrainEngine =>
+      withClassifierIO(engine, {
+        hits: [fakeHit('clients/acme', 0.55, 'shared'), fakeHit('integrations/olo', 0.5, 'shared')],
+        pages: {
+          'clients/acme': fakePage('clients/acme', 'Acme.', 'shared'),
+          'integrations/olo': fakePage('integrations/olo', 'Olo.', 'shared'),
+        },
+      });
+
+    test('U2: a 2-topic capture writes 2 candidate rows with distinct per-target source_record_id + 2 decision-log rows', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['Acme signed', 'Olo webhook changed'], confidence: 0.8 }),
+        classify: twoTopicFanout,
+      });
+      const res = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('mt-1', 'Acme + Olo meeting')], { consolidate: true });
+      expect(res.written).toBe(2); // fan-out → 2 rows from ONE capture
+      const rows = await engine.executeRaw<{ source_record_id: string; classification: string; target_path: string }>(
+        `SELECT source_record_id, classification, target_path FROM connector_candidates WHERE source_record_id LIKE 'mt-1::%' ORDER BY source_record_id`,
+      );
+      expect(rows.map((r) => r.source_record_id)).toEqual(['mt-1::clients/acme', 'mt-1::integrations/olo']);
+      expect(rows.every((r) => r.classification === 'UPDATE')).toBe(true);
+      expect(rows.map((r) => r.target_path).sort()).toEqual(['clients/acme.md', 'integrations/olo.md']);
+      // NO bare-captureId row was written (the capture fanned out entirely).
+      const [{ n: bare }] = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM connector_candidates WHERE source_record_id = 'mt-1'`,
+      );
+      expect(Number(bare)).toBe(0);
+      // Two decision-log rows, one per target.
+      const dl = await engine.executeRaw<{ source_record_id: string }>(
+        `SELECT source_record_id FROM consolidation_decisions WHERE source_record_id LIKE 'mt-1::%' ORDER BY source_record_id`,
+      );
+      expect(dl.map((r) => r.source_record_id)).toEqual(['mt-1::clients/acme', 'mt-1::integrations/olo']);
+    });
+
+    test('U2: the two fan-out rows produce DISTINCT receiver branch names (the KTD2 collision guard)', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['Acme', 'Olo'], confidence: 0.8 }),
+        classify: twoTopicFanout,
+      });
+      await landRecords(twoTopicIO(), 'default', granolaLike, [rec('mt-br', 'cap')], { consolidate: true });
+      const b1 = receiverBranch('granola', 'default', 'mt-br::clients/acme');
+      const b2 = receiverBranch('granola', 'default', 'mt-br::integrations/olo');
+      expect(b1).not.toBe(b2); // distinct branch ⇒ distinct PR ⇒ independent promotion
+      expect(b1).toMatch(/^promote\/granola-[0-9a-f]{12}$/);
+      expect(b2).toMatch(/^promote\/granola-[0-9a-f]{12}$/);
+    });
+
+    test('KTD2 guard: a captureId containing "::" degrades to raw passthrough — no fan-out keying, no false idempotency (review finding 1)', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      // classify WOULD fan out into 2 rows if the guard did not fire first.
+      stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['x', 'y'], confidence: 0.8 }),
+        classify: twoTopicFanout,
+      });
+      const res = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('evil::id', 'cap')], { consolidate: true });
+      // The `::`-in-captureId guard fires BEFORE extract/classify → a single raw
+      // passthrough row, NOT a fan-out (which would collide the prefix idempotency).
+      expect(res.written).toBe(1);
+      const rows = await engine.executeRaw<{ source_record_id: string; classification: string | null }>(
+        `SELECT source_record_id, classification FROM connector_candidates WHERE source_id='default' AND source_record_id LIKE 'evil%'`,
+      );
+      expect(rows.length).toBe(1); // not the 2 fan-out rows
+      expect(rows[0].source_record_id).toBe('evil::id'); // landed verbatim under the bare id
+      expect(rows[0].classification).toBeNull(); // raw passthrough — NOT consolidated
+    });
+
+    test('U2: a held-back (low-confidence) verdict lands rejected while its sibling lands pending (per-verdict disposition)', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['a', 'b'], confidence: 0.8 }),
+        classify: () =>
+          JSON.stringify([
+            { classification: 'UPDATE', target: 'clients/acme', merged_body: 'Acme updated.', timeline_entry: '2026-06-27 — Acme.', confidence: 0.9 },
+            { classification: 'ADD', target: 'projects/new', confidence: 0.4 }, // < 0.70 surface floor → held back
+          ]),
+      });
+      const wrapped = withClassifierIO(engine, {
+        hits: [fakeHit('clients/acme', 0.5, 'shared')],
+        pages: { 'clients/acme': fakePage('clients/acme', 'Acme.', 'shared') },
+      });
+      const res = await landRecords(wrapped, 'default', granolaLike, [rec('mt-hb', 'cap')], { consolidate: true });
+      expect(res.written).toBe(2);
+      const rows = await engine.executeRaw<{ classification: string; status: string; status_reason: string | null }>(
+        `SELECT classification, status, status_reason FROM connector_candidates WHERE source_record_id LIKE 'mt-hb::%'`,
+      );
+      const upd = rows.find((r) => r.classification === 'UPDATE')!;
+      const add = rows.find((r) => r.classification === 'ADD')!;
+      expect(upd.status).toBe('pending'); // surfaced
+      expect(add.status).toBe('rejected'); // held back
+      expect(add.status_reason).toBe('low_confidence');
+    });
+
+    test('U2: a fan-out verdict whose target already has an in-flight update_page → that verdict NEEDS_REVIEW, the sibling proceeds', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      // Pre-seed a pending in-flight update_page on clients/acme.
+      await toRow(engine, {
+        source_id: 'default', source_record_id: 'prior-acme', provider: 'granola',
+        classification: 'UPDATE', target_kind: 'update_page', target_path: 'clients/acme.md',
+        proposed_markdown: 'prior', timeline_entry: 't', base_compiled_hash: 'x', status: 'pending',
+      });
+      stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['a', 'b'], confidence: 0.8 }),
+        classify: twoTopicFanout, // touches clients/acme + integrations/olo
+      });
+      const res = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('mt-sw', 'cap')], { consolidate: true });
+      expect(res.written).toBe(2);
+      const rows = await engine.executeRaw<{ source_record_id: string; classification: string; target_kind: string | null }>(
+        `SELECT source_record_id, classification, target_kind FROM connector_candidates WHERE source_record_id LIKE 'mt-sw::%'`,
+      );
+      const acme = rows.find((r) => r.source_record_id === 'mt-sw::clients/acme')!;
+      const olo = rows.find((r) => r.source_record_id === 'mt-sw::integrations/olo')!;
+      expect(acme.classification).toBe('NEEDS_REVIEW'); // single-writer downgrade (acme already in flight)
+      expect(acme.target_kind).toBeNull();
+      expect(olo.classification).toBe('UPDATE'); // the sibling page is free → proceeds
+      expect(olo.target_kind).toBe('update_page');
+    });
+
+    test('U3: re-polling an already-fanned-out capture lands 0 new rows AND pays 0 LLM calls', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      const { calls } = stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['Acme', 'Olo'], confidence: 0.8 }),
+        classify: twoTopicFanout,
+      });
+      // First poll → fan-out lands 2 rows, pays LLM (extract + classify).
+      const first = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('mt-idem', 'cap')], { consolidate: true });
+      expect(first.written).toBe(2);
+      const callsAfterFirst = calls.length;
+      expect(callsAfterFirst).toBeGreaterThan(0);
+      // Re-poll the SAME capture → the `mt-idem::` prefix pre-check skips it.
+      const second = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('mt-idem', 'cap')], { consolidate: true });
+      expect(second.written).toBe(0); // no new rows
+      expect(calls.length).toBe(callsAfterFirst); // ZERO additional LLM calls (no re-pay)
+      const [{ n }] = await engine.executeRaw<{ n: number }>(
+        `SELECT count(*)::int AS n FROM connector_candidates WHERE source_record_id LIKE 'mt-idem::%'`,
+      );
+      expect(Number(n)).toBe(2); // count stable
+    });
+
+    test('U3: a single-verdict (bare-id) capture is ALSO recognized on re-poll (the `=` branch)', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      const io = (): BrainEngine => withClassifierIO(engine, { hits: [fakeHit('clients/acme', 0.5, 'shared')] });
+      const { calls } = stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['one fact'], confidence: 0.8 }),
+        classify: () => JSON.stringify([{ classification: 'ADD', target: 'projects/x', confidence: 0.9 }]),
+      });
+      const first = await landRecords(io(), 'default', granolaLike, [rec('sv-idem', 'cap')], { consolidate: true });
+      expect(first.written).toBe(1); // single verdict → BARE captureId row
+      const callsAfterFirst = calls.length;
+      const second = await landRecords(io(), 'default', granolaLike, [rec('sv-idem', 'cap')], { consolidate: true });
+      expect(second.written).toBe(0);
+      expect(calls.length).toBe(callsAfterFirst); // no re-pay (the `= captureId` branch matched)
+    });
+
+    test('U3: a mixed batch — one already-consolidated capture + one new — pays the LLM only for the new one', async () => {
+      await enableGranolaConsolidation();
+      configureEmbedding();
+      const { calls } = stubChatRouting({
+        extract: () => JSON.stringify({ facts: ['Acme', 'Olo'], confidence: 0.8 }),
+        classify: twoTopicFanout,
+      });
+      // Consolidate 'batch-done' first.
+      await landRecords(twoTopicIO(), 'default', granolaLike, [rec('batch-done', 'cap')], { consolidate: true });
+      const callsBefore = calls.length;
+      // A re-poll batch: the done capture + a brand-new one.
+      const res = await landRecords(twoTopicIO(), 'default', granolaLike, [rec('batch-done', 'cap'), rec('batch-new', 'cap2')], { consolidate: true });
+      expect(res.written).toBe(2); // only batch-new's 2 fan-out rows
+      expect(calls.length).toBe(callsBefore + 2); // ONLY the new capture paid (extract + classify)
+      const [{ done }] = await engine.executeRaw<{ done: number }>(
+        `SELECT count(*)::int AS done FROM connector_candidates WHERE source_record_id LIKE 'batch-done::%'`,
+      );
+      const [{ fresh }] = await engine.executeRaw<{ fresh: number }>(
+        `SELECT count(*)::int AS fresh FROM connector_candidates WHERE source_record_id LIKE 'batch-new::%'`,
+      );
+      expect(Number(done)).toBe(2); // unchanged
+      expect(Number(fresh)).toBe(2); // newly consolidated
+    });
+  });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// captureConsolidated — the fan-out-aware idempotency pre-check (U3 / KTD3),
+// tested directly: bare-id `=` match, `<captureId>::` prefix match, and LIKE
+// metacharacter escaping (a captureId with '_' must match LITERALLY, not as a
+// wildcard).
+// ──────────────────────────────────────────────────────────────────────────────
+describe('captureConsolidated — fan-out-aware idempotency pre-check (KTD3)', () => {
+  test('matches the <captureId>:: prefix; LIKE metachars in the captureId are escaped', async () => {
+    // A captureId containing a LIKE wildcard ('_') must be matched LITERALLY.
+    await toRow(engine, { source_id: 'default', source_record_id: 'not_abc::clients/acme', provider: 'granola', proposed_markdown: 'x' });
+    expect(await captureConsolidated(engine, 'default', 'not_abc', '1')).toBe(true);
+    // A different id that would ONLY match if '_' were treated as a wildcard must NOT match.
+    expect(await captureConsolidated(engine, 'default', 'notXabc', '1')).toBe(false);
+    // A wholly unrelated capture → false.
+    expect(await captureConsolidated(engine, 'default', 'other', '1')).toBe(false);
+  });
+
+  test('matches a bare-id (single-verdict) row via the `=` branch, version-scoped', async () => {
+    await toRow(engine, { source_id: 'default', source_record_id: 'bare-1', provider: 'granola', proposed_markdown: 'x' });
+    expect(await captureConsolidated(engine, 'default', 'bare-1', '1')).toBe(true);
+    // A different version is a different idempotency tuple → not matched.
+    expect(await captureConsolidated(engine, 'default', 'bare-1', '2')).toBe(false);
+    // A different source → not matched (source-scoped).
+    expect(await captureConsolidated(engine, 'other-src', 'bare-1', '1')).toBe(false);
   });
 });
