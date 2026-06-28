@@ -741,14 +741,22 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
 
   // Default source is the durable 'shared' corpus (the classifier's default scope),
   // so a canned hit/page survives the default source filter unless we say otherwise.
-  function fakePage(slug: string, compiled_truth: string, source_id = 'shared'): Page {
+  // Default `timeline` is NON-EMPTY so a candidate is two-layer-updatable by default
+  // (HF-1: an UPDATE to a `timeline: ''` page degrades to NEEDS_REVIEW). Pass '' as
+  // the 4th arg to exercise the no-timeline guard.
+  function fakePage(
+    slug: string,
+    compiled_truth: string,
+    source_id = 'shared',
+    timeline = '2026-01-01 — Page created.',
+  ): Page {
     return {
       id: 1,
       slug,
       type: 'note',
       title: slug,
       compiled_truth,
-      timeline: '',
+      timeline,
       frontmatter: {},
       created_at: new Date('2026-01-01T00:00:00Z'),
       updated_at: new Date('2026-01-01T00:00:00Z'),
@@ -1068,6 +1076,133 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     expect(getPageCalls).toEqual([{ slug: 'clients/acme', sourceId: 'shared' }]);
     expect(r!.confidence).toBe(0.82);
     expect(r!.tier1_cosine).toBe(0.55);
+  });
+
+  // ── HF-1: UPDATE to a NO-`## Timeline` (non-two-layer) target degrades safely ──
+  // gbrain's splitBody is LENIENT (a no-sentinel page → timeline ''), but the
+  // techtris-brain receiver's _split_page_for_update is STRICT (no sentinel →
+  // ValueError → fail-close to NEEDS_REVIEW). So a single matched target that simply
+  // isn't two-layer-updatable must NOT emit a doomed update_page artifact — degrade to
+  // an honest NEEDS_REVIEW here (named target, NO base_compiled_hash / merged_body).
+  test('UPDATE to a target with an EMPTY timeline (no ## Timeline) → NEEDS_REVIEW (HF-1), no hash stamped', async () => {
+    configureEmbedding();
+    const { calls } = stubChat(
+      JSON.stringify({
+        classification: 'UPDATE',
+        targets: ['docs/runbook'],
+        merged_body: 'Runbook body, updated with a new step.',
+        timeline_entry: '2026-06-28 — Updated the runbook from the ops sync.',
+        confidence: 0.88,
+      }),
+    );
+    // A REAL, single, matched target — but it is NOT two-layer (timeline: '').
+    const { engine } = makeEngine({
+      hits: [fakeHit('docs/runbook', 0.5, 'shared')],
+      pages: { 'docs/runbook': fakePage('docs/runbook', 'Runbook body.', 'shared', '') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r!.classification).toBe('NEEDS_REVIEW'); // NOT UPDATE — the receiver would bounce it
+    expect(r!.target_path).toBe('docs/runbook'); // matched target surfaced for the operator
+    expect(r!.base_compiled_hash).toBeNull(); // no doomed update_page artifact stamped
+    expect(r!.merged_body).toBeNull();
+    expect(r!.timeline_entry).toBeNull();
+    expect(calls.length).toBe(1); // the mid-band LLM still ran — the guard is post-classify
+  });
+
+  test('UPDATE to a target WITH a non-empty ## Timeline still classifies UPDATE (guard does not over-fire)', async () => {
+    configureEmbedding();
+    const targetBody = 'Acme is a Series B customer.\n\nRenewal: pending.';
+    stubChat(
+      JSON.stringify({
+        classification: 'UPDATE',
+        targets: ['clients/acme'],
+        merged_body: 'Acme is a Series B customer.\n\nRenewal: SIGNED (Q3).',
+        timeline_entry: '2026-06-28 — Renewal signed per the Acme sync.',
+        confidence: 0.8,
+      }),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.55, 'shared')],
+      // EXPLICIT non-empty timeline → the page IS two-layer-updatable.
+      pages: { 'clients/acme': fakePage('clients/acme', targetBody, 'shared', '2026-01-01 — Created.') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r!.classification).toBe('UPDATE'); // the guard does not fire on a real two-layer page
+    expect(r!.base_compiled_hash).toBe(sha256(targetBody)); // stamped on the clean path
+  });
+
+  // ── HF-1: whitespace-only timeline still degrades (locks the `.trim()` behavior) ──
+  // A page whose timeline is non-empty as a raw string but BLANK after `.trim()`
+  // ('   \n  ') decomposes the same as a no-sentinel page for the receiver's strict
+  // `_split_page_for_update`. The guard trims before testing, so this must degrade.
+  test('UPDATE to a target whose timeline is WHITESPACE-ONLY → still NEEDS_REVIEW (HF-1 .trim() lock)', async () => {
+    configureEmbedding();
+    stubChat(
+      JSON.stringify({
+        classification: 'UPDATE',
+        targets: ['docs/runbook'],
+        merged_body: 'Runbook body, updated with a new step.',
+        timeline_entry: '2026-06-28 — Updated the runbook from the ops sync.',
+        confidence: 0.88,
+      }),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('docs/runbook', 0.5, 'shared')],
+      // Non-empty raw string, but `.trim()` collapses it to '' → the guard must fire.
+      pages: { 'docs/runbook': fakePage('docs/runbook', 'Runbook body.', 'shared', '   \n  ') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r!.classification).toBe('NEEDS_REVIEW'); // .trim() empties the timeline → degrade
+    expect(r!.target_path).toBe('docs/runbook');
+    expect(r!.base_compiled_hash).toBeNull(); // no doomed update_page artifact stamped
+  });
+
+  // ── HF-1: per-target isolation under multi-topic FAN-OUT ───────────────────────
+  // A SINGLE capture fans out to TWO real, matched targets in one classifier call:
+  // target A (docs/runbook) is NOT two-layer (timeline: '') → its verdict must degrade
+  // to NEEDS_REVIEW; sibling B (clients/acme) HAS a `## Timeline` → its verdict must
+  // stay a clean UPDATE. This pins the per-target isolation the guard depends on —
+  // the degrade fires per fan-out ELEMENT inside `interpretOneClassification`, never
+  // poisoning a healthy sibling.
+  test('mixed fan-out: a no-## Timeline target degrades to NEEDS_REVIEW while a two-layer sibling stays UPDATE (HF-1)', async () => {
+    configureEmbedding();
+    const acmeBody = 'Acme is a Series B customer.\n\nRenewal: pending.';
+    stubChat(
+      JSON.stringify([
+        {
+          classification: 'UPDATE',
+          target: 'docs/runbook', // REAL matched target, but NOT two-layer (timeline: '')
+          merged_body: 'Runbook body, updated with a new step.',
+          timeline_entry: '2026-06-28 — Updated the runbook.',
+          confidence: 0.85,
+        },
+        {
+          classification: 'UPDATE',
+          target: 'clients/acme', // REAL two-layer target (non-empty timeline)
+          merged_body: 'Acme is a Series B customer.\n\nRenewal: SIGNED (Q3).',
+          timeline_entry: '2026-06-28 — Renewal signed.',
+          confidence: 0.84,
+        },
+      ]),
+    );
+    const { engine } = makeEngine({
+      hits: [fakeHit('docs/runbook', 0.55, 'shared'), fakeHit('clients/acme', 0.5, 'shared')],
+      pages: {
+        'docs/runbook': fakePage('docs/runbook', 'Runbook body.', 'shared', ''), // NO timeline → guard fires
+        'clients/acme': fakePage('clients/acme', acmeBody, 'shared', '2026-01-01 — Created.'), // HAS timeline
+      },
+    });
+    const r = await callClassify(engine, { facts: ['Runbook changed', 'Acme renewal signed'] });
+    expect(r!.length).toBe(2);
+    const runbook = r!.find((v) => v.target_path === 'docs/runbook')!;
+    const acme = r!.find((v) => v.target_path === 'clients/acme')!;
+    // The no-## Timeline target degrades — and stamps NO doomed update_page artifact.
+    expect(runbook.classification).toBe('NEEDS_REVIEW');
+    expect(runbook.base_compiled_hash).toBeNull();
+    expect(runbook.merged_body).toBeNull();
+    // Its two-layer sibling is UNAFFECTED (per-target isolation the guard depends on).
+    expect(acme.classification).toBe('UPDATE');
+    expect(acme.base_compiled_hash).toBe(sha256(acmeBody));
   });
 
   test('UPDATE with a hallucinated (unmatched) target → NEEDS_REVIEW (never an UPDATE on a non-candidate)', async () => {
