@@ -336,6 +336,18 @@ function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): voi
 }
 
 export async function runCapture(engine: BrainEngine | null, args: string[]): Promise<void> {
+  // Subcommand: `gbrain capture distill …` distills raw per-turn captures into
+  // a FEW durable-memory pages. Routed here (rather than in cli.ts) so the
+  // pre-engine-bind `--help` path AND the engine-connected dispatch both reach
+  // it. `distill` is reserved — to capture the literal word, quote more content
+  // (e.g. `gbrain capture "distill X"`), matching the connector poll/review
+  // subcommand convention.
+  if (args[0] === 'distill') {
+    const { runCaptureDistill } = await import('./capture-distill.ts');
+    await runCaptureDistill(engine, args.slice(1));
+    return;
+  }
+
   const parsed = parseArgs(args);
   if ('help' in parsed) {
     console.log(HELP);
