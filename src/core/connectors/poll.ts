@@ -35,6 +35,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
+import { withRefreshingLock, LockUnavailableError } from '../db-lock.ts';
 import { getConnector, type ConnectorSource } from './base.ts';
 import { toRow, sweepExpiredCandidates, type ConnectorCandidateItem } from './candidate.ts';
 
@@ -305,7 +306,8 @@ export interface ConnectorPollResult {
     | 'killswitch_tripped'
     | 'connector_not_registered'
     | 'connector_not_enabled'
-    | 'backfill_unsupported';
+    | 'backfill_unsupported'
+    | 'poll_in_progress';
 }
 
 /**
@@ -381,56 +383,93 @@ export async function runConnectorPoll(
     return { ...base, skippedReason: 'backfill_unsupported' };
   }
 
+  // FU1: serialize polls of the SAME (source, provider) so a manual/CLI poll can't race
+  // the scheduled poll into duplicate/leftover consolidation — without it both pass the
+  // per-capture idempotency pre-check before either writes, and a fan-out's per-target
+  // `<id>::<slug>` keys don't collide with the loser's bare-id rows, so both land. The
+  // actual poll work is a closure so it can run either locked or (on an unsupported
+  // engine) unlocked.
   const source: ConnectorSource = { id: row.id, config: row.config };
-  const landed = await connector.backfill(engine, source);
+  // Capture the narrowed backfill fn — TS narrowing on `connector.backfill` (from the
+  // gate above) doesn't persist into the deferred closure below.
+  const backfill = connector.backfill;
+  const doPollWork = async (): Promise<ConnectorPollResult> => {
+    const landed = await backfill(engine, source);
 
-  // Reconciliation gate (anti-mass-tombstone): run ONLY when we have an authoritative,
-  // non-empty current set, OR the connector explicitly confirmed zero records. An empty
-  // `seenRecordIds` without `confirmedEmpty` is treated as "no reliable signal" and
-  // skipped — never as "everything vanished".
-  const reconcile =
-    (params.seenRecordIds !== undefined && params.seenRecordIds.length > 0) ||
-    params.confirmedEmpty === true;
+    // Reconciliation gate (anti-mass-tombstone): run ONLY when we have an authoritative,
+    // non-empty current set, OR the connector explicitly confirmed zero records. An empty
+    // `seenRecordIds` without `confirmedEmpty` is treated as "no reliable signal" and
+    // skipped — never as "everything vanished".
+    const reconcile =
+      (params.seenRecordIds !== undefined && params.seenRecordIds.length > 0) ||
+      params.confirmedEmpty === true;
 
-  let tombstoned = 0;
-  if (reconcile) {
-    const known = await readKnownRecordIds(engine, sourceId, provider);
-    const tombstones = computeTombstoneCandidates({
-      sourceId,
-      provider,
-      knownRecordIds: known,
-      // confirmedEmpty with no ids → empty seen set → every known record is a vanish.
-      seenRecordIds: params.seenRecordIds ?? [],
-    });
-    for (const t of tombstones) {
-      // toRow is the single redaction + table-only write boundary (never a page,
-      // never a delete). ON CONFLICT DO NOTHING makes a re-run a safe no-op.
-      const { written } = await toRow(engine, t);
-      if (written) tombstoned += 1;
+    let tombstoned = 0;
+    if (reconcile) {
+      const known = await readKnownRecordIds(engine, sourceId, provider);
+      const tombstones = computeTombstoneCandidates({
+        sourceId,
+        provider,
+        knownRecordIds: known,
+        // confirmedEmpty with no ids → empty seen set → every known record is a vanish.
+        seenRecordIds: params.seenRecordIds ?? [],
+      });
+      for (const t of tombstones) {
+        // toRow is the single redaction + table-only write boundary (never a page,
+        // never a delete). ON CONFLICT DO NOTHING makes a re-run a safe no-op.
+        const { written } = await toRow(engine, t);
+        if (written) tombstoned += 1;
+      }
     }
+
+    // Self-cleaning queue (U3): after landing, hard-delete expired non-accepted
+    // candidates so the table stays bounded across polls. This is the ONE deletion the
+    // poll performs and it is TTL-driven — distinct from reconciliation, which never
+    // deletes a record (it tombstones). Idempotent (a second poll deletes 0) and
+    // NON-FATAL: the poll's real work (backfill + tombstones) is already committed, so a
+    // sweep failure is logged, never propagated.
+    try {
+      const swept = await sweepExpiredCandidates(engine);
+      if (swept > 0) {
+        // Operational diagnostic on stderr (keeps stdout clean for structured output,
+        // matching serve-http's sweepExpiredTokens + eval's cache sweep).
+        console.error(`[connector] swept ${swept} expired candidate(s) after ${provider} poll of ${sourceId}`);
+      }
+    } catch (err) {
+      console.error(
+        `[connector] candidate sweep failed for ${sourceId}/${provider} ` +
+          `(poll work already committed): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return { ...base, landed, tombstoned };
+  };
+
+  // Capability probe: an engine without the postgres-js / PGLite escape hatch can't take
+  // the DB lock (an embedded / test engine). Degrade to UNLOCKED (best-effort) — the lock
+  // is a defensive serializer, not a correctness requirement — rather than fail the poll.
+  const lockCapable =
+    (engine.kind === 'postgres' && (engine as { sql?: unknown }).sql != null) ||
+    (engine.kind === 'pglite' && (engine as { db?: unknown }).db != null);
+  if (!lockCapable) {
+    console.error(`[connector] poll lock unsupported for ${sourceId}/${provider}, proceeding unlocked (best-effort)`);
+    return await doPollWork();
   }
 
-  // Self-cleaning queue (U3): after landing, hard-delete expired non-accepted
-  // candidates so the table stays bounded across polls. This is the ONE deletion the
-  // poll performs and it is TTL-driven — distinct from reconciliation, which never
-  // deletes a record (it tombstones). Idempotent (a second poll deletes 0) and
-  // NON-FATAL: the poll's real work (backfill + tombstones) is already committed, so a
-  // sweep failure is logged, never propagated.
+  // Lock-capable → serialize via a TTL-REFRESHING DB-row lock: the TTL is refreshed
+  // 6x/window so even a long first-sync backfill (full createdAfter=null re-list +
+  // per-capture LLM calls) can't expire it mid-run, and release errors are swallowed
+  // internally (db-lock.ts). A genuinely-held lock → LockUnavailableError → clean skip.
+  // CRITICAL (review): a transient acquire error is NOT fail-OPENED — it propagates so
+  // the worker retries (fail-CLOSED), never proceeding unlocked into the race. In prod
+  // the engine always has `.sql`, so this catch only ever sees a real held-lock or a
+  // transient error, never the unsupported-engine path.
   try {
-    const swept = await sweepExpiredCandidates(engine);
-    if (swept > 0) {
-      // Operational diagnostic on stderr (keeps stdout clean for structured output,
-      // matching serve-http's sweepExpiredTokens + eval's cache sweep).
-      console.error(`[connector] swept ${swept} expired candidate(s) after ${provider} poll of ${sourceId}`);
-    }
+    return await withRefreshingLock(engine, `connector-poll:${sourceId}:${provider}`, doPollWork);
   } catch (err) {
-    console.error(
-      `[connector] candidate sweep failed for ${sourceId}/${provider} ` +
-        `(poll work already committed): ${err instanceof Error ? err.message : String(err)}`,
-    );
+    if (err instanceof LockUnavailableError) return { ...base, skippedReason: 'poll_in_progress' };
+    throw err; // transient acquire error OR a doPollWork throw → propagate (fail-closed / Minion retries)
   }
-
-  return { ...base, landed, tombstoned };
 }
 
 /** Driver-tolerant 42703 (undefined_column) detector. Mirrors sources-load.ts. */

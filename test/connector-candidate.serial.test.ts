@@ -1003,6 +1003,47 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     expect(good.classification).toBe('NOOP'); // batch continued + consolidated
   });
 
+  test('FU2: a transient verdict-INSERT throw is RETRIED so the partition lands (not stranded)', async () => {
+    await enableGranolaConsolidation();
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['Acme signed'], confidence: 0.8 }),
+      classify: () =>
+        JSON.stringify([{ classification: 'ADD', target: null, merged_body: null, timeline_entry: null, confidence: 0.85 }]),
+    });
+    // Make the candidate INSERT (toRow) throw on its FIRST attempt only, then succeed —
+    // a transient backend hiccup. FU2's bounded retry must re-issue it so the verdict
+    // lands rather than being stranded by the per-verdict catch.
+    let insertAttempts = 0;
+    const flaky = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'executeRaw') {
+          return async (sql: string, params?: unknown[]) => {
+            if (
+              /INSERT INTO connector_candidates/i.test(sql) &&
+              Array.isArray(params) &&
+              params.includes('fu2-retry')
+            ) {
+              insertAttempts += 1;
+              if (insertAttempts === 1) throw new Error('simulated transient INSERT failure');
+            }
+            return (target as unknown as BrainEngine).executeRaw(sql, params);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as BrainEngine;
+    const res = await landRecords(flaky, 'default', granolaLike, [rec('fu2-retry', 'cap')], { consolidate: true });
+    expect(insertAttempts).toBeGreaterThanOrEqual(2); // first threw → retried
+    expect(res.written).toBe(1); // landed on retry, NOT stranded
+    const rows = await engine.executeRaw<{ classification: string | null }>(
+      `SELECT classification FROM connector_candidates WHERE source_record_id = 'fu2-retry'`,
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].classification).toBe('ADD'); // the consolidated verdict, not a raw passthrough
+  });
+
   test('decision log: one row per classification, keyed on the (source, record, version) tuple', async () => {
     await enableGranolaConsolidation();
     configureEmbedding();

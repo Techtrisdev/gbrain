@@ -489,7 +489,23 @@ async function persistOneVerdict(
   }
 
   const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence);
-  const { written } = await toRow(engine, item);
+  // FU2: a transient row-INSERT throw must not strand this partition. `toRow` is an
+  // idempotent INSERT … ON CONFLICT DO NOTHING (a duplicate key returns written:false,
+  // it never throws), so a retry is safe — a throw here is a transient backend hiccup
+  // (connection blip / timeout). Retry with small backoff before letting it propagate
+  // to persistConsolidated's per-verdict catch, which strands + loudly logs THIS
+  // partition only. A PERMANENT error (exhausts the retries) still ends there — that
+  // residual single-partition loss is the documented known-limitation.
+  let written = false;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      ({ written } = await toRow(engine, item));
+      break;
+    } catch (err) {
+      if (isAbortError(err) || attempt >= 3) throw err;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 150));
+    }
+  }
 
   // Durable decision log (audit + Tier-1 calibration), keyed on the per-target
   // (source_id, source_record_id, version) tuple + classification (idempotent).

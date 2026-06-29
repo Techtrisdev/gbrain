@@ -247,6 +247,89 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     expect(backfillCalls).toHaveLength(0);
   });
 
+  test('FU1: a HELD poll lock makes the poll skip with poll_in_progress, before backfill', async () => {
+    const { backfillCalls } = makeStubConnector('poll-lock-held', 5);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-lock-held', true) },
+    });
+    // Simulate the lock HELD by another poller: give the (postgres-kind) engine a `sql`
+    // escape hatch whose acquire INSERT…ON CONFLICT…RETURNING yields NO row (the
+    // existing holder's ttl is still live). tryAcquireDbLock → null → the poll skips.
+    const held = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'sql') return (..._a: unknown[]) => Promise.resolve([]);
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as typeof engine;
+    const result = await runConnectorPoll(held, { sourceId: 's1', provider: 'poll-lock-held' }, NO_ENV);
+    expect(result.skippedReason).toBe('poll_in_progress');
+    expect(result.landed).toBe(0);
+    expect(backfillCalls).toHaveLength(0); // skipped BEFORE the expensive backfill
+  });
+
+  test('FU1: an ACQUIRED poll lock proceeds, then releases (DELETE) in finally', async () => {
+    const { backfillCalls } = makeStubConnector('poll-lock-ok', 3);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-lock-ok', true) },
+    });
+    const sqlCalls: string[] = [];
+    const locked = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'sql') {
+          return (strings: TemplateStringsArray, ..._v: unknown[]) => {
+            const text = strings.join(' ');
+            sqlCalls.push(text);
+            // acquire INSERT returns a row (lock taken); refresh/release return [].
+            return Promise.resolve(/INSERT INTO gbrain_cycle_locks/i.test(text) ? [{ id: 'x' }] : []);
+          };
+        }
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as typeof engine;
+    const result = await runConnectorPoll(locked, { sourceId: 's1', provider: 'poll-lock-ok' }, NO_ENV);
+    expect(result.skippedReason).toBeUndefined();
+    expect(result.landed).toBe(3); // proceeded past the lock
+    expect(backfillCalls).toHaveLength(1);
+    expect(sqlCalls.some((s) => /DELETE FROM gbrain_cycle_locks/i.test(s))).toBe(true); // released
+  });
+
+  test('FU1: lock UNAVAILABLE (engine lacks the escape hatch) degrades to unlocked, poll proceeds', async () => {
+    // The default fake engine reports kind=postgres but has no `sql` handle, so
+    // tryAcquireDbLock throws "Unknown engine kind"; the poll must proceed UNLOCKED
+    // (best-effort), never skip. (This is the path every other poll test exercises.)
+    const { backfillCalls } = makeStubConnector('poll-lock-degrade', 4);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-lock-degrade', true) },
+    });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-lock-degrade' }, NO_ENV);
+    expect(result.skippedReason).toBeUndefined();
+    expect(result.landed).toBe(4);
+    expect(backfillCalls).toHaveLength(1);
+  });
+
+  test('FU1: a TRANSIENT acquire error on a lock-CAPABLE engine fails CLOSED (throws → worker retries), never unlocked', async () => {
+    const { backfillCalls } = makeStubConnector('poll-lock-transient', 5);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-lock-transient', true) },
+    });
+    // `sql` present (lock-CAPABLE) but the acquire INSERT REJECTS (a transient backend
+    // error). The poll must THROW so the worker retries — NOT proceed unlocked into the
+    // race the lock exists to prevent (the review's fail-open finding).
+    const flaky = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'sql') return (..._a: unknown[]) => Promise.reject(new Error('transient: connection reset'));
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as typeof engine;
+    await expect(
+      runConnectorPoll(flaky, { sourceId: 's1', provider: 'poll-lock-transient' }, NO_ENV),
+    ).rejects.toThrow();
+    expect(backfillCalls).toHaveLength(0); // never proceeded unlocked
+  });
+
   test('a missing source short-circuits before touching the connector', async () => {
     const { backfillCalls } = makeStubConnector('poll-probe-c', 1);
     const { engine } = makeFakeEngine({ sourceRow: null });
