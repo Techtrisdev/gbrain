@@ -189,7 +189,7 @@ describe('Context Mirror backfill', () => {
     expect(inserts.every((i) => i.version === '1')).toBe(true);
     // listPages scoped to the source, oldest-first, no watermark on first run
     expect(listPagesCalls.length).toBe(1);
-    expect(listPagesCalls[0]).toEqual({ sourceId: 'capture-events', updated_after: undefined, sort: 'updated_asc' });
+    expect(listPagesCalls[0]).toEqual({ sourceId: 'capture-events', updated_after: undefined, slugPrefix: undefined, sort: 'updated_asc' });
     // watermark advanced to the NEWEST page (last in updated_asc order), normalized to UTC
     expect(watermarkWrites.at(-1)?.watermark).toBe('2026-06-29T09:00:00.000Z');
     expect(watermarkWrites.at(-1)?.id).toBe('capture-events');
@@ -202,6 +202,15 @@ describe('Context Mirror backfill', () => {
       source({ connectors: { context_mirror: { watermark: '2026-06-29T00:00:00.000Z' } } }),
     );
     expect(listPagesCalls[0]?.updated_after).toBe('2026-06-29T00:00:00.000Z');
+  });
+
+  test('read_slug_prefix scopes listPages to distilled captures only (never raw per-turn)', async () => {
+    const { engine, listPagesCalls } = makeFakeEngine({ pages: [] });
+    await contextMirrorConnector.backfill!(
+      engine,
+      source({ connectors: { context_mirror: { read_slug_prefix: 'distilled/' } } }),
+    );
+    expect(listPagesCalls[0]?.slugPrefix).toBe('distilled/');
   });
 
   test('empty page set → returns 0 and writes NO watermark', async () => {
