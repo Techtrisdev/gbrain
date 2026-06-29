@@ -22,7 +22,7 @@
  * captures params; engine.listPages is stubbed to return the capture pages under test.
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, mock } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
 import type { Page, PageFilters } from '../src/core/types.ts';
 import type { ConnectorSource } from '../src/core/connectors/base.ts';
@@ -276,5 +276,38 @@ describe('Context Mirror config + poll-only contract', () => {
   test('provider name is underscore-cased (matches /^[a-z0-9_]+$/)', () => {
     expect(contextMirrorConnector.provider).toBe('context_mirror');
     expect(/^[a-z0-9_]+$/.test(contextMirrorConnector.provider)).toBe(true);
+  });
+});
+
+describe('Context Mirror live scheduling — distill_before_poll', () => {
+  test('distill_before_poll=true distills (sourceId + idleHours) before consolidating; absent skips it', async () => {
+    const distillSpy = mock(async (_engine: unknown, _opts: { sourceId?: string; idleHours?: number }) => ({
+      source_id: 'capture-events', idle_hours_threshold: 6, dry_run: false,
+    }));
+    mock.module('../src/core/connectors/distill.ts', () => ({ distillCaptureSessions: distillSpy }));
+    const { engine } = makeFakeEngine({ pages: [] });
+
+    await contextMirrorConnector.backfill!(engine, source({ connectors: { context_mirror: {} } }));
+    expect(distillSpy).toHaveBeenCalledTimes(0);
+
+    await contextMirrorConnector.backfill!(
+      engine,
+      source({ connectors: { context_mirror: { distill_before_poll: true, distill_idle_hours: 3 } } }),
+    );
+    expect(distillSpy).toHaveBeenCalledTimes(1);
+    expect(distillSpy.mock.calls[0]?.[1]).toMatchObject({ sourceId: 'capture-events', idleHours: 3 });
+  });
+
+  test('a distill failure is non-fatal — consolidation still proceeds', async () => {
+    const distillSpy = mock(async () => {
+      throw new Error('gateway down');
+    });
+    mock.module('../src/core/connectors/distill.ts', () => ({ distillCaptureSessions: distillSpy }));
+    const { engine } = makeFakeEngine({ pages: [] });
+    const landed = await contextMirrorConnector.backfill!(
+      engine,
+      source({ connectors: { context_mirror: { distill_before_poll: true } } }),
+    );
+    expect(landed).toBe(0); // empty pages → 0, but NO throw (failure isolated)
   });
 });

@@ -161,6 +161,27 @@ export const contextMirrorConnector: SaaSConnector = {
   async backfill(engine: BrainEngine, source: ConnectorSource): Promise<number> {
     const { landRecords } = await import('./base.ts');
 
+    // Live scheduling: when config.connectors.context_mirror.distill_before_poll is true,
+    // distill COMPLETED raw sessions into distilled/ pages BEFORE consolidating, so the
+    // scheduled connector poll runs the full live pipeline (distill → consolidate). A
+    // distillation failure must NOT block consolidating distilled/ pages that already exist;
+    // an AbortError (shutdown) propagates.
+    const cmCfg = contextMirrorConfig(source);
+    if (cmCfg?.distill_before_poll === true) {
+      try {
+        const { distillCaptureSessions } = await import('./distill.ts');
+        await distillCaptureSessions(engine, {
+          sourceId: source.id,
+          idleHours: typeof cmCfg.distill_idle_hours === 'number' ? cmCfg.distill_idle_hours : 6,
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') throw err;
+        console.error(
+          `[context_mirror] distill_before_poll failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     const since = readWatermark(source);
     const slugPrefix = readSlugPrefix(source);
     const pages = await engine.listPages({
