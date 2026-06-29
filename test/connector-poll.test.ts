@@ -309,6 +309,27 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     expect(backfillCalls).toHaveLength(1);
   });
 
+  test('FU1: a TRANSIENT acquire error on a lock-CAPABLE engine fails CLOSED (throws → worker retries), never unlocked', async () => {
+    const { backfillCalls } = makeStubConnector('poll-lock-transient', 5);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-lock-transient', true) },
+    });
+    // `sql` present (lock-CAPABLE) but the acquire INSERT REJECTS (a transient backend
+    // error). The poll must THROW so the worker retries — NOT proceed unlocked into the
+    // race the lock exists to prevent (the review's fail-open finding).
+    const flaky = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'sql') return (..._a: unknown[]) => Promise.reject(new Error('transient: connection reset'));
+        const v = Reflect.get(target, prop, receiver);
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    }) as typeof engine;
+    await expect(
+      runConnectorPoll(flaky, { sourceId: 's1', provider: 'poll-lock-transient' }, NO_ENV),
+    ).rejects.toThrow();
+    expect(backfillCalls).toHaveLength(0); // never proceeded unlocked
+  });
+
   test('a missing source short-circuits before touching the connector', async () => {
     const { backfillCalls } = makeStubConnector('poll-probe-c', 1);
     const { engine } = makeFakeEngine({ sourceRow: null });

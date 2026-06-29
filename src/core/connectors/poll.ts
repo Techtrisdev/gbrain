@@ -35,7 +35,7 @@
  */
 
 import type { BrainEngine } from '../engine.ts';
-import { tryAcquireDbLock, type DbLockHandle } from '../db-lock.ts';
+import { withRefreshingLock, LockUnavailableError } from '../db-lock.ts';
 import { getConnector, type ConnectorSource } from './base.ts';
 import { toRow, sweepExpiredCandidates, type ConnectorCandidateItem } from './candidate.ts';
 
@@ -383,33 +383,18 @@ export async function runConnectorPoll(
     return { ...base, skippedReason: 'backfill_unsupported' };
   }
 
-  // FU1: per-(source, provider) poll lock. A DB-row lock (TTL fallback, survives
-  // PgBouncer — see db-lock.ts) serializes polls of the SAME connector source, so a
-  // manual/CLI poll can't race the scheduled poll into duplicate/leftover
-  // consolidation: without it both pass the per-capture idempotency pre-check before
-  // either writes, and a fan-out's per-target `<id>::<slug>` keys don't collide with
-  // the loser's bare-id rows — so both land. A held lock → clean skip (the holder is
-  // already doing this source's work). Released in `finally` so a backfill/sweep throw
-  // can't strand the lock and block polls until its 30-min TTL.
-  // Acquire is BEST-EFFORT: if the engine doesn't support the DB lock (an embedded /
-  // test engine without the postgres-js or PGLite escape hatch), degrade to UNLOCKED
-  // rather than fail the poll — the lock is a defensive serializer, not a correctness
-  // requirement. A genuine `null` (another LIVE holder) still skips.
-  let pollLock: DbLockHandle | null = null;
-  let lockSupported = true;
-  try {
-    pollLock = await tryAcquireDbLock(engine, `connector-poll:${sourceId}:${provider}`);
-  } catch (err) {
-    lockSupported = false;
-    console.error(
-      `[connector] poll lock unavailable for ${sourceId}/${provider}, proceeding unlocked: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (lockSupported && !pollLock) return { ...base, skippedReason: 'poll_in_progress' };
-  try {
-    const source: ConnectorSource = { id: row.id, config: row.config };
-    const landed = await connector.backfill(engine, source);
+  // FU1: serialize polls of the SAME (source, provider) so a manual/CLI poll can't race
+  // the scheduled poll into duplicate/leftover consolidation — without it both pass the
+  // per-capture idempotency pre-check before either writes, and a fan-out's per-target
+  // `<id>::<slug>` keys don't collide with the loser's bare-id rows, so both land. The
+  // actual poll work is a closure so it can run either locked or (on an unsupported
+  // engine) unlocked.
+  const source: ConnectorSource = { id: row.id, config: row.config };
+  // Capture the narrowed backfill fn — TS narrowing on `connector.backfill` (from the
+  // gate above) doesn't persist into the deferred closure below.
+  const backfill = connector.backfill;
+  const doPollWork = async (): Promise<ConnectorPollResult> => {
+    const landed = await backfill(engine, source);
 
     // Reconciliation gate (anti-mass-tombstone): run ONLY when we have an authoritative,
     // non-empty current set, OR the connector explicitly confirmed zero records. An empty
@@ -458,8 +443,32 @@ export async function runConnectorPoll(
     }
 
     return { ...base, landed, tombstoned };
-  } finally {
-    if (pollLock) await pollLock.release();
+  };
+
+  // Capability probe: an engine without the postgres-js / PGLite escape hatch can't take
+  // the DB lock (an embedded / test engine). Degrade to UNLOCKED (best-effort) — the lock
+  // is a defensive serializer, not a correctness requirement — rather than fail the poll.
+  const lockCapable =
+    (engine.kind === 'postgres' && (engine as { sql?: unknown }).sql != null) ||
+    (engine.kind === 'pglite' && (engine as { db?: unknown }).db != null);
+  if (!lockCapable) {
+    console.error(`[connector] poll lock unsupported for ${sourceId}/${provider}, proceeding unlocked (best-effort)`);
+    return await doPollWork();
+  }
+
+  // Lock-capable → serialize via a TTL-REFRESHING DB-row lock: the TTL is refreshed
+  // 6x/window so even a long first-sync backfill (full createdAfter=null re-list +
+  // per-capture LLM calls) can't expire it mid-run, and release errors are swallowed
+  // internally (db-lock.ts). A genuinely-held lock → LockUnavailableError → clean skip.
+  // CRITICAL (review): a transient acquire error is NOT fail-OPENED — it propagates so
+  // the worker retries (fail-CLOSED), never proceeding unlocked into the race. In prod
+  // the engine always has `.sql`, so this catch only ever sees a real held-lock or a
+  // transient error, never the unsupported-engine path.
+  try {
+    return await withRefreshingLock(engine, `connector-poll:${sourceId}:${provider}`, doPollWork);
+  } catch (err) {
+    if (err instanceof LockUnavailableError) return { ...base, skippedReason: 'poll_in_progress' };
+    throw err; // transient acquire error OR a doPollWork throw → propagate (fail-closed / Minion retries)
   }
 }
 
