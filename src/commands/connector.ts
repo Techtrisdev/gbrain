@@ -35,6 +35,11 @@ import {
   type ConnectorPollResult,
 } from '../core/connectors/poll.ts';
 import { listCandidates, type ReviewCandidate } from '../core/connectors/candidate.ts';
+// Side-effect import: register all SaaS connectors so the standalone `gbrain connector`
+// CLI resolves providers. Without it getConnector() returns undefined and every source
+// skips as `connector_not_registered` (the HTTP server gets this via serve-http.ts:60;
+// the CLI needs it too).
+import '../core/connectors/registry.ts';
 
 function flagValue(args: string[], name: string): string | null {
   const i = args.indexOf(name);
