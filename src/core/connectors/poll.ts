@@ -390,9 +390,13 @@ export async function runConnectorPoll(
   // actual poll work is a closure so it can run either locked or (on an unsupported
   // engine) unlocked.
   const source: ConnectorSource = { id: row.id, config: row.config };
-  // Capture the narrowed backfill fn — TS narrowing on `connector.backfill` (from the
-  // gate above) doesn't persist into the deferred closure below.
-  const backfill = connector.backfill;
+  // Capture the narrowed backfill fn BOUND to the connector. Two reasons: (1) TS narrowing
+  // on `connector.backfill` (from the gate above) doesn't persist into the deferred closure
+  // below; (2) the extraction MUST preserve `this` — granola's backfill calls `this.normalize`
+  // and passes `this` to landRecords, so an unbound call sets `this = undefined` →
+  // `TypeError: undefined is not an object (this.normalize)` (regression introduced when this
+  // extraction landed). `.bind` keeps both the narrowed type and the receiver.
+  const backfill = connector.backfill.bind(connector);
   const doPollWork = async (): Promise<ConnectorPollResult> => {
     const landed = await backfill(engine, source);
 

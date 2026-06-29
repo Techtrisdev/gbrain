@@ -236,6 +236,41 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     expect(backfillCalls[0].id).toBe('s1');
   });
 
+  test('REGRESSION: backfill is invoked with `this` bound — a connector using this.normalize (granola-shape) polls cleanly', async () => {
+    // poll.ts extracts `const backfill = connector.backfill` into a deferred closure. If
+    // that extraction is UNBOUND, `this` is undefined inside backfill and any `this.normalize`
+    // throws (the granola regression: granola.ts backfill calls this.normalize + passes this
+    // to landRecords). The existing stubs use arrow backfills (no `this`), so they don't catch
+    // it. This connector mirrors granola's shape: backfill uses `this.normalize`, so the poll
+    // only succeeds when poll.ts binds the receiver.
+    let normalizeReceiverWasConnector = false;
+    const connector: SaaSConnector = {
+      provider: 'poll-this-bound',
+      signatureHeader: 'x-poll-this-bound-signature',
+      verifyWebhook: () => true,
+      accountFromPayload: () => 'acct-1',
+      normalize() {
+        normalizeReceiverWasConnector = this === connector;
+        return [
+          { sourceRecordId: 'r1', profile: 'generic', item: { sourceRecordId: 'r1', summary: 's' } },
+        ];
+      },
+      toCandidate: (r, sourceId) => ({ source_id: sourceId, source_record_id: r.sourceRecordId }),
+      async backfill(_engine, source) {
+        // Uses `this` exactly like granola.ts — throws TypeError if invoked unbound.
+        return this.normalize({} as never, source).length;
+      },
+    };
+    registerConnector(connector);
+    const { engine } = makeFakeEngine({
+      sourceRow: { id: 's1', config: withConnector('poll-this-bound', true) },
+    });
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider: 'poll-this-bound' }, NO_ENV);
+    expect(result.skippedReason).toBeUndefined();
+    expect(result.landed).toBe(1);
+    expect(normalizeReceiverWasConnector).toBe(true);
+  });
+
   test('AC5: a configured-but-DISABLED connector is a clean no-op (no backfill)', async () => {
     const { backfillCalls } = makeStubConnector('poll-probe-b', 5);
     const { engine } = makeFakeEngine({
