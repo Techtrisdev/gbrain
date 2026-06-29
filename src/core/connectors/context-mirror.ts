@@ -162,9 +162,13 @@ export const contextMirrorConnector: SaaSConnector = {
     const { landRecords } = await import('./base.ts');
 
     const since = readWatermark(source);
+    const slugPrefix = readSlugPrefix(source);
     const pages = await engine.listPages({
       sourceId: source.id,
       updated_after: since ?? undefined,
+      // When set (e.g. 'distilled/'), consolidate ONLY distilled session memories — never
+      // raw per-turn captures (which would flood the review queue one-candidate-per-turn).
+      slugPrefix,
       sort: 'updated_asc',
     });
     if (!pages.length) return 0;
@@ -207,6 +211,13 @@ function contextMirrorConfig(source: ConnectorSource): Record<string, unknown> |
 /** The persisted watermark (newest page updated_at landed), or null on first run. */
 export function readWatermark(source: ConnectorSource): string | null {
   return str(contextMirrorConfig(source)?.watermark) ?? null;
+}
+
+/** Optional slug-prefix filter. When set (e.g. 'distilled/'), backfill lists ONLY pages whose
+ *  slug starts with it, so the connector consolidates distilled session memories and NEVER raw
+ *  per-turn captures (one-candidate-per-turn flood). Unset → all pages in the source (back-compat). */
+export function readSlugPrefix(source: ConnectorSource): string | undefined {
+  return str(contextMirrorConfig(source)?.read_slug_prefix) ?? undefined;
 }
 
 /**
