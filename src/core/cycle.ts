@@ -1005,6 +1005,86 @@ async function purgeOrphanClones(staleHours: number): Promise<{ count: number; b
   return { count: removed.length, bytes, names: removed };
 }
 
+// ── Capture retention sweep (Context Mirror raw input + distill markers) ─────
+//
+// The Context Mirror distiller reads RAW `capture/<session>/…` per-turn pages and
+// writes `distill-state/<session>` idempotency markers, both under the
+// `capture-events` source. Left unbounded, that input + markers grow forever —
+// which is exactly what pushed the distiller past its old 100-row enumeration cap.
+// This sweep soft-deletes `capture/` + `distill-state/` pages older than a
+// configurable TTL so the existing 72h purge then reclaims them.
+//
+// HARD SAFETY CONSTRAINT: the sweep NEVER touches `distilled/` pages. Those are
+// the distilled MEMORIES the context_mirror consolidation connector reads
+// (read_slug_prefix='distilled/'); aging them out before consolidation would lose
+// knowledge. Only raw input (`capture/`) and markers (`distill-state/`) are swept.
+// Restriction is enforced by enumerating ONLY those two exact prefixes — a
+// `distilled/` page can never match a `capture/`-or-`distill-state/` LIKE filter.
+//
+// DEFAULT OFF: days = 0 / unset / invalid → no retention (can't surprise-delete on
+// deploy). Soft-delete only — reversible inside the 72h purge window. Active
+// (recently-updated) sessions are spared by the `updated_at <= cutoff` gate.
+
+/** Source the raw captures + distill markers live in. Mirrors distill.ts
+ *  DEFAULT_DISTILL_SOURCE; inlined so the autopilot purge path stays free of a
+ *  static connector import. */
+const CAPTURE_RETENTION_SOURCE = 'capture-events';
+/** The ONLY prefixes the retention sweep may age out. `distilled/` is deliberately
+ *  absent — see the safety constraint above. */
+const CAPTURE_RETENTION_PREFIXES = ['capture/', 'distill-state/'] as const;
+/** Global config key (integer days). Unset / 0 / non-positive / invalid → disabled. */
+const CAPTURE_RETENTION_DAYS_KEY = 'connectors.capture_retention_days';
+/** Conservative default TTL surfaced in docs/PR; the knob itself defaults to 0 (off). */
+export const CAPTURE_RETENTION_DEFAULT_DAYS = 14;
+/** Max pages soft-deleted per prefix per sweep — bounds the work; oldest-first so a
+ *  backlog drains deterministically across successive purge cycles. */
+const CAPTURE_RETENTION_SWEEP_LIMIT = 1000;
+
+/** Read the retention TTL in days. Unset/blank/0/negative/NaN → 0 (disabled). */
+async function readCaptureRetentionDays(engine: BrainEngine): Promise<number> {
+  const raw = await engine.getConfig(CAPTURE_RETENTION_DAYS_KEY);
+  if (raw == null || raw.trim() === '') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/**
+ * Soft-delete raw `capture/` + `distill-state/` pages (under `capture-events`)
+ * older than the configured retention TTL, so the 72h purge then hard-deletes
+ * them. Default OFF. NEVER touches `distilled/`. Soft-delete only (reversible).
+ * Oldest-first + bounded per run.
+ *
+ * Exported for unit testing. `nowMs` is injectable for deterministic age-gating.
+ */
+export async function sweepCaptureRetention(
+  engine: BrainEngine,
+  nowMs: number = Date.now(),
+): Promise<{ days: number; soft_deleted: number; slugs: string[] }> {
+  const days = await readCaptureRetentionDays(engine);
+  if (days <= 0) return { days: 0, soft_deleted: 0, slugs: [] };
+  const cutoffMs = nowMs - days * 86_400_000;
+  const slugs: string[] = [];
+  for (const slugPrefix of CAPTURE_RETENTION_PREFIXES) {
+    // Oldest-first so the most-stale pages are swept first; `listPages` hides
+    // already-soft-deleted rows by default, so the sweep is naturally idempotent.
+    const pages = await engine.listPages({
+      sourceId: CAPTURE_RETENTION_SOURCE,
+      slugPrefix,
+      sort: 'updated_asc',
+      limit: CAPTURE_RETENTION_SWEEP_LIMIT,
+    });
+    for (const page of pages) {
+      const t = page.updated_at ?? page.created_at;
+      const ms = t ? new Date(t).getTime() : 0;
+      if (!(ms > 0)) continue; // undated → can't age safely; skip
+      if (ms > cutoffMs) break; // ascending: first page newer than cutoff ends this prefix
+      const res = await engine.softDeletePage(page.slug, { sourceId: CAPTURE_RETENTION_SOURCE });
+      if (res) slugs.push(res.slug);
+    }
+  }
+  return { days, soft_deleted: slugs.length, slugs };
+}
+
 async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
   try {
     if (dryRun) {
@@ -1013,11 +1093,31 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         status: 'ok',
         duration_ms: 0,
         summary: 'dry-run: skipped purge sweep',
-        details: { dry_run: true, purged_sources_count: 0, purged_pages_count: 0, purged_orphan_clones_count: 0 },
+        details: {
+          dry_run: true,
+          purged_sources_count: 0,
+          purged_pages_count: 0,
+          purged_orphan_clones_count: 0,
+          swept_captures_count: 0,
+        },
       };
     }
     const { purgeExpiredSources } = await import('./destructive-guard.ts');
     const purgedSources = await purgeExpiredSources(engine);
+    // Capture retention (default OFF): soft-delete aged raw captures + distill
+    // markers FIRST so this cycle's 72h hard-purge below reclaims any that have
+    // since aged past the window. NEVER touches `distilled/`. Failure-isolated:
+    // a sweep error must not abort the rest of the purge sweep.
+    let sweptCaptures: { days: number; soft_deleted: number; slugs: string[] } = {
+      days: 0, soft_deleted: 0, slugs: [],
+    };
+    try {
+      sweptCaptures = await sweepCaptureRetention(engine);
+    } catch (e) {
+      console.error(
+        `[purge] capture retention sweep failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
     const purgedPages = await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
     const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
     // v0.36+ folded scope item +C: GC stale op_checkpoints rows.
@@ -1048,7 +1148,9 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
       summary:
         `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s), ` +
         `${purgedClones.count} orphan clone temp dir(s), ${purgedCheckpoints} stale op_checkpoint(s), ` +
-        `and ${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s)`,
+        `${purgedBrainstormCheckpoints} stale brainstorm checkpoint(s), ` +
+        `and soft-deleted ${sweptCaptures.soft_deleted} aged capture/marker page(s)` +
+        `${sweptCaptures.days > 0 ? ` (>${sweptCaptures.days}d)` : ' (retention off)'}`,
       details: {
         purged_sources_count: purgedSources.length,
         purged_pages_count: purgedPages.count,
@@ -1058,6 +1160,9 @@ async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<Phas
         purged_page_slugs: purgedPages.slugs,
         purged_checkpoints_count: purgedCheckpoints,
         purged_brainstorm_checkpoints_count: purgedBrainstormCheckpoints,
+        swept_captures_count: sweptCaptures.soft_deleted,
+        swept_captures_retention_days: sweptCaptures.days,
+        swept_captures_slugs: sweptCaptures.slugs,
       },
     };
   } catch (e) {

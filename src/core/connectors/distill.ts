@@ -17,14 +17,28 @@
  * ── Call graph (group → 1 LLM call → N pages, per session) ───────────────────
  *
  *   distillCaptureSessions(engine, opts)
- *     ├─ engine.listPages({ sourceId, slugPrefix: 'capture/' })        # raw turns
- *     ├─ engine.listPages({ sourceId, slugPrefix: DISTILL_STATE_PREFIX }) # done set
+ *     ├─ engine.listAllSlugs({ sourceId, slugPrefix: 'capture/' })          # ALL raw-turn slugs (uncapped, keyset-paged)
+ *     │    └─ engine.getPage(slug) per slug         # hydrate the full Page rows grouping/idle/assembly need
+ *     ├─ engine.listAllSlugs({ sourceId, slugPrefix: DISTILL_STATE_PREFIX }) # ALL done-marker slugs (uncapped; slug-only suffices)
  *     ├─ groupCapturesBySession(pages)            # Map<session_id, Page[]>
  *     └─ for each session NOT done AND idle ≥ N hours:
  *          ├─ assembleConversation(sessionPages)  # ordered turns → one string
  *          ├─ distillConversation(convo)          # 1 gateway chat() call → string[]
  *          ├─ engine.putPage('distilled/<slug>/mem-K', …)   # one page per memory
  *          └─ engine.putPage('<DISTILL_STATE_PREFIX><slug>', …)  # idempotency marker
+ *
+ * ── Lossless enumeration (why listAllSlugs, not listPages) ───────────────────
+ *
+ * The capture/marker enumeration uses {@link BrainEngine.listAllSlugs} (uncapped,
+ * `SELECT DISTINCT slug ORDER BY slug`, keyset-paged) — NOT `listPages`, whose
+ * default LIMIT is 100. Once a brain holds >100 idle capture sessions (or >100
+ * done-markers), the old `listPages` enumeration silently truncated: sessions
+ * past the 100th were never distilled, and the done-set was incomplete so already
+ * -distilled sessions were re-distilled. listAllSlugs returns the COMPLETE set, so
+ * every idle session distills exactly once regardless of corpus size. Capture
+ * slugs are then hydrated to full `Page` rows via `getPage` (grouping, idle-gating,
+ * and assembly need compiled_truth/timeline/frontmatter/updated_at); the done-set
+ * is built straight from the marker SLUGS (no body needed → no getPage for markers).
  *
  * ── Idempotency (the marker is NOT under `distilled/`) ───────────────────────
  *
@@ -404,12 +418,15 @@ function buildMarkerPage(sessionId: string, count: number, nowIso: string): Page
   };
 }
 
-/** Extract the `<session-slug>` set that already has a `distill-state/<slug>` marker. */
-function doneSlugsFrom(markerPages: Page[]): Set<string> {
+/**
+ * Extract the `<session-slug>` set that already has a `distill-state/<slug>`
+ * marker. Takes the marker SLUGS directly (listAllSlugs returns slugs only, and
+ * the done-set needs nothing but the slug), so markers are never hydrated.
+ */
+function doneSlugsFrom(markerSlugs: string[]): Set<string> {
   const set = new Set<string>();
-  for (const p of Array.isArray(markerPages) ? markerPages : []) {
-    const slug = str(p?.slug);
-    if (slug && slug.startsWith(DISTILL_STATE_PREFIX)) {
+  for (const slug of Array.isArray(markerSlugs) ? markerSlugs : []) {
+    if (typeof slug === 'string' && slug.startsWith(DISTILL_STATE_PREFIX)) {
       const token = slug.slice(DISTILL_STATE_PREFIX.length).split('/')[0];
       if (token) set.add(token);
     }
@@ -417,11 +434,59 @@ function doneSlugsFrom(markerPages: Page[]): Set<string> {
   return set;
 }
 
+/** Keyset page size for the uncapped slug enumeration (one SQL round-trip each). */
+const SLUG_ENUM_PAGE_SIZE = 1000;
+
+/**
+ * Fully enumerate every live slug under `slugPrefix` in `sourceId` via the
+ * mutation-immune keyset cursor ({@link BrainEngine.listAllSlugs}), paging until
+ * exhausted. This is the lossless replacement for the capped `listPages`
+ * (default LIMIT 100) enumeration that silently dropped capture sessions /
+ * done-markers past the 100th row.
+ */
+async function enumerateAllSlugs(
+  engine: BrainEngine,
+  sourceId: string,
+  slugPrefix: string,
+): Promise<string[]> {
+  const out: string[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const page = await engine.listAllSlugs({ sourceId, slugPrefix, after, limit: SLUG_ENUM_PAGE_SIZE });
+    out.push(...page);
+    if (page.length < SLUG_ENUM_PAGE_SIZE) break;
+    after = page[page.length - 1];
+  }
+  return out;
+}
+
+/**
+ * Hydrate full `Page` rows for `slugs` (source-scoped). listAllSlugs returns slugs
+ * only, but grouping/idle-gating/assembly read compiled_truth, timeline,
+ * frontmatter, and updated_at — so each capture slug is fetched via getPage. A
+ * slug that no longer resolves (raced soft-delete/purge) is skipped. Sequential
+ * by design: the distiller is idle-gated + runs infrequently, so it favors a
+ * gentle pool footprint over fan-out.
+ */
+async function hydrateCapturePages(
+  engine: BrainEngine,
+  slugs: string[],
+  sourceId: string,
+): Promise<Page[]> {
+  const pages: Page[] = [];
+  for (const slug of slugs) {
+    const page = await engine.getPage(slug, { sourceId });
+    if (page) pages.push(page);
+  }
+  return pages;
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 /**
- * List the raw captures in `sourceId`, group by session, and distill every
- * session that is (a) not already marked done and (b) idle ≥ `idleHours`. Writes
+ * Enumerate ALL raw captures in `sourceId` (uncapped, via listAllSlugs — never
+ * the 100-capped listPages), group by session, and distill every session that is
+ * (a) not already marked done and (b) idle ≥ `idleHours`. Writes
  * `distilled/<slug>/mem-K` pages + a `distill-state/<slug>` marker per session
  * (unless `dryRun`). Per-session failures are isolated; AbortError propagates.
  */
@@ -436,11 +501,15 @@ export async function distillCaptureSessions(
   const nowMs = now.getTime();
   const idleMs = idleHours * 3_600_000;
 
-  const [capturePages, markerPages] = await Promise.all([
-    engine.listPages({ sourceId, slugPrefix: CAPTURE_PREFIX }),
-    engine.listPages({ sourceId, slugPrefix: DISTILL_STATE_PREFIX }),
+  // Uncapped enumeration: listAllSlugs returns the COMPLETE slug set (no 100-cap),
+  // so no idle session is silently dropped and the done-set is never truncated.
+  const [captureSlugs, markerSlugs] = await Promise.all([
+    enumerateAllSlugs(engine, sourceId, CAPTURE_PREFIX),
+    enumerateAllSlugs(engine, sourceId, DISTILL_STATE_PREFIX),
   ]);
-  const done = doneSlugsFrom(markerPages);
+  // Markers need only their slug (done-set); captures are hydrated to full Page rows.
+  const done = doneSlugsFrom(markerSlugs);
+  const capturePages = await hydrateCapturePages(engine, captureSlugs, sourceId);
   const groups = groupCapturesBySession(capturePages);
 
   // Chat availability is checked ONCE: when unavailable (no API key / not
