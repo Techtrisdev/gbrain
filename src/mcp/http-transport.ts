@@ -29,6 +29,7 @@ import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { operations } from '../core/operations.ts';
+import { RETRIEVAL_ROUTING_INSTRUCTIONS } from '../core/operations-descriptions.ts';
 import { VERSION } from '../version.ts';
 import { dispatchToolCall } from './dispatch.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
@@ -314,6 +315,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
               protocolVersion: '2025-03-26',
               serverInfo: { name: 'gbrain', version: VERSION },
               capabilities: { tools: {} },
+              instructions: RETRIEVAL_ROUTING_INSTRUCTIONS,
             },
             jsonrpc: '2.0',
             id,

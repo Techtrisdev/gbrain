@@ -61,7 +61,12 @@ export const LIST_PAGES_DESCRIPTION =
   "with sort=updated_desc instead of semantic search.";
 
 export const QUERY_DESCRIPTION =
-  "Hybrid search with vector + keyword + multi-query expansion. " +
+  "PREFERRED DEFAULT for retrieval. Hybrid search: vector (semantic) + keyword + " +
+  "multi-query expansion, then cross-encoder reranking. Use this for almost any " +
+  "'find info about X', 'what do we know about Y', or conceptual/fuzzy lookup — it " +
+  "recalls relevant pages even when they don't share your exact wording, which the " +
+  "keyword-only `search` tool cannot. Reach for `search` instead only when you need " +
+  "a verbatim literal-string or identifier match. " +
   "For personal/emotional questions ('what's going on with me', 'anything notable', " +
   "'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
   "get_recent_transcripts. Semantic search returns polished pages and misses " +
@@ -69,12 +74,33 @@ export const QUERY_DESCRIPTION =
   "mean impressive — they often mean difficult or emotionally charged.";
 
 export const SEARCH_DESCRIPTION =
-  "Keyword search using full-text search. For personal/emotional questions, " +
-  "prefer get_recent_salience or find_anomalies — they surface activity bursts " +
-  "without needing a search term. " +
+  "Keyword/BM25 exact-term lookup (full-text search — no vectors, no reranking). " +
+  "Use this ONLY when you know a literal string, identifier, error code, slug, or " +
+  "exact phrase that must appear verbatim in the page. For general or semantic " +
+  "retrieval — 'find info about X', 'what do we know about Y', any conceptual or " +
+  "fuzzy question — prefer `query`, which is the default for retrieval and adds " +
+  "vector recall + reranking; plain keyword search will MISS relevant pages that " +
+  "don't contain your exact terms. " +
+  "For personal/emotional questions, prefer get_recent_salience or find_anomalies — " +
+  "they surface activity bursts without needing a search term. " +
   "For code-symbol questions (callers, callees, definitions, blast radius), use " +
   "code_callers / code_callees / code_def / code_refs instead — those return " +
   "structural graph data, not text chunks.";
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Server-level retrieval-routing nudge. Surfaced in the MCP `initialize` result
+// (`instructions`) on both transports so the client's tool-selection prompt sees
+// the default-tool guidance even before it reads per-tool descriptions. Pinned
+// via test/operations-descriptions.test.ts. Behavior-neutral — text only.
+// ──────────────────────────────────────────────────────────────────────────────
+
+export const RETRIEVAL_ROUTING_INSTRUCTIONS =
+  "Retrieval routing: `query` is the default tool for finding information — it runs " +
+  "hybrid semantic + keyword search with reranking and is right for almost any " +
+  "'find info about X' question. Use `search` only for verbatim keyword/identifier " +
+  "lookups; it is keyword/BM25-only and will miss semantically-relevant pages. For " +
+  "personal / 'what's going on with me' questions, prefer get_recent_salience, " +
+  "find_anomalies, or get_recent_transcripts.";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // v0.32.6 — contradiction probe MCP surface (M3)
