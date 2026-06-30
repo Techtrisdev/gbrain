@@ -854,6 +854,30 @@ function interpretOneClassification(
       }
       const targetSlug = matched[0];
       const targetPage = bySlug.get(targetSlug)!;
+      // HF-1 two-layer guard: an UPDATE is only applicable to a page that HAS a
+      // `## Timeline` region. gbrain's `splitBody` is LENIENT — a page with no
+      // timeline sentinel decomposes to `timeline: ''` (the whole body becomes
+      // compiled_truth) — but the techtris-brain receiver's `_split_page_for_update`
+      // is STRICT: no sentinel → it raises ValueError and fail-closes the artifact to
+      // NEEDS_REVIEW. Stamping an `update_page` here would burn a full LLM merge on an
+      // artifact GUARANTEED to bounce and surface a confusing "cannot parse target
+      // compiled-truth" review. So reject early with an honest verdict that names the
+      // matched target instead. (`Page.timeline` is already the trimmed decomposed
+      // timeline; '' for a no-sentinel page. ~4 of 93 live `shared` pages — under
+      // docs/ and handoffs/ — have no `## Timeline`.)
+      //
+      // `timeline === ''` is a deliberately CONSERVATIVE proxy, not an exact one: a
+      // degenerate page whose only timeline structure is a bare `<!-- timeline -->`
+      // sentinel with nothing after it also decomposes to `timeline: ''`, yet the
+      // receiver's `_split_page_for_update` WOULD split it (it finds the sentinel and
+      // does not raise). Guarding on '' over-fires that case to NEEDS_REVIEW — but it
+      // is unreachable in practice (serializeMarkdown only emits the sentinel for a
+      // non-empty timeline; human pages use the `## Timeline` heading form whose
+      // region is never empty) AND fail-safe (over-firing yields human review, never a
+      // bad write). Accepted over a cross-boundary `hasTimelineSentinel` signal.
+      if (!(targetPage.timeline ?? '').trim()) {
+        return result('NEEDS_REVIEW', conf, { ...meta, target_path: targetSlug });
+      }
       const body = (parsed.merged_body ?? '').trim();
       const timelineEntry = (parsed.timeline_entry ?? '').trim();
       // A merge with no new body or no timeline line is unusable for the receiver.

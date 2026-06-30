@@ -711,9 +711,18 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     );
   }
 
-  function fakePage(slug: string, compiled_truth: string, source_id = 'shared'): Page {
+  // Default `timeline` is NON-EMPTY so a candidate target is two-layer-updatable by
+  // default (HF-1: an UPDATE to a `timeline: ''` page degrades to NEEDS_REVIEW, since
+  // the receiver's strict `_split_page_for_update` would bounce a no-sentinel page).
+  // Pass '' as the 4th arg to exercise the no-timeline guard.
+  function fakePage(
+    slug: string,
+    compiled_truth: string,
+    source_id = 'shared',
+    timeline = '2026-01-01 — Page created.',
+  ): Page {
     return {
-      id: 1, slug, type: 'note', title: slug, compiled_truth, timeline: '',
+      id: 1, slug, type: 'note', title: slug, compiled_truth, timeline,
       frontmatter: {}, created_at: new Date('2026-01-01T00:00:00Z'),
       updated_at: new Date('2026-01-01T00:00:00Z'), source_id,
     };

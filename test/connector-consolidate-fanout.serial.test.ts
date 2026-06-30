@@ -99,9 +99,14 @@ async function enableGranolaConsolidation(): Promise<void> {
   );
 }
 
-function fakePage(slug: string, compiled_truth: string, source_id = 'shared'): Page {
+// Real Brain content pages always carry a non-empty `## Timeline` (the two-layer
+// rule). The HF-1 guard degrades an UPDATE to a no-timeline target → NEEDS_REVIEW,
+// so fixtures must be realistic two-layer pages. `timeline` defaults non-empty;
+// pass '' explicitly to exercise the guard. `compiled_truth` is unchanged, so
+// per-target `base_compiled_hash` assertions are unaffected.
+function fakePage(slug: string, compiled_truth: string, source_id = 'shared', timeline = '2026-01-01 — Page created.'): Page {
   return {
-    id: 1, slug, type: 'note', title: slug, compiled_truth, timeline: '',
+    id: 1, slug, type: 'note', title: slug, compiled_truth, timeline,
     frontmatter: {}, created_at: new Date('2026-01-01T00:00:00Z'),
     updated_at: new Date('2026-01-01T00:00:00Z'), source_id,
   };
