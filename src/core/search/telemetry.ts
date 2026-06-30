@@ -259,8 +259,30 @@ export function recordSearchTelemetry(
 }
 
 /**
+ * Per-caller rollup row. `client` = oauth_clients.client_name (e.g.
+ * 'jarvis-openclaw'); `source_id` = the caller's bound source. Both are
+ * 'unknown' for unauthenticated/legacy traffic. The per-caller
+ * `mode_distribution` is the adoption signal: it answers "is this agent
+ * issuing `query` (semantic mode) vs `search` (keyword mode)?".
+ */
+export interface CallerStats {
+  client: string;
+  source_id: string;
+  total_calls: number;
+  mode_distribution: Record<string, number>;
+  intent_distribution: Record<string, number>;
+}
+
+/**
  * Read aggregated stats over a window. Read-time derives averages from
  * sums + counts so writers can ON CONFLICT-add freely.
+ *
+ * v0.40.x adoption attribution: the write side captures `client` + `source_id`
+ * per bucket, so the read rollup now surfaces them too via `caller_distribution`
+ * (client → call count) and `by_caller` (per (client, source_id) breakdown with
+ * its own mode/intent split). The pre-existing aggregate scalars and the
+ * `mode_distribution`/`intent_distribution` rollups are unchanged — they still
+ * sum across every row regardless of the finer caller grouping.
  */
 export interface StatsWindow {
   total_calls: number;
@@ -272,6 +294,10 @@ export interface StatsWindow {
   total_budget_dropped: number;
   intent_distribution: Record<string, number>;
   mode_distribution: Record<string, number>;
+  /** client (agent identity) → total call count over the window. */
+  caller_distribution: Record<string, number>;
+  /** Per (client, source_id) rollup, sorted by call count descending. */
+  by_caller: CallerStats[];
   window_days: number;
   oldest_seen?: string;
   newest_seen?: string;
@@ -288,6 +314,8 @@ export async function readSearchStats(
     const rows = await engine.executeRaw<{
       mode: string;
       intent: string;
+      client: string;
+      source_id: string;
       count: number;
       sum_results: number;
       sum_tokens: number;
@@ -297,7 +325,12 @@ export async function readSearchStats(
       first_seen: string;
       last_seen: string;
     }>(
-      `SELECT mode, intent,
+      // v0.40.x: GROUP BY now carries the caller dimension (client, source_id)
+      // alongside (mode, intent). The window-wide scalar aggregates below sum
+      // across every returned row, so widening the grouping does NOT change the
+      // existing totals or the mode/intent distributions — it only exposes the
+      // per-caller breakdown that the write side already records.
+      `SELECT mode, intent, client, source_id,
               SUM(count)::int             AS count,
               SUM(sum_results)::int       AS sum_results,
               SUM(sum_tokens)::int        AS sum_tokens,
@@ -308,7 +341,7 @@ export async function readSearchStats(
               MAX(last_seen)::text        AS last_seen
        FROM search_telemetry
        WHERE date >= $1
-       GROUP BY mode, intent`,
+       GROUP BY mode, intent, client, source_id`,
       [cutoffDate],
     );
 
@@ -320,6 +353,8 @@ export async function readSearchStats(
     let total_budget_dropped = 0;
     const intent_distribution: Record<string, number> = {};
     const mode_distribution: Record<string, number> = {};
+    const caller_distribution: Record<string, number> = {};
+    const callerMap = new Map<string, CallerStats>();
     let oldest_seen: string | undefined;
     let newest_seen: string | undefined;
 
@@ -332,9 +367,23 @@ export async function readSearchStats(
       total_budget_dropped += r.sum_budget_dropped;
       intent_distribution[r.intent] = (intent_distribution[r.intent] ?? 0) + r.count;
       mode_distribution[r.mode] = (mode_distribution[r.mode] ?? 0) + r.count;
+      caller_distribution[r.client] = (caller_distribution[r.client] ?? 0) + r.count;
+
+      const callerKey = `${r.client}::${r.source_id}`;
+      let cs = callerMap.get(callerKey);
+      if (!cs) {
+        cs = { client: r.client, source_id: r.source_id, total_calls: 0, mode_distribution: {}, intent_distribution: {} };
+        callerMap.set(callerKey, cs);
+      }
+      cs.total_calls += r.count;
+      cs.mode_distribution[r.mode] = (cs.mode_distribution[r.mode] ?? 0) + r.count;
+      cs.intent_distribution[r.intent] = (cs.intent_distribution[r.intent] ?? 0) + r.count;
+
       if (r.first_seen && (!oldest_seen || r.first_seen < oldest_seen)) oldest_seen = r.first_seen;
       if (r.last_seen && (!newest_seen || r.last_seen > newest_seen)) newest_seen = r.last_seen;
     }
+
+    const by_caller = [...callerMap.values()].sort((a, b) => b.total_calls - a.total_calls);
 
     const probe_total = cache_hits + cache_misses;
     return {
@@ -347,6 +396,8 @@ export async function readSearchStats(
       total_budget_dropped,
       intent_distribution,
       mode_distribution,
+      caller_distribution,
+      by_caller,
       window_days: days,
       oldest_seen,
       newest_seen,
@@ -363,6 +414,8 @@ export async function readSearchStats(
       total_budget_dropped: 0,
       intent_distribution: {},
       mode_distribution: {},
+      caller_distribution: {},
+      by_caller: [],
       window_days: days,
     };
   }

@@ -201,6 +201,72 @@ describe('flush() writes to search_telemetry', () => {
   });
 });
 
+describe('readSearchStats — caller attribution rollup (v0.40.x adoption)', () => {
+  test('caller_distribution + by_caller surface per-caller call counts', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 3 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 4 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5 }, { client: 'simon-hermes', sourceId: 'simon-hermes' });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 1 }); // no caller → unknown/unknown
+    await w.flush();
+
+    const s = await readSearchStats(engine, { days: 7 });
+
+    // client → total calls
+    expect(s.caller_distribution['jarvis-openclaw']).toBe(2);
+    expect(s.caller_distribution['simon-hermes']).toBe(1);
+    expect(s.caller_distribution['unknown']).toBe(1);
+
+    // per (client, source_id) rows, sorted by call count desc
+    expect(s.by_caller.length).toBe(3);
+    expect(s.by_caller[0]).toMatchObject({ client: 'jarvis-openclaw', source_id: 'jarvis-openclaw', total_calls: 2 });
+    const simon = s.by_caller.find(c => c.client === 'simon-hermes');
+    expect(simon?.total_calls).toBe(1);
+    const unknown = s.by_caller.find(c => c.client === 'unknown');
+    expect(unknown).toMatchObject({ source_id: 'unknown', total_calls: 1 });
+  });
+
+  test('per-caller mode_distribution captures the query-vs-search adoption split', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    // jarvis on the semantic path (balanced), support-agent on keyword (`search`).
+    recordSearchTelemetry(engine, makeMeta({ mode: 'balanced' }), { results_count: 0 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'balanced' }), { results_count: 0 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'keyword' }), { results_count: 0 }, { client: 'support-agent', sourceId: 'support-demo' });
+    await w.flush();
+
+    const s = await readSearchStats(engine, { days: 7 });
+    const jarvis = s.by_caller.find(c => c.client === 'jarvis-openclaw');
+    const support = s.by_caller.find(c => c.client === 'support-agent');
+    expect(jarvis?.mode_distribution).toEqual({ balanced: 2 });
+    expect(support?.mode_distribution).toEqual({ keyword: 1 });
+  });
+
+  test('adding the caller dimension preserves the existing mode/intent rollup + totals', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    // Same (mode, intent) split across two distinct callers → distinct telemetry
+    // rows, but the window-wide rollups must still aggregate across callers.
+    recordSearchTelemetry(engine, makeMeta({ mode: 'balanced', intent: 'general' }), { results_count: 0 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'balanced', intent: 'general' }), { results_count: 0 }, { client: 'simon-hermes', sourceId: 'simon-hermes' });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'conservative', intent: 'entity' }), { results_count: 0 }, { client: 'jarvis-openclaw', sourceId: 'jarvis-openclaw' });
+    await w.flush();
+
+    const s = await readSearchStats(engine, { days: 7 });
+    // Totals sum across every caller row — unchanged by the finer grouping.
+    expect(s.total_calls).toBe(3);
+    // mode/intent distributions still collapse across callers.
+    expect(s.mode_distribution.balanced).toBe(2);
+    expect(s.mode_distribution.conservative).toBe(1);
+    expect(s.intent_distribution.general).toBe(2);
+    expect(s.intent_distribution.entity).toBe(1);
+    // ...and the new caller dimension is additive on top.
+    expect(s.caller_distribution['jarvis-openclaw']).toBe(2);
+    expect(s.caller_distribution['simon-hermes']).toBe(1);
+  });
+});
+
 describe('readSearchStats — read-time derived averages', () => {
   test('empty table → all-zero stats', async () => {
     const s = await readSearchStats(engine, { days: 7 });
@@ -268,6 +334,9 @@ describe('readSearchStats — read-time derived averages', () => {
     const s = await readSearchStats(engine, { days: 7 });
     expect(s.total_calls).toBe(0);
     expect(s.cache_hit_rate).toBe(0);
+    // New caller-dimension fields are present + empty on the graceful path.
+    expect(s.caller_distribution).toEqual({});
+    expect(s.by_caller).toEqual([]);
     // Restore for subsequent tests in this describe block.
     await engine.initSchema();
   });
