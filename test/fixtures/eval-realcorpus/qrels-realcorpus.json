@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "_description": "Labeled real-prose retrieval qrels for the gbrain search-quality gate. SYNTHETIC people/companies (no real PII/secrets). Unlike test/fixtures/eval-baselines/qrels-search.json (basis-vector plumbing test), this corpus mixes how-to / runbook / integration / decision docs WITH people + company/client pages, and embeds with gbrain's own ZeroEntropy zembed-1 path (frozen vectors committed alongside). Every query carries a `band`. The `howto` band is the key new signal: its `first_relevant_slug` is always a doc/runbook/integration page (source-boost prefix factor 1.0), deliberately competing against a topically-adjacent person page (people/ prefix factor 1.2). A ranking regression that lets people pages bury how-to docs collapses the per-band how-to nDCG floor in test/eval-realcorpus-gate.serial.test.ts. Grades: 3 = the canonical answer, 2 = strongly relevant, 1 = adjacent/secondary.",
+  "queries": [
+    {
+      "query_id": "howto-sso",
+      "band": "howto",
+      "query": "how do I configure SSO with SAML for the workspace",
+      "relevant_slugs": ["docs/how-to-configure-sso", "people/sam-rivera"],
+      "first_relevant_slug": "docs/how-to-configure-sso",
+      "grades": { "docs/how-to-configure-sso": 3, "people/sam-rivera": 1 }
+    },
+    {
+      "query_id": "howto-stripe-webhooks",
+      "band": "howto",
+      "query": "set up Stripe webhook endpoint and verify the signature",
+      "relevant_slugs": ["integrations/stripe-webhooks", "people/priya-nair"],
+      "first_relevant_slug": "integrations/stripe-webhooks",
+      "grades": { "integrations/stripe-webhooks": 3, "people/priya-nair": 1 }
+    },
+    {
+      "query_id": "howto-pg-failover",
+      "band": "howto",
+      "query": "runbook to promote a replica during a Postgres failover",
+      "relevant_slugs": ["runbooks/postgres-failover", "people/maya-okonkwo"],
+      "first_relevant_slug": "runbooks/postgres-failover",
+      "grades": { "runbooks/postgres-failover": 3, "people/maya-okonkwo": 1 }
+    },
+    {
+      "query_id": "howto-rotate-keys",
+      "band": "howto",
+      "query": "how to rotate API keys safely without downtime",
+      "relevant_slugs": ["docs/how-to-rotate-api-keys", "people/yusuf-demir"],
+      "first_relevant_slug": "docs/how-to-rotate-api-keys",
+      "grades": { "docs/how-to-rotate-api-keys": 3, "people/yusuf-demir": 1 }
+    },
+    {
+      "query_id": "howto-slack-notifications",
+      "band": "howto",
+      "query": "configure Slack notifications with an incoming webhook",
+      "relevant_slugs": ["integrations/slack-notifications"],
+      "first_relevant_slug": "integrations/slack-notifications",
+      "grades": { "integrations/slack-notifications": 3 }
+    },
+    {
+      "query_id": "howto-gha-deploy",
+      "band": "howto",
+      "query": "set up a GitHub Actions deploy pipeline that runs after tests pass",
+      "relevant_slugs": ["integrations/github-actions-deploy", "people/diego-fuentes"],
+      "first_relevant_slug": "integrations/github-actions-deploy",
+      "grades": { "integrations/github-actions-deploy": 3, "people/diego-fuentes": 1 }
+    },
+    {
+      "query_id": "howto-local-dev",
+      "band": "howto",
+      "query": "how to set up the local development environment for the first time",
+      "relevant_slugs": ["docs/how-to-set-up-local-dev", "people/diego-fuentes"],
+      "first_relevant_slug": "docs/how-to-set-up-local-dev",
+      "grades": { "docs/how-to-set-up-local-dev": 3, "people/diego-fuentes": 1 }
+    },
+    {
+      "query_id": "howto-oncall",
+      "band": "howto",
+      "query": "on-call incident response runbook for the first responder",
+      "relevant_slugs": ["runbooks/oncall-incident-response", "people/maya-okonkwo"],
+      "first_relevant_slug": "runbooks/oncall-incident-response",
+      "grades": { "runbooks/oncall-incident-response": 3, "people/maya-okonkwo": 1 }
+    },
+    {
+      "query_id": "people-sso-owner",
+      "band": "people",
+      "query": "who configured our single sign-on identity setup",
+      "relevant_slugs": ["people/sam-rivera", "docs/how-to-configure-sso"],
+      "first_relevant_slug": "people/sam-rivera",
+      "grades": { "people/sam-rivera": 3, "docs/how-to-configure-sso": 1 }
+    },
+    {
+      "query_id": "people-db-oncall",
+      "band": "people",
+      "query": "who owns the database on-call pager and failover drills",
+      "relevant_slugs": ["people/maya-okonkwo"],
+      "first_relevant_slug": "people/maya-okonkwo",
+      "grades": { "people/maya-okonkwo": 3 }
+    },
+    {
+      "query_id": "people-payments",
+      "band": "people",
+      "query": "who works on the Stripe payments and billing integration",
+      "relevant_slugs": ["people/priya-nair"],
+      "first_relevant_slug": "people/priya-nair",
+      "grades": { "people/priya-nair": 3 }
+    },
+    {
+      "query_id": "people-security-lead",
+      "band": "people",
+      "query": "who is the security lead responsible for key rotation",
+      "relevant_slugs": ["people/yusuf-demir"],
+      "first_relevant_slug": "people/yusuf-demir",
+      "grades": { "people/yusuf-demir": 3 }
+    },
+    {
+      "query_id": "people-onboarding",
+      "band": "people",
+      "query": "who runs new engineer onboarding and the hiring loop",
+      "relevant_slugs": ["people/lena-hoffmann"],
+      "first_relevant_slug": "people/lena-hoffmann",
+      "grades": { "people/lena-hoffmann": 3 }
+    },
+    {
+      "query_id": "people-devex",
+      "band": "people",
+      "query": "who set up the CI deploy pipeline and developer experience tooling",
+      "relevant_slugs": ["people/diego-fuentes"],
+      "first_relevant_slug": "people/diego-fuentes",
+      "grades": { "people/diego-fuentes": 3 }
+    },
+    {
+      "query_id": "company-cobalt",
+      "band": "company",
+      "query": "fintech bank client with SSO and compliance requirements",
+      "relevant_slugs": ["companies/cobalt-bank"],
+      "first_relevant_slug": "companies/cobalt-bank",
+      "grades": { "companies/cobalt-bank": 3 }
+    },
+    {
+      "query_id": "company-acme",
+      "band": "company",
+      "query": "e-commerce retail client that processes payments with Stripe",
+      "relevant_slugs": ["companies/acme-retail"],
+      "first_relevant_slug": "companies/acme-retail",
+      "grades": { "companies/acme-retail": 3 }
+    },
+    {
+      "query_id": "company-northwind",
+      "band": "company",
+      "query": "supply chain and freight logistics client",
+      "relevant_slugs": ["companies/northwind-logistics"],
+      "first_relevant_slug": "companies/northwind-logistics",
+      "grades": { "companies/northwind-logistics": 3 }
+    },
+    {
+      "query_id": "company-helio",
+      "band": "company",
+      "query": "renewable energy client with solar and battery assets",
+      "relevant_slugs": ["companies/helio-energy"],
+      "first_relevant_slug": "companies/helio-energy",
+      "grades": { "companies/helio-energy": 3 }
+    },
+    {
+      "query_id": "company-pinecrest",
+      "band": "company",
+      "query": "healthcare client handling protected patient health information",
+      "relevant_slugs": ["companies/pinecrest-health"],
+      "first_relevant_slug": "companies/pinecrest-health",
+      "grades": { "companies/pinecrest-health": 3 }
+    },
+    {
+      "query_id": "company-summit",
+      "band": "company",
+      "query": "education technology client with an adaptive learning platform",
+      "relevant_slugs": ["companies/summit-edu"],
+      "first_relevant_slug": "companies/summit-edu",
+      "grades": { "companies/summit-edu": 3 }
+    }
+  ]
+}
