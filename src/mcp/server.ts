@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations } from '../core/operations.ts';
+import { RETRIEVAL_ROUTING_INSTRUCTIONS } from '../core/operations-descriptions.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
@@ -11,7 +12,7 @@ import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 export async function startMcpServer(engine: BrainEngine) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {} }, instructions: RETRIEVAL_ROUTING_INSTRUCTIONS },
   );
 
   // Generate tool definitions from operations. Extracted to buildToolDefs so

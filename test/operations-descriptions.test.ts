@@ -6,6 +6,7 @@ import {
   LIST_PAGES_DESCRIPTION,
   QUERY_DESCRIPTION,
   SEARCH_DESCRIPTION,
+  RETRIEVAL_ROUTING_INSTRUCTIONS,
 } from '../src/core/operations-descriptions.ts';
 import { operations, operationsByName } from '../src/core/operations.ts';
 import { BRAIN_TOOL_ALLOWLIST } from '../src/core/minions/tools/brain-allowlist.ts';
@@ -99,9 +100,34 @@ describe('v0.29 — redirect hints on existing ops', () => {
     expect(QUERY_DESCRIPTION).toContain("difficult or emotionally charged");
   });
 
-  test('search has the shorter redirect hint', () => {
+  test('search still carries the salience redirect hint', () => {
     expect(operationsByName['search'].description).toBe(SEARCH_DESCRIPTION);
     expect(SEARCH_DESCRIPTION).toContain("get_recent_salience");
+  });
+});
+
+describe('retrieval search/query disambiguation', () => {
+  test('search is labeled keyword/BM25-only and points to query as the default', () => {
+    // Agents were defaulting to `search` (keyword-only) and getting weak recall.
+    // The description must make the keyword-only nature explicit and steer
+    // general/semantic retrieval to `query`.
+    expect(SEARCH_DESCRIPTION).toContain("Keyword/BM25 exact-term lookup");
+    expect(SEARCH_DESCRIPTION).toContain("no vectors, no reranking");
+    expect(SEARCH_DESCRIPTION).toContain("prefer `query`");
+    expect(SEARCH_DESCRIPTION).toContain("will MISS relevant pages");
+  });
+
+  test('query is labeled the preferred default with reranking', () => {
+    expect(QUERY_DESCRIPTION).toContain("PREFERRED DEFAULT for retrieval");
+    expect(QUERY_DESCRIPTION).toContain("reranking");
+    // The keyword-vs-semantic contrast must survive description rewrites.
+    expect(QUERY_DESCRIPTION).toContain("`search`");
+  });
+
+  test('server instructions nudge routes to query by default and bounds search', () => {
+    expect(RETRIEVAL_ROUTING_INSTRUCTIONS).toContain("`query` is the default tool");
+    expect(RETRIEVAL_ROUTING_INSTRUCTIONS).toContain("Use `search` only for verbatim");
+    expect(RETRIEVAL_ROUTING_INSTRUCTIONS).toContain("get_recent_salience");
   });
 });
 
