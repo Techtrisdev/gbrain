@@ -34,8 +34,22 @@ import { VERSION } from '../version.ts';
 import { dispatchToolCall } from './dispatch.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
+import { hasScope } from '../core/scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
+
+/**
+ * Scopes attributed to a legacy bearer token whose access_tokens.scopes
+ * column is NULL/empty. Byte-identical to the OAuth/serve-http legacy
+ * fallback (oauth-provider.ts verifyAccessToken: `scopes: ['read','write','admin']`).
+ *
+ * `gbrain auth create` never populates the scopes column, so every existing
+ * bearer token is grandfathered here. This is what makes the write-scope gate
+ * below NON-BREAKING by construction: the seeder, promotion bridge, and
+ * capture writers all keep their write capability. Only a token that was
+ * explicitly minted with a narrower scopes array (e.g. ['read']) is gated.
+ */
+const LEGACY_GRANDFATHER_SCOPES: readonly string[] = ['read', 'write', 'admin'];
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -75,6 +89,13 @@ interface AuthResult {
    * for narrower scoping.
    */
   sourceId?: string;
+  /**
+   * Capability scopes for the auth'd request, used by the write-scope gate
+   * in the tools/call handler (parity with serve-http.ts). Sourced from the
+   * access_tokens.scopes column; NULL/empty is grandfathered to
+   * LEGACY_GRANDFATHER_SCOPES (matches oauth-provider.ts verifyAccessToken).
+   */
+  scopes?: string[];
 }
 
 /** Read up to `cap` bytes off req.body. Returns null if cap exceeded. */
@@ -165,7 +186,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
     const hash = hashToken(token);
     try {
       const [row] = await sql`
-        SELECT id, name, permissions FROM access_tokens
+        SELECT id, name, permissions, scopes FROM access_tokens
         WHERE token_hash = ${hash} AND revoked_at IS NULL
       `;
       if (!row) return { ok: false };
@@ -184,11 +205,24 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       const allowList = Array.isArray(perms?.takes_holders)
         ? (perms!.takes_holders as unknown[]).filter(h => typeof h === 'string') as string[]
         : ['world'];
+      // Capability scopes for the write-scope gate. The access_tokens.scopes
+      // column is NULL for every token minted by `gbrain auth create`, so an
+      // empty/absent value is grandfathered to read+write+admin — identical to
+      // the OAuth path's legacy fallback (oauth-provider.ts verifyAccessToken).
+      // A token explicitly minted with a narrower scopes array is enforced.
+      const rawScopes = (row as { scopes?: unknown }).scopes;
+      const explicitScopes = Array.isArray(rawScopes)
+        ? (rawScopes as unknown[]).filter(s => typeof s === 'string') as string[]
+        : [];
+      const scopes = explicitScopes.length > 0
+        ? explicitScopes
+        : [...LEGACY_GRANDFATHER_SCOPES];
       return {
         ok: true,
         tokenId: rowId,
         tokenName: rowName,
         takesHoldersAllowList: allowList,
+        scopes,
         // v0.34.1 (#861, D13): legacy bearer tokens default to 'default'
         // source. Preserves the pre-v0.34 effective behavior of the
         // serve-http fallback chain that was removed for OAuth clients
@@ -342,6 +376,45 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (method === 'tools/call') {
         const toolName: string = params?.name ?? 'unknown';
         const args: Record<string, unknown> = params?.arguments ?? {};
+
+        // Write-scope gate — parity with the OAuth/serve-http path
+        // (serve-http.ts: `requiredScope = op.scope || 'read'` +
+        // `hasScope(authInfo.scopes, requiredScope)`). Before this, a
+        // READ-scoped bearer token could invoke a mutating op (put_page /
+        // delete_page) because dispatch.ts performs no scope enforcement —
+        // that is the responsibility of the transport. We resolve the op the
+        // same way the OAuth path does and reject when the token's scopes do
+        // not satisfy it. Unknown tools fall through to dispatchToolCall's
+        // unknown_tool result (the OAuth path also resolves the op before the
+        // scope check, so an unknown name never surfaces as insufficient_scope).
+        // Legacy bearer tokens are grandfathered to read+write+admin in
+        // validateToken, so existing writers are unaffected.
+        const op = operations.find(o => o.name === toolName);
+        if (op) {
+          const requiredScope = op.scope || 'read';
+          if (!hasScope(auth.scopes ?? [], requiredScope)) {
+            logRequest(auth.tokenName!, `tools/call:${toolName}`, 'insufficient_scope', Date.now() - startedMs);
+            return Response.json(
+              {
+                result: {
+                  content: [{
+                    type: 'text',
+                    text: JSON.stringify({
+                      error: 'insufficient_scope',
+                      message: `Operation ${toolName} requires '${requiredScope}' scope`,
+                      your_scopes: auth.scopes ?? [],
+                    }),
+                  }],
+                  isError: true,
+                },
+                jsonrpc: '2.0',
+                id,
+              },
+              { headers: corsHeaders(origin) },
+            );
+          }
+        }
+
         // v0.28: thread per-token takes-holder allow-list so takes_list /
         // takes_search / query (when it returns takes) can server-side filter.
         // v0.34.1 (#861): thread source-isolation scope. Legacy access_tokens
