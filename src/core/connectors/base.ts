@@ -518,11 +518,18 @@ async function persistOneVerdict(
   // guard backstops the rare concurrent-poll double-writer. The guard is per TARGET,
   // so two captures racing one page collapse to one, while a fan-out's distinct
   // targets each proceed independently.
-  if (resolvedPath && (await hasInflightUpdatePage(engine, resolvedPath))) {
+  //
+  // This downgrade is a CONCURRENCY hold, NOT a contradiction the human resolves — so
+  // it is carried through to buildConsolidatedItem as `singleWriterDowngrade` and
+  // stays OFF the review queue (rejected), distinct from a GENUINE classifier
+  // NEEDS_REVIEW which now surfaces as 'needs_review' (T6).
+  const singleWriterDowngrade =
+    resolvedPath != null && (await hasInflightUpdatePage(engine, resolvedPath));
+  if (singleWriterDowngrade) {
     final = { ...verdict, classification: 'NEEDS_REVIEW' };
   }
 
-  const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence);
+  const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence, singleWriterDowngrade);
   // FU2: a transient row-INSERT throw must not strand this partition. `toRow` is an
   // idempotent INSERT … ON CONFLICT DO NOTHING (a duplicate key returns written:false,
   // it never throws), so a retry is safe — a throw here is a transient backend hiccup
@@ -626,24 +633,39 @@ function consolidationExpiry(heldBack: boolean, now: number = Date.now()): Date 
 }
 
 /**
- * Map a classifier verdict onto the candidate row columns (KTD6 + U1/U2/U3). Only
- * confident, unambiguous proposals reach the human; everything else is logged +
- * persisted for audit but lands off the pending queue with a short self-cleaning TTL:
+ * Map a classifier verdict onto the candidate row columns (KTD6 + U1/U2/U3 + T6). Only
+ * confident, unambiguous proposals — and now genuine contradictions — reach the human;
+ * everything else is logged + persisted for audit but lands off the pending queue with a
+ * short self-cleaning TTL:
  *   - NOOP → status='rejected' + status_reason='NOOP' (off the pending queue).
- *   - NEEDS_REVIEW (U1) → status='rejected' + status_reason='NEEDS_REVIEW' — the
- *             system absorbs the ambiguity; the human never triages it. Still recorded
- *             in the decision log by `persistConsolidated` (audit + Tier-1 calibration).
+ *   - NEEDS_REVIEW → split THREE ways by origin (T6 — "surface contradictions"):
+ *       · `singleWriterDowngrade` (a clean UPDATE held because the page already has an
+ *         in-flight update_page writer) → status='rejected' + status_reason='NEEDS_REVIEW'.
+ *         A concurrency hold, NOT a contradiction — stays OFF the queue, exactly as before.
+ *       · confidence < `surfaceMinConfidence` → status='rejected' + status_reason=
+ *         'NEEDS_REVIEW'. The engine's safe-degrade fallback (chat down / malformed /
+ *         hallucinated output is stamped a low REVIEW_CONFIDENCE) and any genuinely
+ *         low-confidence verdict are held back like a low-confidence ADD/UPDATE (U2), so
+ *         an engine outage can't FLOOD the contradiction surface.
+ *       · otherwise (a CONFIDENT, GENUINE contradiction) → status='needs_review' +
+ *         status_reason='NEEDS_REVIEW', SURFACED as a DISTINCT reviewable category so the
+ *         contradiction is RESOLVED, not silently dropped — the change that protects the
+ *         "memory compounds" thesis.
+ *     Every NEEDS_REVIEW row is still recorded in the decision log by `persistConsolidated`.
  *   - ADD / UPDATE with confidence < `surfaceMinConfidence` (U2) → status='rejected' +
  *             status_reason='low_confidence'. The classification + UPDATE target fields
  *             are KEPT (audit / later recovery); only the status (and TTL) change.
  *   - ADD / UPDATE with confidence >= threshold → SURFACED as a pending candidate.
- * Every consolidation row carries an `expires_at` (U3): 30 days surfaced, 7 days held back.
+ * Every consolidation row carries an `expires_at` (U3): 30 days surfaced (incl. a surfaced
+ * 'needs_review' contradiction), 7 days held back. The sweep deletes any non-accepted
+ * expired row, so a 'needs_review' row is surfaced AND bounded (it cannot accrue forever).
  */
-function buildConsolidatedItem(
+export function buildConsolidatedItem(
   base: ConnectorCandidateItem,
   verdict: ConsolidationClassifyResult,
   resolvedPath: string | null,
   surfaceMinConfidence: number,
+  singleWriterDowngrade: boolean,
 ): ConnectorCandidateItem {
   switch (verdict.classification) {
     case 'NOOP':
@@ -655,17 +677,42 @@ function buildConsolidatedItem(
         confidence: verdict.confidence,
         expires_at: consolidationExpiry(true),
       };
-    case 'NEEDS_REVIEW':
-      // U1: NEEDS_REVIEW leaves the pending queue (mirrors NOOP). A downgraded
-      // single-writer UPDATE arrives here too — correctly also off-queue.
+    case 'NEEDS_REVIEW': {
+      // De-flood vs surface (T6). Hold back the two NON-contradiction sources of a
+      // NEEDS_REVIEW verdict exactly as before (rejected, off-queue, 7-day TTL):
+      //   1. a single-writer concurrency downgrade (a clean UPDATE, not a contradiction);
+      //   2. a low-confidence verdict — the engine's safe-degrade fallback (chat down /
+      //      malformed / hallucinated output, stamped REVIEW_CONFIDENCE well under the
+      //      surface floor) or any genuinely uncertain verdict.
+      const heldBack = singleWriterDowngrade || verdict.confidence < surfaceMinConfidence;
+      if (heldBack) {
+        return {
+          ...base,
+          classification: 'NEEDS_REVIEW',
+          status: 'rejected',
+          status_reason: 'NEEDS_REVIEW',
+          confidence: verdict.confidence,
+          expires_at: consolidationExpiry(true),
+        };
+      }
+      // A CONFIDENT, GENUINE contradiction — surface it as a distinct reviewable category.
       return {
         ...base,
         classification: 'NEEDS_REVIEW',
-        status: 'rejected',
+        status: 'needs_review',
         status_reason: 'NEEDS_REVIEW',
         confidence: verdict.confidence,
-        expires_at: consolidationExpiry(true),
+        // The page this fact conflicts with (the classifier's most-relevant slug, if any),
+        // surfaced so the human sees WHERE the contradiction lives. Informational only:
+        // target_kind stays null (a contradiction is NOT an auto-mergeable update_page),
+        // so the single-writer probe and the promotion/approve path both ignore it.
+        target_path: verdict.target_path ?? null,
+        // Surfaced for review → the SURFACED 30-day TTL (like a pending proposal), NOT the
+        // 7-day held-back TTL. The sweep still bounds it (status <> 'accepted'), so a
+        // contradiction is resolvable for ~a month and then auto-expires.
+        expires_at: consolidationExpiry(false),
       };
+    }
     case 'UPDATE': {
       // U2: hold back a low-confidence UPDATE off the pending queue. Keep the full
       // pre-computed target (path + body + timeline + base hash) for audit/recovery —

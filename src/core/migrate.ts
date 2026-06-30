@@ -4557,6 +4557,99 @@ export const MIGRATIONS: Migration[] = [
         ON consolidation_decisions (classification, decided_at DESC);
     `,
   },
+  {
+    version: 99,
+    name: 'connector_candidates_needs_review_status',
+    // Memory Consolidation Engine (CF6 / T6 — "surface contradictions"). RELAX the
+    // connector_candidates.`status` CHECK to admit a new 'needs_review' value so a
+    // GENUINE classifier contradiction (a fact that conflicts with an existing page,
+    // or one that cannot be confidently placed) lands on a DISTINCT reviewable
+    // surface instead of being silently dropped as 'rejected' (the pre-fan-out
+    // de-flood, now wrong: multi-topic fan-out made NEEDS_REVIEW mean a real
+    // contradiction, not multi-topic noise).
+    //
+    // The base `status` CHECK is an UNNAMED inline column constraint (schema.sql /
+    // pglite-schema.ts / schema-embedded.ts all spell it inline), so Postgres
+    // auto-names it (`connector_candidates_status_check`). As in v97 we do NOT
+    // hardcode that assumed name in DROP CONSTRAINT — a wrong literal makes
+    // `DROP CONSTRAINT IF EXISTS <wrong>` a SILENT no-op, leaving prod rejecting
+    // 'needs_review' while pglite tests (rebuilt from the inline 4-value schema)
+    // pass green. Instead we RESOLVE the real constraint name(s) from the catalog:
+    // every CHECK constraint whose `conkey` references the `status` column
+    // (conrelid='connector_candidates'::regclass — same precedent as v97), drop
+    // each, then ADD a NAMED 4-value CHECK.
+    //
+    // FORWARD-ONLY (load-bearing safety): this migration relaxes the CHECK ONLY — it
+    // does NOT UPDATE any existing row. Pre-fan-out rows that landed
+    // status='rejected', status_reason='NEEDS_REVIEW' were mostly multi-topic NOISE,
+    // NOT contradictions; re-statusing them to 'needs_review' would FLOOD the review
+    // surface with stale noise. They stay 'rejected'. Only NEW verdicts route to
+    // 'needs_review' (base.ts buildConsolidatedItem). A one-time historical re-scan
+    // of true contradictions is a possible OPTIONAL follow-up, intentionally not done
+    // here. The relaxed CHECK is a strict SUPERSET of the old one, so the Postgres
+    // VALIDATE pass over existing pending/accepted/rejected rows always succeeds.
+    //
+    // Both engines run the catalog-resolved DROP/ADD (PGLite is Postgres-in-WASM and
+    // supports pg_constraint + DO $$). The ONLY engine difference is the Postgres
+    // NOT VALID / VALIDATE split (avoids a full-table write-lock scan — copied from
+    // v97 / v25 pages_page_kind); PGLite adds the constraint inline. A FRESH DB
+    // already carries the 4-value CHECK from the updated schema files — this
+    // versioned migration is what relaxes EXISTING DBs.
+    //
+    // Idempotent: the catalog DROP-loop re-finds + drops the named 4-value CHECK and
+    // re-adds the same one (the auto-name equals the chosen name, but we never RELY
+    // on it — the DROP resolves from the catalog).
+    idempotent: true,
+    sqlFor: {
+      postgres: `
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'status'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_status_check
+          CHECK (status IN ('pending','accepted','rejected','needs_review')) NOT VALID;
+        ALTER TABLE connector_candidates
+          VALIDATE CONSTRAINT connector_candidates_status_check;
+      `,
+      pglite: `
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'status'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_status_check
+          CHECK (status IN ('pending','accepted','rejected','needs_review'));
+      `,
+    },
+    sql: '', // engine-specific via sqlFor
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

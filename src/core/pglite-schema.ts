@@ -780,8 +780,11 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   expires_at         TIMESTAMPTZ,
   as_of              TIMESTAMPTZ,
   rationale_ref      TEXT,
+  -- 'needs_review' (CF6) is the consolidation engine's distinct surface for a
+  -- GENUINE classifier contradiction (vs 'rejected' off-queue de-flood). Relaxed
+  -- on existing DBs by migration v99.
   status             TEXT          NOT NULL DEFAULT 'pending'
-                                   CHECK (status IN ('pending','accepted','rejected')),
+                                   CHECK (status IN ('pending','accepted','rejected','needs_review')),
   status_reason      TEXT,
   acted_by           TEXT,
   acted_at           TIMESTAMPTZ,

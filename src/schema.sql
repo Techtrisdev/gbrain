@@ -1170,9 +1170,13 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   as_of              TIMESTAMPTZ,
   -- reference to a rationale document slug or URL
   rationale_ref      TEXT,
-  -- review workflow
+  -- review workflow. 'needs_review' (CF6) is the Memory Consolidation Engine's
+  -- distinct surface for a GENUINE classifier contradiction — a fact that conflicts
+  -- with an existing page (or can't be confidently placed) that a human resolves,
+  -- as opposed to 'rejected' (off-queue de-flood for NOOP / low-confidence / a
+  -- single-writer hold). Relaxed on existing DBs by migration v99.
   status             TEXT          NOT NULL DEFAULT 'pending'
-                                   CHECK (status IN ('pending','accepted','rejected')),
+                                   CHECK (status IN ('pending','accepted','rejected','needs_review')),
   status_reason      TEXT,
   acted_by           TEXT,
   acted_at           TIMESTAMPTZ,

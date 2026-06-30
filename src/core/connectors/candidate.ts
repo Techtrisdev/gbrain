@@ -70,8 +70,9 @@ export interface ConnectorCandidateItem {
   /** sha256 of the compiled-truth gbrain merged against (the UPDATE staleness guard, KTD8).
    *  A structural hash — persisted verbatim, NOT strip()'d. */
   base_compiled_hash?: string | null;
-  /** Candidate status override. NOOP lands 'rejected' (off the pending queue). Default 'pending'. */
-  status?: 'pending' | 'accepted' | 'rejected';
+  /** Candidate status override. NOOP lands 'rejected' (off the pending queue); a GENUINE
+   *  contradiction lands 'needs_review' (a distinct review surface, T6). Default 'pending'. */
+  status?: 'pending' | 'accepted' | 'rejected' | 'needs_review';
   /** Status reason. NOOP sets 'NOOP'. strip()'d. Default null. */
   status_reason?: string | null;
 }
@@ -96,7 +97,7 @@ export interface ConnectorCandidateRow {
   expires_at: Date | null;
   as_of: Date | null;
   rationale_ref: string | null;
-  status: 'pending' | 'accepted' | 'rejected';
+  status: 'pending' | 'accepted' | 'rejected' | 'needs_review';
   status_reason: string | null;
   acted_by: string | null;
   acted_at: Date | null;
@@ -504,8 +505,9 @@ export interface ReviewCandidate extends ConnectorCandidateRow {
 }
 
 export interface ListCandidatesOpts {
-  /** Default 'pending' — the review queue's working set. */
-  status?: 'pending' | 'accepted' | 'rejected';
+  /** Default 'pending' — the review queue's working set. 'needs_review' (T6) is the
+   *  distinct surface of genuine contradictions awaiting human resolution. */
+  status?: 'pending' | 'accepted' | 'rejected' | 'needs_review';
   /** Optional per-source filter. */
   sourceId?: string;
   page?: number;
@@ -596,10 +598,13 @@ export async function sweepExpiredCandidates(engine: BrainEngine): Promise<numbe
 }
 
 /**
- * Reject a PENDING candidate: status→rejected + reviewer's reason + actor/time audit. Guarded
- * by `status = 'pending'` so a double-submit or a race on an already-acted row is a safe no-op
- * (returns null). The reason is redaction-stripped — a reviewer note must not become a new
- * leak vector for a secret pasted from the candidate body.
+ * Reject (dismiss) a candidate awaiting review: status→rejected + reviewer's reason +
+ * actor/time audit. Guarded by `status IN ('pending','needs_review')` so the reviewer can
+ * dismiss BOTH a pending ADD/UPDATE proposal AND a surfaced 'needs_review' contradiction
+ * (T6 — e.g. after resolving it on the source-of-truth page), while a double-submit or a
+ * race on an already-acted ('accepted'/'rejected') row stays a safe no-op (returns null).
+ * The reason is redaction-stripped — a reviewer note must not become a new leak vector for
+ * a secret pasted from the candidate body.
  */
 export async function rejectCandidate(
   engine: BrainEngine,
@@ -610,7 +615,7 @@ export async function rejectCandidate(
   const rows = await engine.executeRaw<ConnectorCandidateRow>(
     `UPDATE connector_candidates
         SET status = 'rejected', status_reason = $2, acted_by = $3, acted_at = now()
-      WHERE id = $1 AND status = 'pending'
+      WHERE id = $1 AND status IN ('pending', 'needs_review')
       RETURNING ${CANDIDATE_COLUMNS}`,
     [id, reason != null ? strip(reason) : null, strip(actor)],
   );
