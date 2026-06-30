@@ -16,6 +16,22 @@
 export const DEFAULT_SOURCE_BOOSTS: Record<string, number> = {
   // Curated, opinionated, high-signal — Garry's own writing
   'originals/': 1.5,
+  // Reference / how-to / procedural content. These are the durable "how does
+  // this work / how do I do X" pages a procedural query is actually looking for
+  // (runbooks, integration guides, ADRs, playbooks, handoffs, how-to docs). Held
+  // at the curated long-form tier (== writing/ 1.4, just below originals/ 1.5)
+  // so a relevant reference doc out-ranks a topically-adjacent ENTITY page
+  // (people/companies at 1.2) for a how-to query — closing the documented defect
+  // where a how-to query surfaced the person who owns the area above the actual
+  // runbook. Keyed on the real Brain reference content dirs (playbooks/,
+  // integrations/, decisions/, handoffs/, docs/) plus the universal `runbooks/`
+  // content type. These are content-type prefixes, NOT entity pages.
+  'docs/': 1.4,
+  'playbooks/': 1.4,
+  'integrations/': 1.4,
+  'runbooks/': 1.4,
+  'decisions/': 1.4,
+  'handoffs/': 1.4,
   // Reusable knowledge frameworks
   'concepts/': 1.3,
   // Long-form essays / articles
