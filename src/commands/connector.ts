@@ -141,39 +141,57 @@ async function runPoll(engine: BrainEngine | null, args: string[]): Promise<void
   }
 }
 
-// ── connector review (U4) — push the few confident proposals TO the human ─────────
+// ── connector review (U4 + T6) — push what the human must act on TO the human ──────
 //
-// A READ-ONLY digest over the (post-U1/U2, small + clean) pending consolidation
-// queue. It surfaces ONLY confident ADD/UPDATE proposals — never the ambiguity the
-// system already absorbed (NEEDS_REVIEW lands off-queue as rejected; low-confidence
-// ADD/UPDATE is held back; expired rows are filtered by listCandidates) — each as a
-// one-glance "what · where · how confident · one action" block. It writes nothing:
-// accept/reject still run through the existing admin accept→promote seam
-// (POST /admin/api/candidates/:id/approve|reject) and rejectCandidate.
+// A READ-ONLY digest over the (post-U1/U2, small + clean) consolidation queue, in TWO
+// distinct categories:
+//   1. PROPOSALS — confident PENDING ADD/UPDATE the human accepts (→ promote) or rejects.
+//   2. CONTRADICTIONS — 'needs_review' rows: a GENUINE classifier contradiction (a fact
+//      that conflicts with an existing page, or can't be confidently placed) the human
+//      RESOLVES on the source-of-truth page, then dismisses. These used to be silently
+//      dropped as 'rejected' (the pre-fan-out de-flood) — surfacing them is what protects
+//      the "memory compounds" thesis (T6).
+// Still NEVER surfaced: the ambiguity the system genuinely absorbs — NOOP, a low-confidence
+// or safe-degrade NEEDS_REVIEW, a single-writer concurrency hold, and expired rows.
+// It writes nothing: accept/reject/dismiss run through the existing admin seam
+// (POST /admin/api/candidates/:id/approve|reject) and approveCandidate/rejectCandidate.
 
-/** The two verdicts a human is asked to decide on. NEEDS_REVIEW / NOOP never surface. */
+/** The two verdicts surfaced as accept/reject PROPOSALS. NOOP never surfaces; a
+ *  NEEDS_REVIEW contradiction surfaces in its OWN category (see CONTRADICTION_CLASSIFICATION). */
 const REVIEW_CLASSIFICATIONS = new Set<string>(['ADD', 'UPDATE']);
+/** The verdict surfaced as a CONTRADICTION the human resolves (distinct from a proposal). */
+const CONTRADICTION_CLASSIFICATION = 'NEEDS_REVIEW';
 
 /**
- * A single reviewable proposal, projected from a pending candidate row. This is the
- * stable surface the renderers consume — `summary` is pre-computed (the UPDATE
- * timeline line, or an ADD body excerpt) so no renderer touches the raw row.
+ * A single reviewable item, projected from a candidate row. This is the stable surface the
+ * renderers consume — `summary` is pre-computed (the UPDATE timeline line, an ADD body
+ * excerpt, or the conflicting fact for a contradiction) so no renderer touches the raw row.
  */
 export interface ReviewItem {
-  /** Candidate id — the anchor of the one accept/reject action. */
+  /** Candidate id — the anchor of the accept/reject/dismiss action. */
   id: number;
-  /** The verdict the human decides on (only ADD | UPDATE reach here). */
-  classification: 'ADD' | 'UPDATE';
-  /** UPDATE: the page being rewritten. ADD: null (the slug carries the "where"). */
+  /** The verdict: ADD | UPDATE for a proposal, NEEDS_REVIEW for a contradiction. */
+  classification: 'ADD' | 'UPDATE' | 'NEEDS_REVIEW';
+  /** UPDATE: the page being rewritten. CONTRADICTION: the conflicting page (if any). ADD: null. */
   target_path: string | null;
-  /** ADD: the proposed brain slug. UPDATE: usually null. */
+  /** ADD: the proposed brain slug. UPDATE/CONTRADICTION: usually null. */
   proposed_slug: string | null;
   /** Engine confidence 0..1; null only on legacy rows. Drives the ranking. */
   confidence: number | null;
-  /** One-glance "what changes": UPDATE → timeline line; ADD → body excerpt. */
+  /** One-glance "what": UPDATE → timeline line; ADD/CONTRADICTION → body excerpt. */
   summary: string;
   /** Owning brain source id. */
   source_id: string;
+}
+
+/**
+ * The review queue split into its two distinct, separately-rendered categories (T6).
+ * `proposals` are accept/reject ADD/UPDATE; `contradictions` are 'needs_review' rows the
+ * human resolves. Each list is independently confidence-ranked, highest first.
+ */
+export interface ReviewQueue {
+  proposals: ReviewItem[];
+  contradictions: ReviewItem[];
 }
 
 /** Collapse whitespace to single spaces and hard-cap length with an ellipsis. Pure. */
@@ -248,6 +266,67 @@ export async function loadReviewItems(
   // confidences keep listCandidates' proposed_at-DESC order; null confidence sorts last.
   items.sort((a, b) => (b.confidence ?? -1) - (a.confidence ?? -1));
   return items;
+}
+
+/** Project a surfaced `needs_review` contradiction row into a ReviewItem (classification
+ *  NEEDS_REVIEW — a genuine conflict the human RESOLVES, not an auto-mergeable proposal). */
+function toContradictionItem(row: ReviewCandidate): ReviewItem {
+  return {
+    id: row.id,
+    classification: 'NEEDS_REVIEW',
+    target_path: row.target_path,
+    proposed_slug: row.proposed_slug,
+    confidence: row.confidence,
+    summary: summarize(row),
+    source_id: row.source_id,
+  };
+}
+
+/**
+ * Load the full review queue split into its two categories (T6): confident ADD/UPDATE
+ * `proposals` (the existing pending set) and `needs_review` `contradictions` — GENUINE
+ * conflicts the human must resolve, SURFACED rather than silently dropped. Each list is
+ * paginated in full and confidence-ranked, highest first. Read-only.
+ */
+export async function loadReviewQueue(
+  engine: BrainEngine,
+  opts: { sourceId?: string } = {},
+): Promise<ReviewQueue> {
+  const proposals = await loadReviewItems(engine, opts);
+  const rows: ReviewCandidate[] = [];
+  let page = 1;
+  for (;;) {
+    const res = await listCandidates(engine, {
+      status: 'needs_review',
+      sourceId: opts.sourceId,
+      page,
+      pageSize: 200,
+    });
+    rows.push(...res.rows);
+    if (page >= res.pages) break;
+    page += 1;
+  }
+  const contradictions = rows
+    .filter((r) => r.classification === CONTRADICTION_CLASSIFICATION)
+    .map(toContradictionItem);
+  contradictions.sort((a, b) => (b.confidence ?? -1) - (a.confidence ?? -1));
+  return { proposals, contradictions };
+}
+
+/**
+ * Render the `needs_review` CONTRADICTIONS as a distinct, clearly-labelled block appended
+ * after the proposals. Empty string when there are none, so the proposal-only surfaces are
+ * byte-unchanged. A contradiction is a fact that conflicts with an existing page — the human
+ * resolves it (edit the page, or reject the capture), it is NOT a one-click accept.
+ */
+export function renderContradictions(contradictions: ReviewItem[]): string {
+  if (contradictions.length === 0) return '';
+  const n = contradictions.length;
+  const lines: string[] = ['', `⚠ ${n} contradiction${n === 1 ? '' : 's'} to resolve (a captured fact conflicts with an existing page):`];
+  for (const it of contradictions) {
+    lines.push(`  • \`${it.target_path ?? '(unplaced)'}\` (${fmtConf(it.confidence)}) — ${it.summary} · id ${it.id}`);
+  }
+  return lines.join('\n') + '\n';
 }
 
 /** Format a confidence for display: two decimals, or an em dash for a null/legacy score. */
@@ -361,14 +440,18 @@ async function runReview(engine: BrainEngine | null, args: string[]): Promise<vo
     return;
   }
   const sourceId = flagValue(args, '--source') ?? undefined;
-  const items = await loadReviewItems(engine, { sourceId });
+  const { proposals, contradictions } = await loadReviewQueue(engine, { sourceId });
 
   if (args.includes('--json')) {
-    process.stdout.write(renderReviewJson(items));
+    // --json keeps its stable proposals-array contract (tooling consumes it); the
+    // contradiction surface is the operator-facing human/digest renders.
+    process.stdout.write(renderReviewJson(proposals));
   } else if (args.includes('--digest')) {
-    process.stdout.write(renderReviewDigest(items));
+    process.stdout.write(renderReviewDigest(proposals));
+    process.stdout.write(renderContradictions(contradictions));
   } else {
-    process.stdout.write(renderReviewHuman(items));
+    process.stdout.write(renderReviewHuman(proposals));
+    process.stdout.write(renderContradictions(contradictions));
   }
 }
 

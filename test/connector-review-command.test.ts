@@ -22,11 +22,15 @@ import { toRow, type ConnectorCandidateItem } from '../src/core/connectors/candi
 import {
   runConnector,
   loadReviewItems,
+  loadReviewQueue,
   renderReviewHuman,
   renderReviewJson,
   renderReviewDigest,
+  renderContradictions,
   type ReviewItem,
 } from '../src/commands/connector.ts';
+import { buildConsolidatedItem } from '../src/core/connectors/base.ts';
+import type { ConsolidationClassifyResult } from '../src/core/connectors/consolidate.ts';
 
 let engine: PGLiteEngine;
 
@@ -282,5 +286,72 @@ describe('runConnector review — dispatch', () => {
     }
     expect(exitCode).toBe(1);
     expect(errs.join('\n')).toContain('requires a database');
+  });
+});
+
+describe('T6 — genuine contradictions surface (needs_review), not silently dropped', () => {
+  const base = {
+    source_id: 'default',
+    source_record_id: 'r1',
+    proposed_markdown: 'Acme is now Series A.',
+  } as unknown as ConnectorCandidateItem;
+  const nr = (confidence: number, target: string | null = 'clients/acme'): ConsolidationClassifyResult =>
+    ({ classification: 'NEEDS_REVIEW', confidence, target_path: target } as unknown as ConsolidationClassifyResult);
+
+  test('buildConsolidatedItem splits NEEDS_REVIEW three ways', () => {
+    // confident, genuine contradiction, no single-writer hold → SURFACED as needs_review
+    const surfaced = buildConsolidatedItem(base, nr(0.9), 'clients/acme', 0.7, false);
+    expect(surfaced.status).toBe('needs_review');
+    expect(surfaced.classification).toBe('NEEDS_REVIEW');
+    // single-writer concurrency downgrade → held OFF-queue (rejected), not a contradiction
+    expect(buildConsolidatedItem(base, nr(0.9), 'clients/acme', 0.7, true).status).toBe('rejected');
+    // low-confidence / safe-degrade → held OFF-queue (rejected) so an engine outage can't flood
+    expect(buildConsolidatedItem(base, nr(0.4), 'clients/acme', 0.7, false).status).toBe('rejected');
+  });
+
+  test('loadReviewQueue surfaces a needs_review contradiction in its OWN category, never proposals', async () => {
+    await seed({
+      source_record_id: 'upd-ok',
+      classification: 'UPDATE',
+      confidence: 0.95,
+      target_path: 'clients/acme.md',
+      timeline_entry: '2026-06-30 — funding update',
+    });
+    await seed({
+      source_record_id: 'contra-1',
+      status: 'needs_review',
+      classification: 'NEEDS_REVIEW',
+      confidence: 0.9,
+      target_path: 'clients/acme.md',
+      proposed_markdown: 'Acme is Series A — conflicts with the page which says Series B.',
+    });
+
+    const queue = await loadReviewQueue(engine, {});
+    // proposals: the confident UPDATE, and NEVER a contradiction
+    expect(queue.proposals.some((p) => p.classification === 'NEEDS_REVIEW')).toBe(false);
+    expect(queue.proposals.some((p) => p.classification === 'UPDATE')).toBe(true);
+    // contradictions: the surfaced needs_review row, distinct + resolvable
+    expect(queue.contradictions.length).toBe(1);
+    expect(queue.contradictions[0].classification).toBe('NEEDS_REVIEW');
+    expect(queue.contradictions[0].target_path).toBe('clients/acme.md');
+
+    // operator render shows the contradiction; empty list → empty (proposal-only surfaces unchanged)
+    const out = renderContradictions(queue.contradictions);
+    expect(out).toContain('contradiction');
+    expect(out).toContain('clients/acme.md');
+    expect(renderContradictions([])).toBe('');
+  });
+
+  test('the pre-T6 proposal-only loadReviewItems still excludes needs_review rows', async () => {
+    await seed({
+      source_record_id: 'contra-2',
+      status: 'needs_review',
+      classification: 'NEEDS_REVIEW',
+      confidence: 0.9,
+      target_path: 'clients/acme.md',
+      proposed_markdown: 'conflict',
+    });
+    const items = await loadReviewItems(engine, {});
+    expect(items.length).toBe(0);
   });
 });

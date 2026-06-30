@@ -2425,7 +2425,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // these identically — every admin action IS an API. The candidate row's own
   // status / status_reason / acted_by / acted_at columns are the audit trail.
   const CONNECTOR_PROVIDER_RE = /^[a-z0-9_]+$/;
-  const CANDIDATE_STATUSES = ['pending', 'accepted', 'rejected'] as const;
+  // 'needs_review' (T6) is the distinct surface of genuine consolidation contradictions —
+  // listable here so the agent-native admin queue can show + dismiss them alongside pending.
+  const CANDIDATE_STATUSES = ['pending', 'accepted', 'rejected', 'needs_review'] as const;
 
   // requireAdmin authenticates one admin role (cookie session), so the acted_by
   // value is an attribution LABEL, not an authz decision: an agent may self-identify
