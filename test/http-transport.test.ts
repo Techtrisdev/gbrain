@@ -66,7 +66,7 @@ interface FakeEngineConfig {
    * `permissions` JSONB column. Default permissions = {takes_holders: ['world']}
    * when unset, matching the migration v33 default.
    */
-  validTokens?: Map<string, { id: string; name: string; permissions?: { takes_holders?: string[] } }>;
+  validTokens?: Map<string, { id: string; name: string; permissions?: { takes_holders?: string[] }; scopes?: string[] }>;
   /** Tokens that are present but revoked (revoked_at IS NOT NULL — query returns empty). */
   revokedTokens?: Set<string>;
   /** If true, every SELECT throws (simulating DB outage). */
@@ -90,14 +90,22 @@ function makeFakeEngine(cfg: FakeEngineConfig = {}): FakeEngine {
 
     const norm = normalizeSql(query);
 
-    // SELECT id, name, permissions FROM access_tokens WHERE token_hash = $1 AND revoked_at IS NULL
+    // SELECT id, name, permissions, scopes FROM access_tokens WHERE token_hash = $1 AND revoked_at IS NULL
     if (norm.startsWith('select id, name from access_tokens') ||
-        norm.startsWith('select id, name, permissions from access_tokens')) {
+        norm.startsWith('select id, name, permissions from access_tokens') ||
+        norm.startsWith('select id, name, permissions, scopes from access_tokens')) {
       const tokenHash = values[0] as string;
       if (revokedTokens.has(tokenHash)) return [];
       const row = validTokens.get(tokenHash);
       if (!row) return [];
-      const rowWithPerms = { ...row, permissions: row.permissions ?? { takes_holders: ['world'] } };
+      // scopes defaults to NULL (column unset) when the test token omits it —
+      // exercises the legacy-grandfather path in validateToken. A test that
+      // sets `scopes` exercises explicit-scope enforcement.
+      const rowWithPerms = {
+        ...row,
+        permissions: row.permissions ?? { takes_holders: ['world'] },
+        scopes: row.scopes ?? null,
+      };
       return [rowWithPerms];
     }
 
@@ -339,6 +347,111 @@ describe('http-transport: tools/call dispatch', () => {
     const body = await r.json();
     expect(body.result.isError).toBe(true);
     expect(body.result.content[0].text).toContain('Unknown tool');
+  });
+});
+
+// --------------------------------------------------------------------------
+// Write-scope gate (parity with the OAuth/serve-http path)
+// --------------------------------------------------------------------------
+
+describe('http-transport: write-scope gate', () => {
+  // A token explicitly minted with a narrow scope. `gbrain auth create` does
+  // not set scopes today, but the access_tokens.scopes column exists and the
+  // gate must enforce it when present.
+  const READ_ONLY = 'read-only-token';
+  // A token with no scopes column value — grandfathered to read+write+admin,
+  // exactly like the OAuth path's legacy fallback. This is the seeder /
+  // promotion-bridge / capture parity case: existing writers must keep working.
+  const LEGACY = 'legacy-grandfathered-token';
+  const WRITE_TOK = 'write-scoped-token';
+
+  async function srv() {
+    return startTest({
+      validTokens: new Map([
+        [hash(READ_ONLY), { id: 'ro-1', name: 'ro', scopes: ['read'] }],
+        [hash(LEGACY), { id: 'lg-1', name: 'legacy' }], // scopes omitted → NULL → grandfather
+        [hash(WRITE_TOK), { id: 'wr-1', name: 'writer', scopes: ['read', 'write'] }],
+      ]),
+    });
+  }
+
+  function callBody(token: string, name: string, args: Record<string, unknown>) {
+    return {
+      method: 'POST' as const,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: rpc('tools/call', { name, arguments: args }),
+    };
+  }
+
+  test('23. read-scoped token → put_page (write op) rejected with insufficient_scope', async () => {
+    const s = await srv();
+    try {
+      const r = await fetch(`${s.url}/mcp`, callBody(READ_ONLY, 'put_page', { slug: 'x/y', content: 'hi' }));
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      expect(body.result.isError).toBe(true);
+      const text = body.result.content[0].text;
+      expect(text).toContain('insufficient_scope');
+      expect(text).toContain("requires 'write'");
+    } finally { s.stop(); }
+  });
+
+  test('24. read-scoped token → delete_page (write op) rejected with insufficient_scope', async () => {
+    const s = await srv();
+    try {
+      const r = await fetch(`${s.url}/mcp`, callBody(READ_ONLY, 'delete_page', { slug: 'x/y' }));
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      expect(body.result.isError).toBe(true);
+      expect(body.result.content[0].text).toContain('insufficient_scope');
+    } finally { s.stop(); }
+  });
+
+  test('25. read-scoped token → read op (list_pages) NOT scope-blocked (reaches dispatch)', async () => {
+    const s = await srv();
+    try {
+      const r = await fetch(`${s.url}/mcp`, callBody(READ_ONLY, 'list_pages', { limit: 1 }));
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      // The handler may still return an isError result (no real DB in this
+      // stub), but it must NOT be a scope rejection — the read op passed the gate.
+      expect(body.result.content[0].text).not.toContain('insufficient_scope');
+    } finally { s.stop(); }
+  });
+
+  test('26. write-scoped token → put_page passes the scope gate (reaches dispatch)', async () => {
+    const s = await srv();
+    try {
+      const r = await fetch(`${s.url}/mcp`, callBody(WRITE_TOK, 'put_page', { slug: 'x/y', content: 'hi' }));
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      expect(body.result.content[0].text).not.toContain('insufficient_scope');
+    } finally { s.stop(); }
+  });
+
+  test('27. legacy token (no scopes → grandfathered) → put_page passes (seeder/capture parity)', async () => {
+    const s = await srv();
+    try {
+      const r = await fetch(`${s.url}/mcp`, callBody(LEGACY, 'put_page', { slug: 'x/y', content: 'hi' }));
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      // Grandfathered to read+write+admin: a NULL scopes column must NOT lock
+      // out the existing bearer writers. This is the load-bearing safety case.
+      expect(body.result.content[0].text).not.toContain('insufficient_scope');
+    } finally { s.stop(); }
+  });
+
+  test('28. read-scoped token → unknown tool falls through to unknown_tool, not insufficient_scope', async () => {
+    const s = await srv();
+    try {
+      const r = await fetch(`${s.url}/mcp`, callBody(READ_ONLY, 'definitely_not_a_real_tool', {}));
+      expect(r.status).toBe(200);
+      const body = await r.json();
+      expect(body.result.isError).toBe(true);
+      const text = body.result.content[0].text;
+      expect(text).toContain('Unknown tool');
+      expect(text).not.toContain('insufficient_scope');
+    } finally { s.stop(); }
   });
 });
 
