@@ -67,6 +67,12 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // Content-substance gate (connector-substance-gate PR): the legacy toRow / landRecords /
+  // approveCandidate tests below use tiny synthetic bodies ('x', 'cap', 'Acme renewal
+  // signed') to exercise redaction / idempotency / consolidation — NOT content substance —
+  // so disable the floor by default (0). The dedicated 'content-substance gate' describe at
+  // the bottom of this file sets its OWN threshold per test (runs after this beforeEach).
+  await engine.setConfig('connectors.min_candidate_body_chars', '0');
   // Shard isolation: bun distributes individual TESTS across shards, so the U3
   // consolidation-seam tests can run first in a shard and inherit a leaked
   // chat/embed transport or gateway config from a prior file. The U3 describe's

@@ -53,6 +53,11 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // Content-substance gate (connector-substance-gate PR): the fan-out tests land tiny
+  // synthetic captures ('cap', 'Acme + Olo meeting') to exercise multi-topic routing —
+  // NOT content substance — so disable the ingest floor (0). The gate is covered by the
+  // dedicated substance-gate tests in connector-candidate.serial.test.ts.
+  await engine.setConfig('connectors.min_candidate_body_chars', '0');
   resetGateway();
   __setChatTransportForTests(null);
   __setEmbedTransportForTests(null);

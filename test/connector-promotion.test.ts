@@ -51,6 +51,12 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // Content-substance gate (connector-substance-gate PR): these promotion-mechanics tests
+  // approve minimal fixtures (`# X`, `# ACME`) to exercise canonicalization / hashing /
+  // retriability / logging — NOT content substance — so they predate the egress floor.
+  // Disable it (0) so the minimal bodies still flow. The gate itself is covered by the
+  // dedicated substance-gate tests in connector-candidate.serial.test.ts.
+  await engine.setConfig('connectors.min_candidate_body_chars', '0');
 });
 
 const SECRET = 'test-promotion-hmac-secret-0123456789';
@@ -661,6 +667,9 @@ describe('U4 approveCandidate: honor the stored consolidation UPDATE target (end
   // MINOR-1: fail CLOSED at approve on a malformed stored UPDATE (empty body or timeline_entry),
   // mirroring the receiver's update_page guard — never dispatch a doomed artifact.
   test('a stored update_page row with an EMPTY proposed_markdown (merged body) is rejected at approve — NO dispatch', async () => {
+    // This test exercises the egress substance backstop itself (an empty body is the
+    // extreme sub-threshold case), so re-enable the floor that the file beforeEach disables.
+    await engine.setConfig('connectors.min_candidate_body_chars', '64');
     const { hook, getArtifact } = capturingHook();
     registerPromotionHook(hook);
     const { row } = await toRow(engine, {
