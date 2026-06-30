@@ -40,19 +40,48 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import type { Page, PageInput, PageFilters } from '../src/core/types.ts';
 
 // ── Stateful fake engine ──────────────────────────────────────────────────────
-//   listPages(slugPrefix) returns seeded capture pages + any pages putPage wrote
-//   (markers/distilled), filtered by prefix. putPage records + persists.
+//   The distiller enumerates with listAllSlugs (uncapped, DISTINCT slug ORDER BY
+//   slug, keyset cursor via after/limit) and hydrates capture rows via getPage;
+//   markers need only their slug. The fake mirrors that contract over a combined
+//   set of seeded pages + any pages putPage wrote (markers/distilled). putPage
+//   records + persists. listPages is retained for the retention-sweep style tests.
 
-function makeFakeEngine(capturePages: Page[] = []) {
+function makeFakeEngine(seededPages: Page[] = []) {
   const store = new Map<string, Page>();
   const puts: { slug: string; page: PageInput; sourceId?: string }[] = [];
   const listCalls: (PageFilters | undefined)[] = [];
+  const allPages = (): Page[] => [...seededPages, ...store.values()];
 
   const listPages = async (filters?: PageFilters): Promise<Page[]> => {
     listCalls.push(filters);
     const prefix = filters?.slugPrefix ?? '';
-    const all = [...capturePages, ...store.values()];
-    return all.filter((p) => (p.slug ?? '').startsWith(prefix));
+    return allPages().filter((p) => (p.slug ?? '').startsWith(prefix));
+  };
+
+  // listAllSlugs: DISTINCT slug ORDER BY slug, optional prefix, keyset cursor.
+  const listAllSlugs = async (opts?: {
+    sourceId?: string;
+    slugPrefix?: string;
+    after?: string;
+    limit?: number;
+    includeDeleted?: boolean;
+  }): Promise<string[]> => {
+    const prefix = opts?.slugPrefix ?? '';
+    let slugs = [
+      ...new Set(
+        allPages()
+          .map((p) => p.slug as string)
+          .filter((s) => typeof s === 'string' && s.startsWith(prefix)),
+      ),
+    ].sort();
+    if (opts?.after) slugs = slugs.filter((s) => s > opts.after!);
+    if (opts?.limit && opts.limit > 0) slugs = slugs.slice(0, opts.limit);
+    return slugs;
+  };
+
+  // getPage: store (latest write) wins over the seeded set; null when unknown.
+  const getPage = async (slug: string): Promise<Page | null> => {
+    return store.get(slug) ?? allPages().find((p) => p.slug === slug) ?? null;
   };
 
   const putPage = async (slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page> => {
@@ -73,8 +102,24 @@ function makeFakeEngine(capturePages: Page[] = []) {
     return stored;
   };
 
-  const engine = { kind: 'pglite', listPages, putPage } as unknown as BrainEngine;
+  const engine = { kind: 'pglite', listPages, listAllSlugs, getPage, putPage } as unknown as BrainEngine;
   return { engine, puts, listCalls, store };
+}
+
+/** A bare `distill-state/<slug>` marker page (only the slug is read by the done-set). */
+function mkMarker(sessionSlug: string): Page {
+  return {
+    id: 1,
+    slug: `distill-state/${sessionSlug}`,
+    type: 'note',
+    title: `distill-state ${sessionSlug}`,
+    compiled_truth: 'marker',
+    timeline: '',
+    frontmatter: { kind: 'distill-marker' },
+    created_at: new Date(),
+    updated_at: new Date(),
+    source_id: 'capture-events',
+  } as unknown as Page;
 }
 
 /** A raw capture page: only slug/frontmatter/compiled_truth/updated_at are read. */
@@ -370,5 +415,62 @@ describe('distillCaptureSessions — failure tolerance', () => {
     expect(report.sessions[0].status).toBe('failed');
     expect(report.sessions[0].error).toContain('unavailable');
     expect(puts.length).toBe(0);
+  });
+});
+
+// ── Uncapped enumeration (the listAllSlugs rewire — no silent 100-row drop) ───
+//   The old listPages(default LIMIT 100) enumeration silently truncated: capture
+//   sessions past the 100th were never distilled, and the done-set was incomplete
+//   so already-distilled sessions were re-distilled. listAllSlugs enumerates the
+//   COMPLETE set, so these >100 corpora are fully + correctly handled.
+
+describe('distillCaptureSessions — uncapped enumeration (>100)', () => {
+  // session-id zero-padded so toSessionSlug + slug ASC ordering are stable.
+  const sid = (i: number) => `sess-${String(i).padStart(3, '0')}`;
+
+  test('>100 idle capture sessions are ALL distilled (none dropped past row 100)', async () => {
+    const N = 150;
+    const seeded: Page[] = [];
+    for (let i = 0; i < N; i++) {
+      seeded.push(
+        mkCapture({ slug: `capture/${sid(i)}/prompt-1`, session_id: sid(i), compiled_truth: 'q', updated_at: OLD }),
+      );
+    }
+    const { engine, puts } = makeFakeEngine(seeded);
+    stubChat(() => '["one durable memory"]');
+
+    const report = await distillCaptureSessions(engine, { now: NOW });
+
+    // With the old listPages(100) cap, total_sessions would have been 100.
+    expect(report.total_sessions).toBe(N);
+    expect(report.eligible).toBe(N);
+    expect(report.distilled).toBe(N);
+    expect(report.failed).toBe(0);
+    // Every session got a marker → none silently skipped.
+    const markers = puts.filter((p) => p.slug.startsWith('distill-state/'));
+    expect(markers.length).toBe(N);
+  });
+
+  test('>100 done-markers are ALL seen → no re-distillation past row 100', async () => {
+    const N = 150;
+    const seeded: Page[] = [];
+    for (let i = 0; i < N; i++) {
+      // every session is both captured AND already marked done
+      seeded.push(
+        mkCapture({ slug: `capture/${sid(i)}/prompt-1`, session_id: sid(i), compiled_truth: 'q', updated_at: OLD }),
+      );
+      seeded.push(mkMarker(sid(i)));
+    }
+    const { engine, puts } = makeFakeEngine(seeded);
+    stubChat(() => '["should never be called"]');
+
+    const report = await distillCaptureSessions(engine, { now: NOW });
+
+    // All 150 markers are in the done-set → all sessions skipped, none re-distilled.
+    // With the old listPages(100) marker cap, ~50 would have been re-distilled.
+    expect(report.total_sessions).toBe(N);
+    expect(report.skipped_already).toBe(N);
+    expect(report.distilled).toBe(0);
+    expect(puts.length).toBe(0); // no new writes at all
   });
 });
