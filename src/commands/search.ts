@@ -227,6 +227,8 @@ async function runStatsSubcommand(engine: BrainEngine, args: string[]): Promise<
           avg_results: 'mean number of result rows returned per search call',
           avg_tokens: 'mean estimated tokens in the returned chunk text (char/4 heuristic)',
           total_budget_dropped: 'sum of results dropped because the call exceeded its tokenBudget',
+          caller_distribution: 'client (agent identity) → call count over the window — who is issuing searches',
+          by_caller: 'per (client, source_id) rollup with its own mode/intent split — the query-vs-search adoption signal per agent',
           graph_signals_enabled: 'whether graph_signals is on for the active mode (or via search.graph_signals override)',
           graph_signals_failures_count: 'count of fail-open events in the JSONL audit over the window',
         },
@@ -266,6 +268,20 @@ async function runStatsSubcommand(engine: BrainEngine, args: string[]): Promise<
   for (const [i, c] of Object.entries(stats.intent_distribution).sort((a, b) => b[1] - a[1])) {
     const pct = ((c / stats.total_calls) * 100).toFixed(1);
     console.log(`    ${i.padEnd(14)} ${c} (${pct}%)`);
+  }
+  console.log('');
+  console.log('  Caller distribution (adoption):');
+  for (const [client, c] of Object.entries(stats.caller_distribution).sort((a, b) => b[1] - a[1])) {
+    const pct = ((c / stats.total_calls) * 100).toFixed(1);
+    console.log(`    ${client.padEnd(20)} ${c} (${pct}%)`);
+  }
+  // Per-caller mode split — the query-vs-search adoption signal.
+  for (const caller of stats.by_caller) {
+    const modeBits = Object.entries(caller.mode_distribution)
+      .sort((a, b) => b[1] - a[1])
+      .map(([m, c]) => `${m}=${c}`)
+      .join(', ');
+    console.log(`      ${caller.client}/${caller.source_id}: ${modeBits}`);
   }
   if (stats.oldest_seen || stats.newest_seen) {
     console.log('');
