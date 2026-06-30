@@ -1242,6 +1242,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   //      hit 404 on /admin (issue #1090).
   const path = await import('path');
   const fs = await import('fs');
+  // Express 5's `/admin/{*path}` route does NOT match the BARE `/admin` (no
+  // trailing slash) — so a fresh `gbrain serve` 404'd on GET /admin even though
+  // GET /admin/ served the SPA fine (#1090 follow-up). Redirect the bare path to
+  // the SPA root so it works in BOTH the dev and embedded branches below.
+  app.get('/admin', (_req: Request, res: Response) => res.redirect(301, '/admin/'));
   const adminDistPath = path.join(process.cwd(), 'admin', 'dist');
   const useDevPath = fs.existsSync(adminDistPath);
   if (useDevPath) {
