@@ -1044,6 +1044,49 @@ export class PostgresEngine implements BrainEngine {
     return new Set(rows.map((r) => r.slug as string));
   }
 
+  async listAllSlugs(opts?: {
+    sourceId?: string;
+    sourceIds?: string[];
+    slugPrefix?: string;
+    updated_after?: string;
+    includeDeleted?: boolean;
+    after?: string;
+    limit?: number;
+  }): Promise<string[]> {
+    // v0.41 — unbounded / keyset-paginated slug enumeration. See
+    // engine.ts:listAllSlugs for the contract. Mirrors listPages' fragment
+    // composition so source-scoping / deleted / prefix / updated_after
+    // semantics stay byte-identical to the capped path.
+    const sql = this.sql;
+    // Federated array scope wins over the scalar (D9, same as listPages).
+    const sourceCondition = opts?.sourceIds && opts.sourceIds.length > 0
+      ? sql`AND source_id = ANY(${opts.sourceIds}::text[])`
+      : opts?.sourceId
+        ? sql`AND source_id = ${opts.sourceId}`
+        : sql``;
+    // Live-only by default; includeDeleted opts the soft-deleted set back in.
+    const deletedCondition = opts?.includeDeleted === true ? sql`` : sql`AND deleted_at IS NULL`;
+    const updatedCondition = opts?.updated_after
+      ? sql`AND updated_at > ${opts.updated_after}::timestamptz`
+      : sql``;
+    // Escape LIKE metacharacters so the user prefix is a literal (matches listPages).
+    const slugPrefix = opts?.slugPrefix;
+    const prefixCondition = slugPrefix
+      ? sql`AND slug LIKE ${slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%'} ESCAPE '\\'`
+      : sql``;
+    // Keyset cursor: strictly greater than the last slug of the prior page.
+    const afterCondition = opts?.after ? sql`AND slug > ${opts.after}` : sql``;
+    // Bounded page size when limit is set; no cap (full set) when omitted.
+    const limitClause = opts?.limit && opts.limit > 0 ? sql`LIMIT ${opts.limit}` : sql``;
+    const rows = await sql`
+      SELECT DISTINCT slug FROM pages
+      WHERE 1=1 ${sourceCondition} ${deletedCondition} ${updatedCondition} ${prefixCondition} ${afterCondition}
+      ORDER BY slug
+      ${limitClause}
+    `;
+    return rows.map((r) => r.slug as string);
+  }
+
   async listAllPageRefs(): Promise<Array<{ slug: string; source_id: string }>> {
     // v0.32.8: cross-source page enumeration. ORDER BY (source_id, slug) for
     // deterministic iteration (F11) — same-slug-different-source pages stay

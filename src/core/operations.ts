@@ -1353,6 +1353,83 @@ const list_pages: Operation = {
   cliHints: { name: 'list' },
 };
 
+// --- Unbounded slug enumeration (v0.41 — the "enumeration cliff" fix) ---
+//
+// list_pages caps at 100 (clampSearchLimit(..., 50, 100)) with no cursor and
+// sorts updated_desc, so a consumer reconciling against the COMPLETE live brain
+// (the techtris-brain seeder's deletion reconciliation; distill.ts capture
+// enumeration) silently truncates everything past row 100 → a latent
+// data-divergence cliff. This op exposes the complete live-slug set for the
+// caller's source scope via stable keyset (slug-ordered) pagination, so a
+// consumer pages past 100 losslessly. It does NOT change list_pages' contract.
+//
+// Backed by engine.listAllSlugs — a purpose-built, source-scoped, slug-ordered
+// enumeration that returns the cheap slug-only projection (mirrors getAllSlugs /
+// listAllPageRefs); callers fetch bodies with get_page as needed. Source scope
+// flows through the SAME sourceScopeOpts ladder as list_pages / search, so an
+// OAuth client scoped to one source can never enumerate another's slugs.
+const LIST_ALL_SLUGS_DEFAULT_PAGE = 1000;
+const LIST_ALL_SLUGS_MAX_PAGE = 5000;
+
+const list_all_slugs: Operation = {
+  name: 'list_all_slugs',
+  description:
+    'Enumerate the COMPLETE live-slug set for the caller\'s source scope, ordered by slug for stable cursor pagination. ' +
+    'Unlike list_pages (hard-capped at 100 results, no cursor), this pages past 100 losslessly: when the response\'s ' +
+    'next_cursor is non-null, call again with cursor=next_cursor and repeat until next_cursor is null. Live ' +
+    '(non-soft-deleted) slugs only by default; pass include_deleted: true to include the recoverable set. Optional ' +
+    'slug_prefix (literal prefix, e.g. "capture/") and updated_after (ISO date/timestamp) narrow the scan. Returns ' +
+    '{ slugs: string[], next_cursor: string | null }. Slugs only — fetch page bodies with get_page. Confined to the ' +
+    'authenticated read scope.',
+  params: {
+    slug_prefix: {
+      type: 'string',
+      description: 'Optional literal prefix filter on slug (LIKE-escaped). e.g. "capture/" to enumerate a single tier.',
+    },
+    updated_after: {
+      type: 'string',
+      description: 'ISO date (YYYY-MM-DD) or full timestamp. Returns only slugs with updated_at > value (incremental enumeration).',
+    },
+    include_deleted: {
+      type: 'boolean',
+      description: 'Include soft-deleted slugs (default: false — live slugs only). Mirrors list_pages.include_deleted.',
+    },
+    cursor: {
+      type: 'string',
+      description: "Pagination cursor: pass the previous response's next_cursor to fetch the next page. Omit for the first page.",
+    },
+    limit: {
+      type: 'number',
+      description: `Page size (default ${LIST_ALL_SLUGS_DEFAULT_PAGE}, max ${LIST_ALL_SLUGS_MAX_PAGE}). Pagination is lossless regardless of page size — page until next_cursor is null.`,
+    },
+  },
+  handler: async (ctx, p) => {
+    // Source-scope through the same precedence ladder as list_pages / search.
+    const scope = sourceScopeOpts(ctx);
+    const pageSize = clampSearchLimit(
+      p.limit as number | undefined,
+      LIST_ALL_SLUGS_DEFAULT_PAGE,
+      LIST_ALL_SLUGS_MAX_PAGE,
+    );
+    const cursor = typeof p.cursor === 'string' && p.cursor.length > 0 ? p.cursor : undefined;
+    // Over-fetch one row to detect "more remain" without a separate COUNT.
+    const rows = await ctx.engine.listAllSlugs({
+      slugPrefix: typeof p.slug_prefix === 'string' ? p.slug_prefix : undefined,
+      updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
+      includeDeleted: (p.include_deleted as boolean) === true,
+      after: cursor,
+      limit: pageSize + 1,
+      ...scope,
+    });
+    const hasMore = rows.length > pageSize;
+    const slugs = hasMore ? rows.slice(0, pageSize) : rows;
+    const next_cursor = hasMore && slugs.length > 0 ? slugs[slugs.length - 1]! : null;
+    return { slugs, next_cursor };
+  },
+  scope: 'read',
+  cliHints: { name: 'list-all-slugs' },
+};
+
 // --- Search ---
 
 const search: Operation = {
@@ -4342,6 +4419,9 @@ const reload_schema_pack: Operation = {
 export const operations: Operation[] = [
   // Page CRUD
   get_page, put_page, delete_page, list_pages,
+  // v0.41 — unbounded / cursor-paginated slug enumeration (the "enumeration
+  // cliff" fix; list_pages stays capped at 100, this pages past it losslessly)
+  list_all_slugs,
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page, purge_deleted_pages,
   // Search
