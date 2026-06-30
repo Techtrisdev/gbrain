@@ -118,6 +118,68 @@ export interface ConnectorCandidateRow {
   proposed_at: Date;
 }
 
+// ── Content-substance gate (connector ingest + promotion egress) ──────────────
+//
+// A contentless / title-only capture (e.g. a Granola meeting that is JUST a title
+// with no notes — the real "Westside Pizza <> Techtris Intro" incident, whose
+// compiled-truth body measured 28 non-whitespace chars) must NEVER become a
+// connector candidate or a promotion PR. Two gates share this ONE substance signal:
+//   - INGEST (base.ts::landRecords): a sub-threshold body is skipped — never persisted.
+//   - EGRESS (approveCandidate below): a sub-threshold body fail-closes at approve, so a
+//            manually-accepted pre-existing junk candidate can never reach a promotion PR.
+
+/** Global config key for the minimum compiled-truth body substance a connector
+ *  candidate must carry. Read the SAME way the consolidation_* knobs are
+ *  (engine.getConfig → range-check → default); see {@link minCandidateBodyChars}. */
+export const MIN_CANDIDATE_BODY_CHARS_KEY = 'connectors.min_candidate_body_chars';
+/** Default substance floor (non-whitespace compiled-truth chars). Title-only junk
+ *  measures ~22-28 (the incident body = 28); the smallest legit capture
+ *  (context_mirror) is ~119, a granola meeting ~900+. 64 sits cleanly in the gap —
+ *  it blocks junk without clipping any real capture. */
+export const MIN_CANDIDATE_BODY_CHARS_DEFAULT = 64;
+
+/**
+ * Non-whitespace character count of the COMPILED-TRUTH body of a proposed-page
+ * markdown string — the substance signal both connector gates measure. Strips the
+ * parts that are NOT compiled truth, then counts what remains:
+ *   1. a leading YAML frontmatter block (`^---\n … \n---`),
+ *   2. everything from the first `## Timeline` / `## History` heading onward
+ *      (append-only history is not compiled truth),
+ *   3. a single leading inbox-draft blockquote line (`> **Inbox draft …`) that the
+ *      Brain receiver prepends to an inbox page.
+ * Pure — no I/O. Verified on the real incident: the title-only body
+ * "Westside Pizza <> Techtris Intro" measures 28 (< the 64 default floor).
+ */
+export function compiledTruthSubstance(markdown: string | null | undefined): number {
+  if (!markdown) return 0;
+  let text = markdown;
+  // 1. Drop a leading YAML frontmatter block (only when it opens at the very top).
+  text = text.replace(/^\uFEFF?[ \t]*---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, '');
+  // 2. Drop everything from the first `## Timeline` / `## History` heading to EOF.
+  const tl = text.search(/^[ \t]*##[ \t]+(?:timeline|history)\b/im);
+  if (tl !== -1) text = text.slice(0, tl);
+  // 3. Drop a single leading inbox-draft blockquote line, if present.
+  text = text.replace(/^[ \t\r\n]*>[ \t]*\*\*Inbox draft[^\n]*\r?\n?/i, '');
+  // 4. Count the surviving non-whitespace characters.
+  const m = text.match(/\S/g);
+  return m ? m.length : 0;
+}
+
+/**
+ * The minimum compiled-truth substance (non-whitespace chars) a connector candidate
+ * body must carry to be persisted (ingest) or promoted (egress). Reads
+ * `connectors.min_candidate_body_chars`; a missing / blank / malformed / negative
+ * value falls back to {@link MIN_CANDIDATE_BODY_CHARS_DEFAULT}. Mirrors
+ * consolidation-config.ts's `readUnitFloat` knob pattern (getConfig → check →
+ * default); `0` is honored and disables the gate.
+ */
+export async function minCandidateBodyChars(engine: BrainEngine): Promise<number> {
+  const raw = await engine.getConfig(MIN_CANDIDATE_BODY_CHARS_KEY);
+  if (raw == null || raw.trim() === '') return MIN_CANDIDATE_BODY_CHARS_DEFAULT;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : MIN_CANDIDATE_BODY_CHARS_DEFAULT;
+}
+
 // ── Pure helpers ──────────────────────────────────────────────────────────────
 
 /**
@@ -786,15 +848,26 @@ export async function approveCandidate(
   // 3. Validate the EFFECTIVE (row-sourced or reviewer) target before any write.
   validatePromotionTarget(effectiveTarget);
 
-  // 3b. For a consolidation UPDATE the artifact body = row.proposed_markdown (the merged
-  //     compiled-truth), which is NOT carried on the target — so validatePromotionTarget can't
-  //     see it. The receiver rejects an empty body for update_page (promote_candidate.py), so
-  //     fail closed HERE (PromotionTargetError → 400, never dispatched) rather than emit a
-  //     doomed artifact that only bounces back as a receiver-side failed callback.
-  if (honorStored && !(current?.proposed_markdown ?? '').trim()) {
-    throw new PromotionTargetError(
-      'update_page candidate has an empty proposed_markdown (the merged compiled-truth body)',
-    );
+  // 3b. Egress substance backstop (fail-closed). The original guard fired only on an EMPTY
+  //     consolidation UPDATE body (the receiver rejects an empty update_page body); EXTEND it
+  //     to EVERY target mode (inbox / existing_page / update_page) and to any SUB-THRESHOLD
+  //     body, so a manually-accepted title-only candidate (the "Westside Pizza <> Techtris
+  //     Intro" incident — an admin accept of a contentless candidate) can never become a
+  //     promotion PR. For a consolidation UPDATE the artifact body = row.proposed_markdown
+  //     (the merged compiled-truth), which validatePromotionTarget can't see — so check it
+  //     HERE. Tombstones are intentionally body-less deletion markers, not content: exempt
+  //     them (their version carries the reserved `:tombstone` suffix — see poll.ts
+  //     TOMBSTONE_VERSION_SUFFIX). Throwing here leaves the row untouched (pending), exactly
+  //     like validatePromotionTarget above — never dispatched, never a failed callback.
+  if (current && !(current.version ?? '').endsWith(':tombstone')) {
+    const substance = compiledTruthSubstance(current.proposed_markdown);
+    const floor = await minCandidateBodyChars(engine);
+    if (substance < floor) {
+      throw new PromotionTargetError(
+        `candidate proposed_markdown is below the substance floor ` +
+          `(${substance} < ${floor} non-whitespace compiled-truth chars) — refusing to promote a contentless page`,
+      );
+    }
   }
 
   // 4. Compute the artifact hash off the current row + effective target (read-only).

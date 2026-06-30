@@ -14,7 +14,13 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
 import { isAvailable } from '../ai/gateway.ts';
-import { toRow, captureConsolidated, type ConnectorCandidateItem } from './candidate.ts';
+import {
+  toRow,
+  captureConsolidated,
+  compiledTruthSubstance,
+  minCandidateBodyChars,
+  type ConnectorCandidateItem,
+} from './candidate.ts';
 import { minimize, strip, type RawConnectorItem } from './redact.ts';
 import { recordConsolidationDecision } from './consolidation-decisions.ts';
 import type { ConsolidationClassifyResult } from './consolidate.ts';
@@ -213,6 +219,20 @@ export async function landRecords(
     }
   }
 
+  // Content-substance floor (provider-agnostic ingest gate): a contentless / title-only
+  // capture must NEVER become a candidate (the granola raw-passthrough incident). Read the
+  // threshold ONCE per batch. A config-read THROW (a hard backend failure) degrades the gate
+  // to OFF — matching the surrounding degrade-to-passthrough philosophy, and harmless because
+  // the very same failure also fails the subsequent toRow persist (nothing slips through) and
+  // the egress backstop in approveCandidate catches any survivor. In normal operation
+  // `getConfig` returns null for an unset key and the reader still defaults to 64 (gate ON).
+  let minBodyChars = 0;
+  try {
+    minBodyChars = await minCandidateBodyChars(engine);
+  } catch {
+    minBodyChars = 0;
+  }
+
   let written = 0;
   for (const record of records) {
     // Minimize the connector record: drop the body, keep only allowlisted +
@@ -235,6 +255,20 @@ export async function landRecords(
       provider: raw.provider ?? connector.provider,
       redactions: [...(raw.redactions ?? []), ...min.redactions],
     };
+
+    // Provider-agnostic content-substance gate: a sub-threshold compiled-truth body is
+    // contentless (title-only) — skip it entirely (do NOT persist, do NOT count it in
+    // `written`). Applies to BOTH the raw-passthrough path (granola's default) and the
+    // consolidation path (a contentless capture has nothing worth consolidating); the
+    // consolidation NOOP/needs_review handling for SUBSTANTIVE captures is untouched.
+    const substance = compiledTruthSubstance(candidate.proposed_markdown);
+    if (substance < minBodyChars) {
+      console.warn(
+        `[connector] skip contentless candidate ${record.sourceRecordId} ` +
+          `(${substance} < ${minBodyChars} chars)`,
+      );
+      continue;
+    }
 
     // The consolidation path may FAN OUT one capture into N candidate rows, so it
     // returns the COUNT it wrote (not a boolean); the raw passthrough writes one.
