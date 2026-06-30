@@ -677,6 +677,45 @@ export interface BrainEngine {
   getAllSlugs(opts?: { sourceId?: string }): Promise<Set<string>>;
 
   /**
+   * v0.41 — unbounded / cursor-paginated slug enumeration. Returns the
+   * COMPLETE slug set for the requested source scope, deduped (`SELECT
+   * DISTINCT slug`) and ordered by `slug ASC` so a consumer can page past the
+   * `list_pages` 100-cap losslessly via stable keyset pagination (pass the
+   * last slug of a page back as `after` to fetch the next page).
+   *
+   * This is the engine primitive behind the `list_all_slugs` MCP tool, which
+   * exists to close the "enumeration cliff": `list_pages` is capped at 100
+   * with no cursor, so reconciliation consumers (the techtris-brain seeder's
+   * deletion reconciliation; distill.ts capture enumeration) silently
+   * truncate past 100 rows.
+   *
+   * Differs from `getAllSlugs` in three ways:
+   *   1. Live-only by default (`deleted_at IS NULL`); `includeDeleted: true`
+   *      opts the soft-deleted set back in. (`getAllSlugs` always includes
+   *      soft-deleted rows.)
+   *   2. Deterministically ordered by slug for keyset cursoring (`getAllSlugs`
+   *      returns an unordered Set).
+   *   3. Optional `slugPrefix` / `updated_after` filters applied at the SQL
+   *      layer, plus federated `sourceIds` array scope (array wins over the
+   *      scalar `sourceId`, mirroring `listPages`).
+   *
+   * Because the projection is `DISTINCT slug`, the slug column is unique in
+   * the result even under a federated multi-source scope (a same-slug page in
+   * two sources collapses to one), which keeps the `slug > after` keyset
+   * stable and lossless. `limit` bounds the page size; when omitted the full
+   * remaining set is returned (no cap).
+   */
+  listAllSlugs(opts?: {
+    sourceId?: string;
+    sourceIds?: string[];
+    slugPrefix?: string;
+    updated_after?: string;
+    includeDeleted?: boolean;
+    after?: string;
+    limit?: number;
+  }): Promise<string[]>;
+
+  /**
    * v0.32.8: cross-source page enumeration. Returns one row per (slug,
    * source_id) pair across the brain, ordered by (source_id, slug) for
    * deterministic iteration on large brains. Used by extract-takes,

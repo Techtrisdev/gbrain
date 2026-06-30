@@ -989,6 +989,61 @@ export class PGLiteEngine implements BrainEngine {
     return new Set((rows as { slug: string }[]).map(r => r.slug));
   }
 
+  async listAllSlugs(opts?: {
+    sourceId?: string;
+    sourceIds?: string[];
+    slugPrefix?: string;
+    updated_after?: string;
+    includeDeleted?: boolean;
+    after?: string;
+    limit?: number;
+  }): Promise<string[]> {
+    // v0.41 — parity with postgres-engine.listAllSlugs. Unbounded /
+    // keyset-paginated, DISTINCT slug, ORDER BY slug ASC. See
+    // engine.ts:listAllSlugs for the contract.
+    const where: string[] = [];
+    const params: unknown[] = [];
+    // Federated array scope wins over the scalar (D9, same as listPages).
+    if (opts?.sourceIds && opts.sourceIds.length > 0) {
+      params.push(opts.sourceIds);
+      where.push(`source_id = ANY($${params.length}::text[])`);
+    } else if (opts?.sourceId) {
+      params.push(opts.sourceId);
+      where.push(`source_id = $${params.length}`);
+    }
+    // Live-only by default; includeDeleted opts the soft-deleted set back in.
+    if (opts?.includeDeleted !== true) {
+      where.push('deleted_at IS NULL');
+    }
+    if (opts?.updated_after) {
+      params.push(opts.updated_after);
+      where.push(`updated_at > $${params.length}::timestamptz`);
+    }
+    // Escape LIKE metacharacters so the user prefix is a literal (matches listPages).
+    if (opts?.slugPrefix) {
+      const escaped = opts.slugPrefix.replace(/[\\%_]/g, (c) => '\\' + c) + '%';
+      params.push(escaped);
+      where.push(`slug LIKE $${params.length} ESCAPE '\\'`);
+    }
+    // Keyset cursor: strictly greater than the last slug of the prior page.
+    if (opts?.after) {
+      params.push(opts.after);
+      where.push(`slug > $${params.length}`);
+    }
+    const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+    // Bounded page size when limit is set; no cap (full set) when omitted.
+    let limitSql = '';
+    if (opts?.limit && opts.limit > 0) {
+      params.push(opts.limit);
+      limitSql = `LIMIT $${params.length}`;
+    }
+    const { rows } = await this.db.query(
+      `SELECT DISTINCT slug FROM pages ${whereSql} ORDER BY slug ${limitSql}`,
+      params,
+    );
+    return (rows as { slug: string }[]).map(r => r.slug);
+  }
+
   async listAllPageRefs(): Promise<Array<{ slug: string; source_id: string }>> {
     // v0.32.8: see postgres-engine.ts:listAllPageRefs for context. ORDER BY
     // (source_id, slug) for determinism; WHERE deleted_at IS NULL matches
