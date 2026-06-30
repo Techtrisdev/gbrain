@@ -479,18 +479,32 @@ export async function scanBrainSources(
     // pool can make this await hang past the budget. Without the race, we'd
     // wait indefinitely AND defeat the wall-clock guarantee.
     let dbPageCount: number | null = null;
+    // Tracks whether the COUNT was cut off by the deadline (timed out, or the
+    // budget was already gone) vs. returned a real value. This is the
+    // DETERMINISTIC skip signal: relying solely on a post-await
+    // `Date.now() >= deadline` re-read flaked on loaded CI runners because the
+    // race timer resolves *at* the deadline and integer-ms Date.now() can read
+    // `deadline - 1` (sub-ms rounding), letting a budget-exhausted source
+    // wrongly proceed to scanOneSource.
+    let countDeadlineHit = false;
     if (opts.dbPageCountForSource) {
       try {
         if (opts.deadline) {
           const remainingMs = opts.deadline - Date.now();
           if (remainingMs <= 0) {
             dbPageCount = null;
+            countDeadlineHit = true;
           } else {
             // Race COUNT against the deadline so a hung query can't eat the budget.
+            let timer: ReturnType<typeof setTimeout> | undefined;
             dbPageCount = await Promise.race([
               opts.dbPageCountForSource(src.id),
-              new Promise<null>(resolve => setTimeout(() => resolve(null), remainingMs)),
+              new Promise<null>(resolve => {
+                timer = setTimeout(() => { countDeadlineHit = true; resolve(null); }, remainingMs);
+              }),
             ]);
+            // COUNT won the race → cancel the timer so it can't flip the flag.
+            if (timer) clearTimeout(timer);
           }
         } else {
           dbPageCount = await opts.dbPageCountForSource(src.id);
@@ -509,7 +523,7 @@ export async function scanBrainSources(
     // setTimeout resolves null at exactly `remainingMs` from now, so post-await
     // Date.now() often equals deadline within integer-ms precision — strict `>`
     // missed those landings on CI and let the next scanOneSource run anyway.
-    if (opts.signal?.aborted || (opts.deadline && Date.now() >= opts.deadline)) {
+    if (opts.signal?.aborted || countDeadlineHit || (opts.deadline && Date.now() >= opts.deadline)) {
       if (abortedAtSource === null) {
         abortedAtSource = src.id;
       }
