@@ -508,7 +508,7 @@ const CANDIDATE_PROMOTION_RETURNING = [
 //                and breaks the HMAC).
 //   - Body:      EXACTLY { status, branch, pr_url, source_record_id_hash } — no candidate_id,
 //                no artifact_hash, no nonce, no signed_at, no target_*, no reason.
-//   - status ∈  EXACTLY { "opened", "failed" } — the only two the Brain emits.
+//   - status in  EXACTLY { "opened", "failed", "indexed" } - the statuses the Brain emits.
 //   - Identity:  source_record_id_hash = sha256(source_record_id).hexdigest()[:16] — the
 //                Brain's only candidate identifier on the wire (there is no candidate_id).
 //
@@ -516,9 +516,10 @@ const CANDIDATE_PROMOTION_RETURNING = [
 // replay-safety rests on IDEMPOTENCY (re-applying the same writeback is a no-op) because the
 // Brain sends no nonce/timestamp to support the ticket's skew-window replay model.
 //
-// STATUS MAPPING (load-bearing): the wire `status` is NOT a valid promotion_status CHECK
-// value. We map:  "opened" → 'pr_opened' (+ store pr_url + branch, stamp promoted_at),
-//                 "failed" → 'failed' (status_* only; the candidate STAYS status='accepted',
+// STATUS MAPPING (load-bearing): not every wire `status` is a valid promotion_status CHECK
+// value. We map:  "opened" -> 'pr_opened' (+ store pr_url + branch, stamp promoted_at),
+//                 "indexed" -> 'indexed',
+//                 "failed" -> 'failed' (status_* only; the candidate STAYS status='accepted',
 //                            never 'rejected').
 //
 // SECURITY: verify-before-parse. A forged/missing/garbage signature → 401 with ZERO DB
@@ -526,8 +527,8 @@ const CANDIDATE_PROMOTION_RETURNING = [
 // LOGGING (AC7): the secret, the signature, and the full body are NEVER logged; only `status`,
 // `source_record_id_hash` (already a hash — safe), and the matched candidate id.
 
-/** The two wire statuses the merged Brain bridge emits. */
-export type PromotionCallbackWireStatus = 'opened' | 'failed';
+/** The wire statuses the merged Brain bridge emits. */
+export type PromotionCallbackWireStatus = 'opened' | 'failed' | 'indexed';
 
 /** The EXACT 4-key body the merged Brain `emit_status` sends. */
 export interface PromotionCallbackBody {
@@ -556,7 +557,7 @@ export function sourceRecordIdHash16(sourceRecordId: string): string {
 
 /**
  * Strictly validate the parsed JSON body: it must be a plain object carrying EXACTLY the 4
- * keys (no missing, no extra), each of the right type, with status ∈ {opened, failed}.
+ * keys (no missing, no extra), each of the right type, with status in {opened, failed, indexed}.
  * Returns the typed body or null (caller → 400). Pure; no I/O.
  */
 function parsePromotionCallbackBody(parsed: unknown): PromotionCallbackBody | null {
@@ -571,7 +572,7 @@ function parsePromotionCallbackBody(parsed: unknown): PromotionCallbackBody | nu
   }
 
   const { status, branch, pr_url, source_record_id_hash } = obj;
-  if (status !== 'opened' && status !== 'failed') return null;
+  if (status !== 'opened' && status !== 'failed' && status !== 'indexed') return null;
   if (typeof branch !== 'string') return null;
   if (typeof pr_url !== 'string') return null;
   if (typeof source_record_id_hash !== 'string' || source_record_id_hash.length === 0) return null;
@@ -703,15 +704,17 @@ export async function handlePromotionCallback(args: {
   }
 
   // (5) Allowlisted writeback. The status MAPPING is load-bearing: 'opened' is NOT a valid
-  //     promotion_status CHECK value — it maps to 'pr_opened'. On 'failed' we set only
-  //     promotion_status='failed'; the candidate row's `status` stays 'accepted' (NOT
-  //     'rejected') — updateCandidatePromotionState can never touch `status`. Re-applying the
-  //     same patch (a duplicate delivery) writes the same values — an idempotent no-op — and
+  //     promotion_status CHECK value - it maps to 'pr_opened'. 'indexed' and 'failed' map
+  //     to their same-named promotion_status values. The candidate row's status stays
+  //     'accepted' (NOT 'rejected') - updateCandidatePromotionState can never touch status.
+  //     Re-applying the same patch (a duplicate delivery) writes the same values - an idempotent no-op - and
   //     returns 200 (replay-safe: the Brain sends no nonce/timestamp).
   const patch: PromotionStatePatch =
     body.status === 'opened'
       ? { promotion_status: 'pr_opened', promotion_pr_url: body.pr_url, promotion_branch: body.branch, promoted: true }
-      : { promotion_status: 'failed' };
+      : body.status === 'indexed'
+        ? { promotion_status: 'indexed' }
+        : { promotion_status: 'failed' };
 
   try {
     const updated = await updateCandidatePromotionState(engine, candidate.id, patch);
