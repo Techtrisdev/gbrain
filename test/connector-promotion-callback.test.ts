@@ -9,7 +9,7 @@
  *     + artifact_hash ownership + nonce/clock-skew replay protection.
  *   The MERGED techtris-brain bridge (PR #101 `emit_status`) actually sends
  *     { status, branch, pr_url, source_record_id_hash } + header X-Brain-Signature
- *     + status∈{opened,failed} with NO replay token.
+ *     + status in {opened,failed,indexed} with NO replay token.
  *   gbrain matches the merged reality: ownership is by source_record_id_hash, replay-safety
  *   is by idempotency (re-applying the same writeback is a no-op).
  *
@@ -212,7 +212,7 @@ describe('body validation (strict 4-key shape)', () => {
   test('unknown status value → 400, no write', async () => {
     const { id, hash16 } = await seedDispatched('rec-badstatus');
     const { rawBody, signature } = signRaw(JSON.stringify({
-      branch: BRANCH, pr_url: PR_URL, source_record_id_hash: hash16, status: 'indexed',
+      branch: BRANCH, pr_url: PR_URL, source_record_id_hash: hash16, status: 'banana',
     }));
     const result = await handlePromotionCallback({ rawBody, signatureHeader: signature, secret: SECRET, engine });
     expect((result as Extract<PromotionCallbackResult, { ok: false }>).status).toBe(400);
@@ -288,6 +288,73 @@ describe('status mapping: failed → failed (status stays accepted)', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────
+// indexed -> indexed, status stays accepted
+describe('status mapping: indexed -> indexed (status stays accepted)', () => {
+  test("advances an opened candidate to promotion_status='indexed'", async () => {
+    const { id, hash16 } = await seedDispatched('rec-indexed');
+    const opened = signedBody({ status: 'opened', branch: BRANCH, pr_url: PR_URL, source_record_id_hash: hash16 });
+    const openedResult = await handlePromotionCallback({
+      rawBody: opened.rawBody,
+      signatureHeader: opened.signature,
+      secret: SECRET,
+      engine,
+    });
+    expect(openedResult.ok).toBe(true);
+    expect((await readRow(id)).promotion_status).toBe('pr_opened');
+
+    const indexed = signedBody({ status: 'indexed', branch: BRANCH, pr_url: PR_URL, source_record_id_hash: hash16 });
+    const result = await handlePromotionCallback({
+      rawBody: indexed.rawBody,
+      signatureHeader: indexed.signature,
+      secret: SECRET,
+      engine,
+    });
+    expect(result.ok).toBe(true);
+    expect((result as Extract<PromotionCallbackResult, { ok: true }>).status).toBe(200);
+    expect((result as Extract<PromotionCallbackResult, { ok: true }>).mappedStatus).toBe('indexed');
+
+    const after = await readRow(id);
+    expect(after.promotion_status).toBe('indexed');
+    expect(after.promotion_pr_url).toBe(PR_URL);
+    expect(after.promotion_branch).toBe(BRANCH);
+    expect(after.promoted_at).not.toBeNull();
+    expect(after.status).toBe('accepted');
+  });
+
+  test('duplicate indexed delivery -> same 200, same terminal state', async () => {
+    const { id, hash16 } = await seedDispatched('rec-indexed-dup');
+    const opened = signedBody({ status: 'opened', branch: BRANCH, pr_url: PR_URL, source_record_id_hash: hash16 });
+    await handlePromotionCallback({ rawBody: opened.rawBody, signatureHeader: opened.signature, secret: SECRET, engine });
+
+    const indexed = signedBody({ status: 'indexed', branch: BRANCH, pr_url: PR_URL, source_record_id_hash: hash16 });
+    const first = await handlePromotionCallback({
+      rawBody: indexed.rawBody,
+      signatureHeader: indexed.signature,
+      secret: SECRET,
+      engine,
+    });
+    expect(first.ok).toBe(true);
+    const afterFirst = await readRow(id);
+    expect(afterFirst.promotion_status).toBe('indexed');
+
+    const second = await handlePromotionCallback({
+      rawBody: indexed.rawBody,
+      signatureHeader: indexed.signature,
+      secret: SECRET,
+      engine,
+    });
+    expect(second.ok).toBe(true);
+    expect((second as Extract<PromotionCallbackResult, { ok: true }>).status).toBe(200);
+    expect((second as Extract<PromotionCallbackResult, { ok: true }>).mappedStatus).toBe('indexed');
+
+    const afterSecond = await readRow(id);
+    expect(afterSecond.promotion_status).toBe('indexed');
+    expect(afterSecond.promotion_pr_url).toBe(afterFirst.promotion_pr_url);
+    expect(afterSecond.promotion_branch).toBe(afterFirst.promotion_branch);
+    expect(afterSecond.promoted_at).toEqual(afterFirst.promoted_at);
+    expect(afterSecond.status).toBe('accepted');
+  });
+});
 // Identity by source_record_id_hash — right row, neighbours untouched
 // ─────────────────────────────────────────────────────────────────
 describe('identity by source_record_id_hash', () => {
