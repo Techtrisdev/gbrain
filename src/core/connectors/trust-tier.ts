@@ -26,6 +26,11 @@ export const AUTO_APPROVE_ALLOWED_PATH_PREFIXES = ['docs/', 'playbooks/'] as con
 export const AUTO_PROMOTE_ENABLED_KEY = 'connectors.auto_promote_enabled';
 export const AUTO_PROMOTE_ACTOR = 'connector:auto-promote';
 
+type TrustRelevantCandidateRow = Pick<
+  ConnectorCandidateRow,
+  'status' | 'classification' | 'confidence' | 'target_path' | 'target_kind' | 'rationale_ref' | 'redactions'
+>;
+
 const AUTO_APPROVE_DENIED_PATH_PREFIXES = [
   'clients/',
   'people/',
@@ -114,11 +119,19 @@ export async function maybeAutoApprove(engine: BrainEngine, row: ConnectorCandid
     const id = Number(row.id);
     if (!Number.isSafeInteger(id)) return false;
 
+    const freshRow = await readCurrentTrustRelevantRow(engine, id);
+    if (!freshRow) return false;
+    if (freshRow.status !== 'pending') return false;
+    if (trustTierDecision(freshRow) !== 'auto_approve') return false;
+
+    // This re-validation closes the stale in-memory-row TOCTOU. approveCandidate
+    // intentionally re-reads by id, so the residual gap is two adjacent reads
+    // before the guarded UPDATE, acceptable for this default-off fail-closed path.
     const result = await approveCandidateForTrustTier(
       engine,
       id,
       AUTO_PROMOTE_ACTOR,
-      { kind: 'existing_page', path: row.target_path ?? '' },
+      { kind: 'existing_page', path: freshRow.target_path ?? '' },
     );
     return result.row !== null;
   } catch (err) {
@@ -151,6 +164,22 @@ function isSafeAutoApprovePath(path: string): boolean {
     if (segment === '' || segment.startsWith('.')) return false;
   }
   return true;
+}
+
+async function readCurrentTrustRelevantRow(
+  engine: BrainEngine,
+  id: number,
+): Promise<TrustRelevantCandidateRow | null> {
+  try {
+    const rows = await engine.executeRaw<TrustRelevantCandidateRow>(
+      `SELECT status, classification, confidence, target_path, target_kind, rationale_ref, redactions
+         FROM connector_candidates WHERE id = $1`,
+      [id],
+    );
+    return rows[0] ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function readSourceConfig(

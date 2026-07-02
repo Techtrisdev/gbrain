@@ -47,6 +47,7 @@ function fakeEngine(opts: {
   autoPromote?: string | null;
   sourceConfig?: unknown;
   sourceMissing?: boolean;
+  currentCandidate?: ConnectorCandidateRow | null;
 } = {}): BrainEngine {
   return {
     kind: 'postgres',
@@ -57,6 +58,9 @@ function fakeEngine(opts: {
     executeRaw: async (sql: string) => {
       if (/FROM sources WHERE id = \$1/.test(sql)) {
         return opts.sourceMissing ? [] : [{ config: opts.sourceConfig ?? {} }];
+      }
+      if (/FROM connector_candidates WHERE id = \$1/.test(sql)) {
+        return opts.currentCandidate === null ? [] : [opts.currentCandidate ?? candidateRow()];
       }
       throw new Error(`unexpected SQL in fake engine: ${sql}`);
     },
@@ -161,7 +165,9 @@ describe('maybeAutoApprove', () => {
     const row = candidateRow();
     const approve = mockApproval(row);
 
-    await expect(maybeAutoApprove(fakeEngine({ autoPromote: 'true' }), row)).resolves.toBe(true);
+    await expect(
+      maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
+    ).resolves.toBe(true);
     expect(approve).toHaveBeenCalledTimes(1);
     const call = approve.mock.calls[0] as Parameters<ApproveCandidateFn>;
     expect(call[1]).toBe(row.id);
@@ -181,6 +187,34 @@ describe('maybeAutoApprove', () => {
     expect(approve).not.toHaveBeenCalled();
   });
 
+  test('fresh unsafe candidate reread fails closed before approval', async () => {
+    const staleSafeRow = candidateRow();
+    const currentUnsafeRow = candidateRow({
+      classification: 'UPDATE',
+      target_kind: 'update_page',
+      target_path: 'clients/acme.md',
+    });
+    const approve = mockApproval(staleSafeRow);
+
+    await expect(
+      maybeAutoApprove(
+        fakeEngine({ autoPromote: 'true', currentCandidate: currentUnsafeRow }),
+        staleSafeRow,
+      ),
+    ).resolves.toBe(false);
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  test('missing candidate reread fails closed before approval', async () => {
+    const row = candidateRow();
+    const approve = mockApproval(row);
+
+    await expect(
+      maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: null }), row),
+    ).resolves.toBe(false);
+    expect(approve).not.toHaveBeenCalled();
+  });
+
   test('approveCandidate errors fail closed and do not propagate', async () => {
     const row = candidateRow();
     const approve = mock(async (..._args: Parameters<ApproveCandidateFn>): Promise<ApproveResult> => {
@@ -190,7 +224,9 @@ describe('maybeAutoApprove', () => {
     const errSpy = spyOn(console, 'error').mockImplementation(() => {});
 
     try {
-      await expect(maybeAutoApprove(fakeEngine({ autoPromote: 'true' }), row)).resolves.toBe(false);
+      await expect(
+        maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
+      ).resolves.toBe(false);
       expect(approve).toHaveBeenCalledTimes(1);
     } finally {
       errSpy.mockRestore();
