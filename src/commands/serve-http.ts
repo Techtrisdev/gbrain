@@ -360,6 +360,165 @@ export async function queryAgentClientSpend(engine: BrainEngine): Promise<AgentC
   }));
 }
 
+// ---------------------------------------------------------------------------
+// U8 — Admin static-asset reverse proxy (opt-in via ADMIN_ASSET_ORIGIN)
+// ---------------------------------------------------------------------------
+//
+// When ADMIN_ASSET_ORIGIN is set, the /admin static catch-all forwards asset
+// requests to a private origin (the forge-admin static export behind Vercel
+// deployment protection) instead of serving the embedded/dev bundle. This is
+// OPT-IN and FAIL-CLOSED: with the env unset the catch-all keeps its exact
+// pre-U8 behavior (dev-static / embedded manifest), so default public gbrain
+// deployments are byte-identical to before.
+//
+// Every branch below is pure + dependency-injected so the security-critical
+// rules (cookie/auth stripping, traversal rejection, method gating, cache
+// fallback) are unit-testable without a live network or Express client —
+// matching the resolveBootstrapToken / probeLiveness test seams.
+
+/**
+ * Resolve the configured private asset origin, or null when the reverse proxy
+ * is not enabled. This is the single fail-closed gate: an unset OR
+ * whitespace-only ADMIN_ASSET_ORIGIN → null → the caller keeps the pre-U8
+ * dev-static / embedded fallback, so default public deployments never proxy.
+ */
+export function resolveAdminAssetOrigin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const v = env.ADMIN_ASSET_ORIGIN;
+  return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
+}
+
+/**
+ * Local admin routes that must NEVER be reverse-proxied to the private asset
+ * origin. They are served by earlier Express handlers (magic-link login/redeem,
+ * JSON API, SSE feed); the static catch-all defers to them via next(). Mirrors
+ * the pre-U8 exclusion list plus /admin/auth/* (magic-link redemption) for
+ * defense in depth — the admin session surface must stay local.
+ */
+export function isAdminLocalRoute(reqPath: string): boolean {
+  return (
+    reqPath.startsWith('/admin/api/') ||
+    reqPath === '/admin/events' ||
+    reqPath === '/admin/login' ||
+    reqPath.startsWith('/admin/auth/')
+  );
+}
+
+/**
+ * Validate + normalize a request path for upstream forwarding. Returns the
+ * safe path (guaranteed to stay under the /admin/ prefix) or null on any
+ * traversal attempt. Express's `req.path` is NOT percent-decoded, so encoded
+ * primitives (%2e, %2f, %5c) are still literal here and rejected pre-decode.
+ *
+ * Rejects: literal `.`/`..` segments, percent-encoded dots/slashes/backslashes,
+ * literal backslashes, NUL bytes, and anything escaping the /admin/ prefix.
+ */
+export function normalizeAdminAssetPath(reqPath: string): string | null {
+  // Reject encoded traversal primitives before any decode (case-insensitive):
+  // %2e (.), %2f (/), %5c (\).
+  if (/%2e|%2f|%5c/i.test(reqPath)) return null;
+  // Reject literal backslashes (Windows separators) and NUL bytes.
+  if (reqPath.includes('\\') || reqPath.includes('\0')) return null;
+  // Must stay within the /admin prefix.
+  if (reqPath !== '/admin' && !reqPath.startsWith('/admin/')) return null;
+  // Reject any `.` or `..` path segment.
+  if (reqPath.split('/').some(seg => seg === '.' || seg === '..')) return null;
+  return reqPath;
+}
+
+/** One cached upstream asset response, with an absolute expiry timestamp. */
+export interface AdminAssetCacheEntry {
+  status: number;
+  contentType: string | null;
+  body: Buffer;
+  expiresAt: number;
+}
+
+/**
+ * Result of proxyAdminAsset — a tagged union the Express handler maps onto the
+ * response:
+ *   - `local`    → defer to the earlier local route (next()).
+ *   - `reject`   → send `status` with an empty body (400 traversal / 405 method
+ *                  / 503 cold-miss upstream failure).
+ *   - `response` → send `status` + optional content-type + body bytes.
+ */
+export type AdminProxyResult =
+  | { kind: 'local' }
+  | { kind: 'reject'; status: number }
+  | { kind: 'response'; status: number; contentType: string | null; body: Buffer; fromCache: boolean };
+
+export interface AdminProxyDeps {
+  origin: string;
+  bypassToken?: string;
+  fetchFn: typeof fetch;
+  cache: Map<string, AdminAssetCacheEntry>;
+  ttlMs: number;
+  now?: () => number;
+}
+
+/**
+ * Core reverse-proxy decision for one /admin/* asset request. Pure except for
+ * the injected `fetchFn` and `cache`; the outbound request is built from
+ * scratch so inbound Cookie / Authorization headers are dropped BY
+ * CONSTRUCTION — the private origin only ever sees the bypass token and a
+ * minimal Accept header. The gbrain admin session cookie can never transit.
+ *
+ * Order of checks: local-route exclusion → method gate (GET/HEAD only) →
+ * traversal rejection → fresh cache hit → upstream fetch (cache 200s) →
+ * on-error last-good fallback → cold-miss 503.
+ */
+export async function proxyAdminAsset(
+  reqPath: string,
+  method: string,
+  search: string,
+  deps: AdminProxyDeps,
+): Promise<AdminProxyResult> {
+  if (isAdminLocalRoute(reqPath)) return { kind: 'local' };
+
+  const upper = method.toUpperCase();
+  if (upper !== 'GET' && upper !== 'HEAD') return { kind: 'reject', status: 405 };
+
+  const safePath = normalizeAdminAssetPath(reqPath);
+  if (safePath === null) return { kind: 'reject', status: 400 };
+
+  const now = deps.now ?? (() => Date.now());
+  const cacheKey = safePath + search;
+  const cached = deps.cache.get(cacheKey);
+
+  // Fresh cache hit — serve without touching the origin.
+  if (cached && cached.expiresAt > now()) {
+    return { kind: 'response', status: cached.status, contentType: cached.contentType, body: cached.body, fromCache: true };
+  }
+
+  // Build the outbound request from scratch. Only these headers travel
+  // upstream; inbound Cookie / Authorization are never copied.
+  const headers: Record<string, string> = { accept: '*/*' };
+  if (deps.bypassToken) headers['x-vercel-protection-bypass'] = deps.bypassToken;
+
+  const url = deps.origin.replace(/\/+$/, '') + safePath + search;
+
+  try {
+    // redirect:'manual' — never chase a 3xx while carrying the bypass token
+    // (avoids re-sending it to a redirected host).
+    const upstream = await deps.fetchFn(url, { method: upper, headers, redirect: 'manual' });
+    const body = Buffer.from(await upstream.arrayBuffer());
+    const contentType = upstream.headers.get('content-type');
+    // Only cache successful GETs — HEAD has no body and errors must not poison
+    // the cache.
+    if (upper === 'GET' && upstream.status === 200) {
+      deps.cache.set(cacheKey, { status: 200, contentType, body, expiresAt: now() + deps.ttlMs });
+    }
+    return { kind: 'response', status: upstream.status, contentType, body, fromCache: false };
+  } catch {
+    // Origin blip: serve last-good bytes even past TTL so a transient outage
+    // doesn't down the dashboard. Only a cold miss (nothing ever cached) fails
+    // closed with 503.
+    if (cached) {
+      return { kind: 'response', status: cached.status, contentType: cached.contentType, body: cached.body, fromCache: true };
+    }
+    return { kind: 'reject', status: 503 };
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -1240,50 +1399,83 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   //      instead of 404. Pre-fix the cwd-relative path was the ONLY
   //      resolution path, and every fresh install of the compiled binary
   //      hit 404 on /admin (issue #1090).
-  const path = await import('path');
-  const fs = await import('fs');
-  const adminDistPath = path.join(process.cwd(), 'admin', 'dist');
-  const useDevPath = fs.existsSync(adminDistPath);
-  if (useDevPath) {
-    app.use('/admin', express.static(adminDistPath));
-    app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
-      if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
-        return next();
-      }
-      res.sendFile(path.join(adminDistPath, 'index.html'));
+  //
+  // U8 (opt-in): when ADMIN_ASSET_ORIGIN is set, reverse-proxy the /admin
+  // static catch-all to that private origin (the forge-admin static export
+  // behind Vercel deployment protection). Fail-closed — when the env is unset
+  // we fall through to the exact pre-U8 dev-static / embedded-manifest branches
+  // below, so default public deployments are byte-identical to before. Only the
+  // static catch-all is affected; every earlier /admin route (login, auth,
+  // api, events) is registered above and untouched.
+  const adminAssetOrigin = resolveAdminAssetOrigin();
+  if (adminAssetOrigin) {
+    const ADMIN_ASSET_BYPASS_TOKEN = process.env.ADMIN_ASSET_BYPASS_TOKEN;
+    const ADMIN_ASSET_TTL_MS = 60_000; // last-good window when the origin blips
+    const adminAssetCache = new Map<string, AdminAssetCacheEntry>();
+    // app.all so a non-GET/HEAD to the static path resolves to a real 405
+    // (proxyAdminAsset gates the method). Earlier /admin/api|login|auth|events
+    // routes are registered first and still win for their methods.
+    app.all('/admin/{*path}', async (req: Request, res: Response, next: NextFunction) => {
+      const qIdx = req.originalUrl.indexOf('?');
+      const search = qIdx === -1 ? '' : req.originalUrl.slice(qIdx);
+      const result = await proxyAdminAsset(req.path, req.method, search, {
+        origin: adminAssetOrigin,
+        bypassToken: ADMIN_ASSET_BYPASS_TOKEN,
+        fetchFn: fetch,
+        cache: adminAssetCache,
+        ttlMs: ADMIN_ASSET_TTL_MS,
+      });
+      if (result.kind === 'local') { next(); return; }
+      if (result.kind === 'reject') { res.status(result.status).end(); return; }
+      if (result.contentType) res.setHeader('Content-Type', result.contentType);
+      res.status(result.status).send(result.body);
     });
   } else {
-    // Embedded path. Read assets from the generated manifest. Cache the
-    // bytes per asset on first request — these never change for a given
-    // binary, so subsequent requests skip the fs read.
-    const { ADMIN_ASSETS, ADMIN_INDEX_HTML } = await import('../admin-embedded.ts');
-    const cache = new Map<string, Buffer>();
-    function loadAsset(asset: { path: string }): Buffer {
-      const hit = cache.get(asset.path);
-      if (hit) return hit;
-      const buf = fs.readFileSync(asset.path);
-      cache.set(asset.path, buf);
-      return buf;
+    const path = await import('path');
+    const fs = await import('fs');
+    const adminDistPath = path.join(process.cwd(), 'admin', 'dist');
+    const useDevPath = fs.existsSync(adminDistPath);
+    if (useDevPath) {
+      app.use('/admin', express.static(adminDistPath));
+      app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
+        if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
+          return next();
+        }
+        res.sendFile(path.join(adminDistPath, 'index.html'));
+      });
+    } else {
+      // Embedded path. Read assets from the generated manifest. Cache the
+      // bytes per asset on first request — these never change for a given
+      // binary, so subsequent requests skip the fs read.
+      const { ADMIN_ASSETS, ADMIN_INDEX_HTML } = await import('../admin-embedded.ts');
+      const cache = new Map<string, Buffer>();
+      function loadAsset(asset: { path: string }): Buffer {
+        const hit = cache.get(asset.path);
+        if (hit) return hit;
+        const buf = fs.readFileSync(asset.path);
+        cache.set(asset.path, buf);
+        return buf;
+      }
+      app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
+        if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
+          return next();
+        }
+        const hit = ADMIN_ASSETS[req.path];
+        if (hit) {
+          res.setHeader('Content-Type', hit.mime);
+          res.send(loadAsset(hit));
+          return;
+        }
+        // SPA fallback — every unmatched /admin/* route resolves to index.html
+        // so client-side routing takes over (login, dashboard, agents, ...).
+        if (ADMIN_INDEX_HTML) {
+          res.setHeader('Content-Type', ADMIN_INDEX_HTML.mime);
+          res.send(loadAsset(ADMIN_INDEX_HTML));
+          return;
+        }
+        res.status(404).send('admin SPA not available');
+      });
     }
-    app.get('/admin/{*path}', (req: Request, res: Response, next: NextFunction) => {
-      if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
-        return next();
-      }
-      const hit = ADMIN_ASSETS[req.path];
-      if (hit) {
-        res.setHeader('Content-Type', hit.mime);
-        res.send(loadAsset(hit));
-        return;
-      }
-      // SPA fallback — every unmatched /admin/* route resolves to index.html
-      // so client-side routing takes over (login, dashboard, agents, ...).
-      if (ADMIN_INDEX_HTML) {
-        res.setHeader('Content-Type', ADMIN_INDEX_HTML.mime);
-        res.send(loadAsset(ADMIN_INDEX_HTML));
-        return;
-      }
-      res.status(404).send('admin SPA not available');
-    });
   }
 
   // ---------------------------------------------------------------------------
