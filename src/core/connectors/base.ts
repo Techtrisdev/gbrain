@@ -20,7 +20,9 @@ import {
   compiledTruthSubstance,
   minCandidateBodyChars,
   type ConnectorCandidateItem,
+  type ConnectorCandidateRow,
 } from './candidate.ts';
+import { maybeAutoApprove } from './trust-tier.ts';
 import { minimize, strip, type RawConnectorItem } from './redact.ts';
 import { recordConsolidationDecision } from './consolidation-decisions.ts';
 import type { ConsolidationClassifyResult } from './consolidate.ts';
@@ -274,8 +276,12 @@ export async function landRecords(
     // returns the COUNT it wrote (not a boolean); the raw passthrough writes one.
     if (consolidation) {
       written += await landOneConsolidated(engine, sourceId, connector, candidate, consolidation);
-    } else if ((await toRow(engine, candidate)).written) {
-      written += 1;
+    } else {
+      const landed = await toRow(engine, candidate);
+      if (landed.written) {
+        written += 1;
+        await maybeAutoApprove(engine, landed.row);
+      }
     }
   }
   return { written, total: records.length };
@@ -346,7 +352,12 @@ async function landOneConsolidated(
 ): Promise<number> {
   const provider = candidate.provider ?? connector.provider;
   const version = strip(candidate.version ?? '1');
-  const passthrough = async (): Promise<number> => ((await toRow(engine, candidate)).written ? 1 : 0);
+  const passthrough = async (): Promise<number> => {
+    const landed = await toRow(engine, candidate);
+    if (!landed.written) return 0;
+    await maybeAutoApprove(engine, landed.row);
+    return 1;
+  };
   try {
     // Gate: per-connector flag (default false) + chat reachable. Either off →
     // today's raw passthrough (no DB pre-check, no LLM). The POLL-only structural
@@ -538,9 +549,12 @@ async function persistOneVerdict(
   // partition only. A PERMANENT error (exhausts the retries) still ends there — that
   // residual single-partition loss is the documented known-limitation.
   let written = false;
+  let landedRow: ConnectorCandidateRow | null = null;
   for (let attempt = 1; ; attempt++) {
     try {
-      ({ written } = await toRow(engine, item));
+      const landed = await toRow(engine, item);
+      written = landed.written;
+      landedRow = landed.row;
       break;
     } catch (err) {
       if (isAbortError(err) || attempt >= 3) throw err;
@@ -586,6 +600,9 @@ async function persistOneVerdict(
       `[consolidation] fan-out verdict for ${sourceId}/${recordId} (${final.classification}) ` +
         `conflicted on an existing key — body dropped (duplicate target in one capture)`,
     );
+  }
+  if (written && landedRow) {
+    await maybeAutoApprove(engine, landedRow);
   }
   return written ? 1 : 0;
 }
