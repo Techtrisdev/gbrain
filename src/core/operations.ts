@@ -18,6 +18,7 @@ import { hybridSearch, hybridSearchCached } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { recordSearchTelemetry } from './search/telemetry.ts';
+import { attachRetrievalResponseMeta, hashQueryText, recordRetrievalEvent } from './search/retrieval-events.ts';
 import { classifyQueryIntent } from './search/query-intent.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
@@ -284,6 +285,12 @@ export interface OperationContext {
    * per-operation scope enforcement.
    */
   auth?: AuthInfo;
+  /**
+   * Human-readable caller/agent label from the transport, when available.
+   * Kept separate from auth so legacy bearer tokens and OAuth clients can both
+   * attribute retrieval events without changing the auth contract.
+   */
+  agentName?: string;
   /**
    * True when the caller is remote/untrusted (MCP over stdio/HTTP, or any agent-facing entry point).
    * False for local CLI invocations by the owner of the machine.
@@ -1453,6 +1460,7 @@ const search: Operation = {
     });
     const results = dedupResults(raw);
     const latency_ms = Date.now() - startedAt;
+    const intent = classifyQueryIntent(queryText);
 
     // v0.40.x — keyword-op telemetry. This op bypasses hybridSearch, so it records
     // here. mode='keyword' keeps it a DISTINCT rollup bucket from the semantic modes;
@@ -1462,12 +1470,24 @@ const search: Operation = {
       vector_enabled: false,
       detail_resolved: null,
       expansion_applied: false,
-      intent: classifyQueryIntent(queryText),
+      intent,
       mode: 'keyword',
     }, { results_count: results.length }, {
       client: ctx.auth?.clientName,
       sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
     });
+
+    const queryId = recordRetrievalEvent(ctx.engine, {
+      client: ctx.auth?.clientName,
+      sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
+      agentName: ctx.agentName,
+      mode: 'keyword',
+      intent,
+      queryText,
+      resultCount: results.length,
+      topResultSlug: results[0]?.slug ?? null,
+    });
+    attachRetrievalResponseMeta(results, { query_id: queryId });
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Fire-and-forget;
     // results already returned by engine, this just marks them as user-surfaced
@@ -1617,6 +1637,17 @@ const query: Operation = {
         embeddingColumn: 'embedding_image',
         ...querySourceScope,
       });
+      const queryId = recordRetrievalEvent(ctx.engine, {
+        client: ctx.auth?.clientName,
+        sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
+        agentName: ctx.agentName,
+        mode: 'image',
+        intent: 'image',
+        queryText: 'image:' + hashQueryText(imageData),
+        resultCount: results.length,
+        topResultSlug: results[0]?.slug ?? null,
+      });
+      attachRetrievalResponseMeta(results, { query_id: queryId });
       return results;
     }
 
@@ -1671,6 +1702,20 @@ const query: Operation = {
       embeddingColumn: embeddingColumnParam,
     });
     const latency_ms = Date.now() - startedAt;
+    const retrievalMeta = capturedMeta as HybridSearchMeta | null;
+    const retrievalMode = retrievalMeta?.mode ?? 'unset';
+    const retrievalIntent = retrievalMeta?.intent ?? classifyQueryIntent(queryText);
+    const queryId = recordRetrievalEvent(ctx.engine, {
+      client: ctx.auth?.clientName,
+      sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
+      agentName: ctx.agentName,
+      mode: retrievalMode,
+      intent: retrievalIntent,
+      queryText,
+      resultCount: results.length,
+      topResultSlug: results[0]?.slug ?? null,
+    });
+    attachRetrievalResponseMeta(results, { query_id: queryId });
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.
@@ -1708,6 +1753,89 @@ const query: Operation = {
   cliHints: { name: 'query', positional: ['query'] },
 };
 
+const record_retrieval_use: Operation = {
+  name: 'record_retrieval_use',
+  description: 'Record that a caller used one result from a prior query/search response. Requires a query_id returned in MCP _meta.retrieval.query_id and the 1-based used_rank. Updates only existing retrieval_events rows; unknown query ids are rejected.',
+  params: {
+    query_id: { type: 'string', required: true, description: 'query_id returned in MCP _meta.retrieval.query_id' },
+    used_rank: { type: 'number', required: true, description: '1-based rank of the result the caller used' },
+  },
+  scope: 'write',
+  mutating: true,
+  handler: async (ctx, p) => {
+    const queryId = p.query_id as string;
+    const usedRank = p.used_rank as number;
+    if (queryId.trim().length === 0) {
+      throw new OperationError('invalid_params', 'query_id must be a non-empty string');
+    }
+    if (!Number.isInteger(usedRank) || usedRank < 1) {
+      throw new OperationError('invalid_params', 'used_rank must be a positive integer');
+    }
+    const rawCallerSource = ctx.auth?.sourceId ?? ctx.sourceId;
+    const callerSource = typeof rawCallerSource === 'string' && rawCallerSource.trim().length > 0
+      ? rawCallerSource.trim()
+      : 'unknown';
+    if (ctx.dryRun) {
+      return {
+        dry_run: true,
+        action: 'record_retrieval_use',
+        query_id: queryId,
+        used_result_rank: usedRank,
+      };
+    }
+
+    const notFoundError = () => new OperationError(
+      'retrieval_event_not_found',
+      `retrieval_event not found for query_id: ${queryId}`,
+      'Call record_retrieval_use only with a query_id returned in MCP _meta.retrieval.query_id.',
+    );
+
+    // Query/search inserts retrieval_events fire-and-forget; an immediate ack
+    // can race the async insert. Unknown, wrong-source, and pre-commit acks
+    // intentionally fail closed with retrieval_event_not_found.
+    const events = await ctx.engine.executeRaw<{ result_count: number }>(
+      `SELECT result_count
+         FROM retrieval_events
+        WHERE query_id = $1
+          AND source_id = $2`,
+      [queryId, callerSource],
+    );
+    const event = events[0];
+    if (!event) {
+      throw notFoundError();
+    }
+    if (usedRank > event.result_count) {
+      throw new OperationError(
+        'invalid_params',
+        `used_rank must be less than or equal to result_count (${event.result_count})`,
+      );
+    }
+
+    const rows = await ctx.engine.executeRaw<{
+      query_id: string;
+      used_result_rank: number;
+      used_at: string;
+    }>(
+      `UPDATE retrieval_events
+         SET used_result_rank = $2,
+             used_at = now()
+       WHERE query_id = $1
+         AND source_id = $3
+       RETURNING query_id, used_result_rank, used_at::text AS used_at`,
+      [queryId, usedRank, callerSource],
+    );
+    const row = rows[0];
+    if (!row) {
+      throw notFoundError();
+    }
+    return {
+      status: 'recorded',
+      query_id: row.query_id,
+      used_result_rank: row.used_result_rank,
+      used_at: row.used_at,
+    };
+  },
+};
 // --- v0.28: Takes ---
 
 const takes_list: Operation = {
@@ -4425,7 +4553,7 @@ export const operations: Operation[] = [
   // v0.26.5 destructive-guard ops (page-level soft-delete + recovery + admin purge)
   restore_page, purge_deleted_pages,
   // Search
-  search, query,
+  search, query, record_retrieval_use,
   // v0.36 Phase 2: image-as-query
   search_by_image,
   // Tags

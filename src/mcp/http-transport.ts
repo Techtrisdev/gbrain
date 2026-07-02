@@ -423,6 +423,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           remote: true,
           takesHoldersAllowList: auth.takesHoldersAllowList,
           sourceId: auth.sourceId,
+          agentName: auth.tokenName,
         });
         const status = result.isError ? 'error' : 'success';
         logRequest(auth.tokenName!, `tools/call:${toolName}`, status, Date.now() - startedMs);

@@ -561,6 +561,30 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
 -- Composite indexes for admin dashboard request log queries
 CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at, token_name);
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
+-- ============================================================
+-- retrieval_events: per-query retrieval outcome attribution
+-- ============================================================
+CREATE TABLE IF NOT EXISTS retrieval_events (
+  query_id         TEXT PRIMARY KEY,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  client           TEXT NOT NULL DEFAULT 'unknown',
+  source_id        TEXT NOT NULL DEFAULT 'unknown',
+  agent_name       TEXT,
+  mode             TEXT,
+  intent           TEXT,
+  query_hash       TEXT NOT NULL,
+  result_count     INTEGER NOT NULL DEFAULT 0,
+  top_result_slug  TEXT,
+  used_result_rank INTEGER,
+  used_at          TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_events_created_at
+  ON retrieval_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_retrieval_events_source_client
+  ON retrieval_events(source_id, client, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_retrieval_events_used_at
+  ON retrieval_events(used_at DESC) WHERE used_at IS NOT NULL;
 
 -- ============================================================
 -- op_checkpoints: shared checkpoint table for long-running ops

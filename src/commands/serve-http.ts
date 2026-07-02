@@ -1478,6 +1478,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           // but forgot to pass authInfo; whoami fell through to the
           // unknown_transport throw because ctx.auth was undefined.
           auth: authInfo,
+          agentName,
           logger: {
             info: (msg: string) => console.error(`[INFO] ${msg}`),
             warn: (msg: string) => console.error(`[WARN] ${msg}`),
