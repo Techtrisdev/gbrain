@@ -4650,6 +4650,62 @@ export const MIGRATIONS: Migration[] = [
     },
     sql: '', // engine-specific via sqlFor
   },
+  {
+    version: 100,
+    name: 'retrieval_events_per_query_outcomes',
+    // Per-query retrieval attribution for live qrel construction. This is a
+    // separate append-only event table, not part of search_telemetry, because
+    // the rollup is keyed by day/mode/intent/client/source and intentionally
+    // cannot retain query-level ack state. Only a SHA-256 query_hash is stored;
+    // raw query text never persists here.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS retrieval_events (
+        query_id         TEXT PRIMARY KEY,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+        client           TEXT NOT NULL DEFAULT 'unknown',
+        source_id        TEXT NOT NULL DEFAULT 'unknown',
+        agent_name       TEXT,
+        mode             TEXT,
+        intent           TEXT,
+        query_hash       TEXT NOT NULL,
+        result_count     INTEGER NOT NULL DEFAULT 0,
+        top_result_slug  TEXT,
+        used_result_rank INTEGER,
+        used_at          TIMESTAMPTZ
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_retrieval_events_created_at
+        ON retrieval_events(created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_retrieval_events_source_client
+        ON retrieval_events(source_id, client, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_retrieval_events_used_at
+        ON retrieval_events(used_at DESC) WHERE used_at IS NOT NULL;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'retrieval_events'`,
+      );
+      const cols = new Set(rows.map((r) => r.column_name));
+      return [
+        'query_id',
+        'created_at',
+        'client',
+        'source_id',
+        'agent_name',
+        'mode',
+        'intent',
+        'query_hash',
+        'result_count',
+        'top_result_slug',
+        'used_result_rank',
+        'used_at',
+      ].every((col) => cols.has(col));
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

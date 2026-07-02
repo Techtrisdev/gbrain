@@ -10,6 +10,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { Operation, OperationContext, AuthInfo } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
+import { getRetrievalResponseMeta } from '../core/search/retrieval-events.ts';
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];
@@ -70,6 +71,8 @@ export interface DispatchOpts {
    * was replaced by dispatchToolCall.
    */
   auth?: AuthInfo;
+  /** Optional caller label for per-query retrieval attribution. */
+  agentName?: string;
 }
 
 /**
@@ -210,6 +213,7 @@ export function buildOperationContext(
     // this fallback covers code paths that historically passed undefined.
     sourceId: opts.sourceId ?? 'default',
     auth: opts.auth,
+    agentName: opts.agentName ?? opts.auth?.clientName,
   };
 }
 
@@ -252,6 +256,8 @@ export async function dispatchToolCall(
   try {
     const result = await op.handler(ctx, safeParams);
     const out: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    const retrievalMeta = getRetrievalResponseMeta(result);
+    if (retrievalMeta) out._meta = { ...(out._meta ?? {}), retrieval: retrievalMeta };
     // v0.31 (eD3 + eE4): best-effort _meta.brain_hot_memory injection.
     // The hook is wrapped in its own try/catch — any DB blip / cache miss /
     // helper crash degrades to no `_meta` rather than flipping the whole
@@ -259,7 +265,7 @@ export async function dispatchToolCall(
     if (opts.metaHook) {
       try {
         const meta = await opts.metaHook(name, ctx);
-        if (meta && Object.keys(meta).length > 0) out._meta = meta;
+        if (meta && Object.keys(meta).length > 0) out._meta = { ...(out._meta ?? {}), ...meta };
       } catch (metaErr) {
         const msg = metaErr instanceof Error ? metaErr.message : String(metaErr);
         ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${msg}; degrading to no-_meta`);
