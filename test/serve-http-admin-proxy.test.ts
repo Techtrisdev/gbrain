@@ -29,6 +29,7 @@ import {
   type AdminAssetCacheEntry,
   type AdminProxyDeps,
 } from '../src/commands/serve-http.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const ORIGIN = 'https://admin.example.internal';
 const BYPASS = 'bypass-token-abc123';
@@ -437,15 +438,10 @@ describe('unset ADMIN_ASSET_ORIGIN → pre-U8 dev/embedded fallback (behavior pr
   // the gate is null → that block is skipped entirely → the pre-U8
   // express.static (dev) / embedded-manifest branch serves /admin, so default
   // public deployments are byte-identical to before U8 (no proxy is wired).
-  test('unset gate resolves null → proxy catch-all is never wired (dev/embedded path used)', () => {
-    const saved = process.env.ADMIN_ASSET_ORIGIN;
-    delete (process.env as Record<string, string | undefined>).ADMIN_ASSET_ORIGIN;
-    try {
+  test('unset gate resolves null → proxy catch-all is never wired (dev/embedded path used)', async () => {
+    await withEnv({ ADMIN_ASSET_ORIGIN: undefined }, () => {
       expect(resolveAdminAssetOrigin()).toBeNull();
-    } finally {
-      if (saved === undefined) delete (process.env as Record<string, string | undefined>).ADMIN_ASSET_ORIGIN;
-      else process.env.ADMIN_ASSET_ORIGIN = saved;
-    }
+    });
   });
 
   test('set gate resolves the trimmed origin → proxy catch-all is wired', () => {
