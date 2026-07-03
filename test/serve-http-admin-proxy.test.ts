@@ -24,6 +24,8 @@ import {
   isAdminLocalRoute,
   normalizeAdminAssetPath,
   proxyAdminAsset,
+  extractAdminProxyArgs,
+  ADMIN_ASSET_CACHE_MAX_ENTRIES,
   type AdminAssetCacheEntry,
   type AdminProxyDeps,
 } from '../src/commands/serve-http.ts';
@@ -146,12 +148,12 @@ describe('proxyAdminAsset — (a) proxies + strips Cookie/Authorization', () => 
     expect(calls[0].url).toBe(`${ORIGIN}/admin/`);
     expect((calls[0].init.method as string).toUpperCase()).toBe('GET');
 
-    // The security-critical assertion: the admin session cookie /
-    // Authorization NEVER transit to the private origin; only the bypass
-    // token (plus a minimal Accept) is present.
-    const keys = headerKeys(calls[0].init);
-    expect(keys).not.toContain('cookie');
-    expect(keys).not.toContain('authorization');
+    // The outbound header set is built from scratch: ONLY accept + the bypass
+    // token travel. Asserting the EXACT key set (not just "cookie absent",
+    // which is vacuous here since proxyAdminAsset never receives inbound
+    // headers) proves nothing extra is ever attached. The inbound-headers
+    // guarantee is covered at the Express-handler seam (extractAdminProxyArgs).
+    expect(headerKeys(calls[0].init).sort()).toEqual(['accept', 'x-vercel-protection-bypass']);
     expect(calls[0].init.headers['x-vercel-protection-bypass']).toBe(BYPASS);
   });
 
@@ -289,5 +291,164 @@ describe('proxyAdminAsset — TTL cache + fail-closed fallback', () => {
     const result = await proxyAdminAsset('/admin/', 'GET', '', makeDeps(fn, { bypassToken: undefined }));
     expect(result.kind).toBe('response');
     expect(headerKeys(calls[0].init)).not.toContain('x-vercel-protection-bypass');
+  });
+});
+
+// A fetch that resolves ONLY when its injected AbortSignal fires — a genuine
+// hang the timeout must break (mirrors real fetch honoring the signal). If the
+// handler forgot to pass a signal this promise never settles and the test times
+// out, which is itself the failure signal for F2.
+function makeHangingFetch() {
+  const calls: Array<{ url: string; init: any }> = [];
+  const fn = ((input: any, init: any) => {
+    calls.push({ url: String(input), init });
+    return new Promise<Response>((_resolve, reject) => {
+      const signal: AbortSignal | undefined = init?.signal;
+      if (!signal) return; // no signal → real hang → test times out (F2 not fixed)
+      const onAbort = () => reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }) as unknown as typeof fetch;
+  return { fn, calls };
+}
+
+describe('extractAdminProxyArgs — (a′) Express-handler seam: ONLY path/method/search flow in', () => {
+  test('returns exactly {reqPath, method, search} — nothing else', () => {
+    expect(
+      extractAdminProxyArgs({ path: '/admin/assets/app.js', method: 'GET', originalUrl: '/admin/assets/app.js?v=7' }),
+    ).toEqual({ reqPath: '/admin/assets/app.js', method: 'GET', search: '?v=7' });
+  });
+
+  test('no query string → empty search', () => {
+    expect(extractAdminProxyArgs({ path: '/admin/', method: 'HEAD', originalUrl: '/admin/' }))
+      .toEqual({ reqPath: '/admin/', method: 'HEAD', search: '' });
+  });
+
+  test('inbound headers / cookies are NEVER read (the real guarantee, not structural)', () => {
+    // A request whose headers/cookies THROW on access. Because the proxy's sole
+    // Express call site is this extractor, if it touched any inbound header the
+    // Cookie/Authorization could reach the private origin — this test would then
+    // throw. It passes only because path/method/originalUrl are the ONLY reads.
+    const trap = new Proxy(
+      { path: '/admin/x.js', method: 'GET', originalUrl: '/admin/x.js?a=1' } as Record<string, unknown>,
+      {
+        get(target, prop) {
+          if (prop === 'headers' || prop === 'cookies' || prop === 'header' || prop === 'get') {
+            throw new Error(`extractAdminProxyArgs read a forbidden inbound property: ${String(prop)}`);
+          }
+          return target[prop as string];
+        },
+      },
+    ) as unknown as { path: string; method: string; originalUrl: string };
+    expect(extractAdminProxyArgs(trap)).toEqual({ reqPath: '/admin/x.js', method: 'GET', search: '?a=1' });
+  });
+});
+
+describe('proxyAdminAsset — F1 bounded LRU cache (memory-exhaustion DoS)', () => {
+  test('cycling many distinct cache keys stays at or below the cap (not unbounded)', async () => {
+    const cache = new Map<string, AdminAssetCacheEntry>();
+    // Fresh 200 per call so every distinct query string is a distinct cache key.
+    const okFetch = makeFetchStub(() => new Response('x', { status: 200, headers: { 'content-type': 'text/plain' } }));
+    for (let i = 0; i < 500; i++) {
+      await proxyAdminAsset('/admin/assets/app.js', 'GET', `?v=${i}`, makeDeps(okFetch.fn, { cache, now: () => 1_000 }));
+    }
+    // 500 distinct keys inserted, but the LRU evicts the oldest on each insert
+    // past capacity → the Map saturates AT the cap, it does not grow to 500.
+    expect(cache.size).toBe(ADMIN_ASSET_CACHE_MAX_ENTRIES);
+    expect(cache.size).toBeLessThanOrEqual(ADMIN_ASSET_CACHE_MAX_ENTRIES);
+  });
+
+  test('an oversized body is proxied but never cached', async () => {
+    const cache = new Map<string, AdminAssetCacheEntry>();
+    const big = 'a'.repeat(64);
+    const okFetch = makeFetchStub(new Response(big, { status: 200, headers: { 'content-type': 'text/plain' } }));
+    const result = await proxyAdminAsset('/admin/assets/big.bin', 'GET', '', makeDeps(okFetch.fn, { cache, maxBodyBytes: 32, now: () => 1_000 }));
+    expect(result.kind).toBe('response');
+    if (result.kind === 'response') {
+      expect(result.body.toString()).toBe(big); // served in full
+      expect(result.fromCache).toBe(false);
+    }
+    expect(cache.size).toBe(0); // but not retained
+  });
+});
+
+describe('proxyAdminAsset — F2 fetch timeout (a hung origin must not park the handler)', () => {
+  test('a hung origin aborts via the timeout → cold miss fails closed with 503', async () => {
+    const { fn, calls } = makeHangingFetch();
+    const result = await proxyAdminAsset('/admin/assets/app.js', 'GET', '', makeDeps(fn, { timeoutMs: 25 }));
+    expect(result).toEqual({ kind: 'reject', status: 503 });
+    // The handler passed a real AbortSignal (proves the timeout is wired, F2).
+    expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test('a hung origin with a warm cache serves last-good bytes (not a 503)', async () => {
+    const cache = new Map<string, AdminAssetCacheEntry>();
+    await proxyAdminAsset(
+      '/admin/assets/app.js', 'GET', '',
+      makeDeps(makeFetchStub(new Response('warm', { status: 200, headers: { 'content-type': 'text/plain' } })).fn, { cache, now: () => 1_000 }),
+    );
+    const { fn } = makeHangingFetch();
+    const result = await proxyAdminAsset('/admin/assets/app.js', 'GET', '', makeDeps(fn, { cache, now: () => 999_999, timeoutMs: 25 }));
+    expect(result.kind).toBe('response');
+    if (result.kind === 'response') {
+      expect(result.fromCache).toBe(true);
+      expect(result.body.toString()).toBe('warm');
+    }
+  });
+});
+
+describe('proxyAdminAsset — F4 3xx upstream → SPA index fallback (same-origin, no redirect leak)', () => {
+  test('a GET that upstream 302s is served the SPA index.html, not a bare redirect', async () => {
+    // First upstream call: the deep link 302s (no matching static file). Second
+    // call: the index. The handler must re-fetch /admin/index.html and return it.
+    let n = 0;
+    const fn = (async (input: any, _init: any) => {
+      n++;
+      if (n === 1) return new Response(null, { status: 302, headers: { location: '/admin/' } });
+      return new Response('<!doctype html>app-shell', { status: 200, headers: { 'content-type': 'text/html' } });
+    }) as unknown as typeof fetch;
+    const calls: string[] = [];
+    const wrapped = (async (input: any, init: any) => { calls.push(String(input)); return fn(input, init); }) as unknown as typeof fetch;
+
+    const result = await proxyAdminAsset('/admin/agents/123', 'GET', '', makeDeps(wrapped));
+    expect(result.kind).toBe('response');
+    if (result.kind === 'response') {
+      expect(result.status).toBe(200);
+      expect(result.contentType).toBe('text/html');
+      expect(result.body.toString()).toBe('<!doctype html>app-shell');
+    }
+    // Second fetch targeted the index, not a redirect chase of the deep link.
+    expect(calls).toEqual([`${ORIGIN}/admin/agents/123`, `${ORIGIN}/admin/index.html`]);
+  });
+
+  test('HEAD is NOT rewritten to the index (no body to fall back to)', async () => {
+    const { fn, calls } = makeFetchStub(new Response(null, { status: 302, headers: { location: '/admin/' } }));
+    const result = await proxyAdminAsset('/admin/agents/123', 'HEAD', '', makeDeps(fn));
+    expect(result.kind).toBe('response');
+    if (result.kind === 'response') expect(result.status).toBe(302);
+    expect(calls).toHaveLength(1); // no index re-fetch for HEAD
+  });
+});
+
+describe('unset ADMIN_ASSET_ORIGIN → pre-U8 dev/embedded fallback (behavior preserved)', () => {
+  // The Express wiring registers the proxy catch-all ONLY inside
+  // `if (resolveAdminAssetOrigin())`. With the env unset (or whitespace-only)
+  // the gate is null → that block is skipped entirely → the pre-U8
+  // express.static (dev) / embedded-manifest branch serves /admin, so default
+  // public deployments are byte-identical to before U8 (no proxy is wired).
+  test('unset gate resolves null → proxy catch-all is never wired (dev/embedded path used)', () => {
+    const saved = process.env.ADMIN_ASSET_ORIGIN;
+    delete (process.env as Record<string, string | undefined>).ADMIN_ASSET_ORIGIN;
+    try {
+      expect(resolveAdminAssetOrigin()).toBeNull();
+    } finally {
+      if (saved === undefined) delete (process.env as Record<string, string | undefined>).ADMIN_ASSET_ORIGIN;
+      else process.env.ADMIN_ASSET_ORIGIN = saved;
+    }
+  });
+
+  test('set gate resolves the trimmed origin → proxy catch-all is wired', () => {
+    expect(resolveAdminAssetOrigin({ ADMIN_ASSET_ORIGIN: '  https://admin.internal  ' })).toBe('https://admin.internal');
   });
 });

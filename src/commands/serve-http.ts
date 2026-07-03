@@ -446,6 +446,24 @@ export type AdminProxyResult =
   | { kind: 'reject'; status: number }
   | { kind: 'response'; status: number; contentType: string | null; body: Buffer; fromCache: boolean };
 
+/**
+ * F1 (bounded LRU): the admin-asset cache is set on every 200 GET keyed by
+ * path+search. Without a bound, an unauthenticated client cycling distinct
+ * query strings (`app.js?v=1..N`) or distinct SPA-fallback paths accumulates
+ * retained Buffers forever → OOM on the live runtime. The Map is capped at
+ * ADMIN_ASSET_CACHE_MAX_ENTRIES (oldest evicted on insert) and bodies larger
+ * than ADMIN_ASSET_CACHE_MAX_BODY_BYTES are proxied but never cached.
+ */
+export const ADMIN_ASSET_CACHE_MAX_ENTRIES = 256;
+export const ADMIN_ASSET_CACHE_MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MiB
+/**
+ * F2 (fetch timeout): a hung origin never REJECTS, so the last-good/503 catch
+ * would never fire and the handler would park forever. Every upstream call is
+ * bounded by an AbortController fired from a setTimeout so a hang aborts → the
+ * abort rejection hits the catch → last-good/503.
+ */
+export const ADMIN_ASSET_FETCH_TIMEOUT_MS = 5_000;
+
 export interface AdminProxyDeps {
   origin: string;
   bypassToken?: string;
@@ -453,6 +471,12 @@ export interface AdminProxyDeps {
   cache: Map<string, AdminAssetCacheEntry>;
   ttlMs: number;
   now?: () => number;
+  /** LRU entry cap; defaults to ADMIN_ASSET_CACHE_MAX_ENTRIES (F1). */
+  maxEntries?: number;
+  /** Skip caching bodies larger than this; defaults to ADMIN_ASSET_CACHE_MAX_BODY_BYTES (F1). */
+  maxBodyBytes?: number;
+  /** Upstream fetch timeout; defaults to ADMIN_ASSET_FETCH_TIMEOUT_MS (F2). */
+  timeoutMs?: number;
 }
 
 /**
@@ -481,11 +505,18 @@ export async function proxyAdminAsset(
   if (safePath === null) return { kind: 'reject', status: 400 };
 
   const now = deps.now ?? (() => Date.now());
+  const maxEntries = deps.maxEntries ?? ADMIN_ASSET_CACHE_MAX_ENTRIES;
+  const maxBodyBytes = deps.maxBodyBytes ?? ADMIN_ASSET_CACHE_MAX_BODY_BYTES;
+  const timeoutMs = deps.timeoutMs ?? ADMIN_ASSET_FETCH_TIMEOUT_MS;
   const cacheKey = safePath + search;
   const cached = deps.cache.get(cacheKey);
 
-  // Fresh cache hit — serve without touching the origin.
+  // Fresh cache hit — serve without touching the origin. Refresh LRU recency
+  // (delete + re-insert moves the key to the newest slot) so a hot asset is
+  // never the one evicted when the cache is at capacity.
   if (cached && cached.expiresAt > now()) {
+    deps.cache.delete(cacheKey);
+    deps.cache.set(cacheKey, cached);
     return { kind: 'response', status: cached.status, contentType: cached.contentType, body: cached.body, fromCache: true };
   }
 
@@ -493,30 +524,87 @@ export async function proxyAdminAsset(
   // upstream; inbound Cookie / Authorization are never copied.
   const headers: Record<string, string> = { accept: '*/*' };
   if (deps.bypassToken) headers['x-vercel-protection-bypass'] = deps.bypassToken;
+  const base = deps.origin.replace(/\/+$/, '');
 
-  const url = deps.origin.replace(/\/+$/, '') + safePath + search;
+  // F2: bound every upstream call with an abort timeout so a hung origin aborts
+  // (→ the catch below → last-good/503) instead of parking the handler forever.
+  // An explicit AbortController + setTimeout is used (not AbortSignal.timeout,
+  // whose unref'd timer does not reliably fire under Bun) and is always cleared
+  // in finally so no timer leaks on the happy path. redirect:'manual' — never
+  // chase a 3xx while carrying the bypass token (avoids re-sending it to a
+  // redirected host).
+  // NOTE: no explicit return annotation — in this module `Response` is Express's
+  // type; the inferred type from deps.fetchFn (typeof fetch) is the Web Response.
+  const fetchUpstream = async (pathAndSearch: string) => {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new DOMException('admin asset upstream timeout', 'TimeoutError')),
+      timeoutMs,
+    );
+    try {
+      return await deps.fetchFn(base + pathAndSearch, {
+        method: upper,
+        headers,
+        redirect: 'manual',
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   try {
-    // redirect:'manual' — never chase a 3xx while carrying the bypass token
-    // (avoids re-sending it to a redirected host).
-    const upstream = await deps.fetchFn(url, { method: upper, headers, redirect: 'manual' });
+    let upstream = await fetchUpstream(safePath + search);
+
+    // F4: a 3xx from the static origin is a bare redirect (Vercel trailing-slash
+    // normalization, or a SPA deep link with no matching file). Relaying it
+    // drops Location and breaks the browser; instead serve the SPA index so
+    // client-side routing takes over — same-origin, no redirect leak. GET only
+    // (HEAD has no body to fall back to). The index fetch shares the timeout.
+    if (upper === 'GET' && upstream.status >= 300 && upstream.status < 400) {
+      upstream = await fetchUpstream('/admin/index.html');
+    }
+
     const body = Buffer.from(await upstream.arrayBuffer());
     const contentType = upstream.headers.get('content-type');
     // Only cache successful GETs — HEAD has no body and errors must not poison
-    // the cache.
-    if (upper === 'GET' && upstream.status === 200) {
+    // the cache. F1: skip oversized bodies, and evict the oldest entry when the
+    // LRU is at capacity, so a client cycling distinct keys/query-strings cannot
+    // grow the Map without bound.
+    if (upper === 'GET' && upstream.status === 200 && body.length <= maxBodyBytes) {
+      if (!deps.cache.has(cacheKey) && deps.cache.size >= maxEntries) {
+        const oldest = deps.cache.keys().next().value;
+        if (oldest !== undefined) deps.cache.delete(oldest);
+      }
       deps.cache.set(cacheKey, { status: 200, contentType, body, expiresAt: now() + deps.ttlMs });
     }
     return { kind: 'response', status: upstream.status, contentType, body, fromCache: false };
   } catch {
-    // Origin blip: serve last-good bytes even past TTL so a transient outage
-    // doesn't down the dashboard. Only a cold miss (nothing ever cached) fails
-    // closed with 503.
+    // Origin blip or abort (hung origin / timeout): serve last-good bytes even
+    // past TTL so a transient outage doesn't down the dashboard. Only a cold
+    // miss (nothing ever cached) fails closed with 503.
     if (cached) {
       return { kind: 'response', status: cached.status, contentType: cached.contentType, body: cached.body, fromCache: true };
     }
     return { kind: 'reject', status: 503 };
   }
+}
+
+/**
+ * Extract the ONLY three inputs the reverse proxy is permitted to see from an
+ * inbound Express request: the path, the method, and the raw query string.
+ * Inbound headers (Cookie, Authorization, ...) are deliberately NOT read — and
+ * because this is proxyAdminAsset's single Express call site, no inbound header
+ * can ever reach the private origin. Kept as an exported pure helper so that
+ * guarantee is unit-testable AT THE EXPRESS-HANDLER BOUNDARY, not merely
+ * structural inside proxyAdminAsset (whose signature can't accept a header).
+ */
+export function extractAdminProxyArgs(
+  req: { path: string; method: string; originalUrl: string },
+): { reqPath: string; method: string; search: string } {
+  const qIdx = req.originalUrl.indexOf('?');
+  const search = qIdx === -1 ? '' : req.originalUrl.slice(qIdx);
+  return { reqPath: req.path, method: req.method, search };
 }
 
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
@@ -1415,10 +1503,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // app.all so a non-GET/HEAD to the static path resolves to a real 405
     // (proxyAdminAsset gates the method). Earlier /admin/api|login|auth|events
     // routes are registered first and still win for their methods.
+    //
+    // F3 (ordering contract — latent, NOT a live bug): this catch-all is
+    // registered BEFORE the later /admin/api/* routes (connectors/candidates,
+    // ~line 2600+). It defers to them via proxyAdminAsset → isAdminLocalRoute,
+    // whose exclusion list covers EVERY current non-asset /admin route
+    // (/admin/api/*, /admin/events, /admin/login, /admin/auth/*). Chosen to
+    // leave the block in place rather than relocate ~70 lines across ~1400
+    // (which would reorder express.static('/admin') and the embedded catch-all
+    // relative to intervening middleware — larger blast radius than the latent
+    // finding warrants). GUARDRAIL FOR FUTURE AUTHORS: any new /admin route that
+    // is NOT under /admin/api/ MUST be registered before this catch-all OR added
+    // to isAdminLocalRoute — otherwise it would be silently reverse-proxied.
     app.all('/admin/{*path}', async (req: Request, res: Response, next: NextFunction) => {
-      const qIdx = req.originalUrl.indexOf('?');
-      const search = qIdx === -1 ? '' : req.originalUrl.slice(qIdx);
-      const result = await proxyAdminAsset(req.path, req.method, search, {
+      // Only path/method/search flow into the proxy — inbound headers (Cookie,
+      // Authorization) are never read, so they can't transit to the origin.
+      const { reqPath, method, search } = extractAdminProxyArgs(req);
+      const result = await proxyAdminAsset(reqPath, method, search, {
         origin: adminAssetOrigin,
         bypassToken: ADMIN_ASSET_BYPASS_TOKEN,
         fetchFn: fetch,
@@ -2501,6 +2602,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // /admin/api/connectors/:provider/connect + /callback — outbound OAuth (TECH-2033)
   // ---------------------------------------------------------------------------
+  // F3 ordering note: these /admin/api/* routes are registered AFTER the U8
+  // reverse-proxy catch-all above, but are reached because that catch-all defers
+  // every /admin/api/* path (isAdminLocalRoute) via next(). Any future NON-/admin/api
+  // /admin route added here must also be added to isAdminLocalRoute (or moved
+  // above the catch-all) or it would be silently proxied.
+  //
   // The custody layer (src/core/connectors/credentials.ts) owns encryption,
   // refresh-rotation, and the connector_tokens store. These two routes only
   // drive a registered provider's OAuth dance and hand the resulting grant to
