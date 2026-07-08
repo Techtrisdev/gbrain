@@ -12,21 +12,21 @@ surfaces**, and which one you pick depends on the operation.
                        │                gbrain process                │
                        │                                              │
    Agent (hermes,      │  ┌──────────────────┐    ┌────────────────┐ │
-   openclaw, fork) ────┼──▶  MCP ops surface  │    │   localOnly    │ │
-                       │  │ (HTTP + OAuth)    │    │   admin ops    │ │
+   openclaw, fork) ────┼──▶  MCP ops surface  │    │ local CLI +    │ │
+                       │  │ (HTTP + OAuth)    │    │ admin surface  │ │
                        │  │                   │    │                │ │
                        │  │  search, query,   │    │  sync, embed,  │ │
-                       │  │  put_page,        │    │  dream, doctor,│ │
-                       │  │  get_page,        │    │  autopilot,    │ │
-                       │  │  find_experts,    │    │  init, secrets │ │
-                       │  │  ...              │    │                │ │
+                       │  │  put_page,        │    │  extract,      │ │
+                       │  │  get_page,        │    │  dream,        │ │
+                       │  │  find_experts,    │    │  file/admin    │ │
+                       │  │  ...              │    │  ops           │ │
                        │  └──────────────────┘    └────────────────┘ │
                        │           ▲                       ▲          │
                        │           │                       │          │
                        │           │                       │          │
                        │     thin-client OAuth      shell-job `inherit:`│
-                       │     (preferred for          (only path for   │
-                       │      MCP-equivalent ops)    localOnly ops)   │
+                       │     (preferred for          (preferred for   │
+                       │      MCP-equivalent ops)    local CLI/admin) │
                        └─────────────────────────────────────────────┘
 ```
 
@@ -45,7 +45,7 @@ the set of ops in `src/core/operations.ts` whose `localOnly` flag is unset
 The host runs gbrain as a long-lived HTTP server:
 
 ```bash
-GBRAIN_ALLOW_SHELL_JOBS=1 gbrain serve --http --port 3131
+gbrain serve --http --port 3131
 ```
 
 The agent registers as an OAuth client (one-time):
@@ -53,7 +53,9 @@ The agent registers as an OAuth client (one-time):
 ```bash
 gbrain auth register-client hermes \
   --grant-types client_credentials \
-  --scopes read,write
+  --scopes read
+# Add write only for a dedicated capture-source client; see
+# docs/architecture/hermes-gbrain-memory-boundary.md.
 # Prints client_id + client_secret one-time. Store securely.
 ```
 
@@ -75,25 +77,22 @@ commands through the configured remote MCP. The agent can call
   agent to a specific source within a federated brain.
 - One audit surface (`mcp_request_log`) covers every op call uniformly.
 
-## Surface 2 — localOnly admin ops via shell-job `inherit:`
+## Surface 2 — local-only CLI/admin commands via shell-job `inherit:`
 
-Some operations are flagged `localOnly: true` in `src/core/operations.ts` and
-are **refused** in thin-client mode at `src/cli.ts:isThinClient`. The full
-list (as of v0.36.5.0) includes:
+Some CLI commands need local filesystem, daemon, or operator context and are
+refused by thin-client mode even when lower-level MCP operations exist. Check
+`src/cli.ts`'s thin-client refuse list and `src/core/operations.ts`'s
+`localOnly` flags for the current source of truth. Common examples include:
 
-- `sync` (filesystem walks need local FS access)
-- `embed` (orchestrates the embed pipeline)
-- `extract` (walks markdown files)
-- `dream` (synthesis cycle)
-- `doctor` (filesystem hygiene checks)
-- `autopilot` (background daemon orchestration)
-- `init` (creates `~/.gbrain/`)
-- `secrets` (config management)
+- `sync` / `embed` / `extract` (filesystem walks and local indexing);
+- `dream` (local synthesis cycle orchestration);
+- local file/admin operations such as `file_upload`, `file_list`, `file_url`,
+  `sync_brain`, `purge_deleted_pages`, `get_recent_transcripts`, and
+  `code_traversal_cache_clear`.
 
-For these, the agent cannot route through HTTP MCP. The only path is to run
-`gbrain` as a CLI subprocess. The recommended pattern is to submit the
-subprocess as a shell job to the gbrain Minions worker so retry / backoff /
-DLQ / audit trail all come for free.
+For these, the agent should not route through HTTP MCP. The preferred pattern
+is to run `gbrain` as a CLI subprocess, usually submitted as a shell job to the
+GBrain Minions worker so retry / backoff / DLQ / audit trail all come for free.
 
 ### Setup
 
@@ -146,14 +145,15 @@ proxy for worker env.
 | `get_page` / `list_pages` | HTTP MCP | Same. |
 | `put_page` | HTTP MCP | Same; respects subagent allow-list when applicable. |
 | `find_experts` / `find_orphans` | HTTP MCP | Same. |
-| `sync` / `embed` / `extract` | Shell job + `inherit:` | `localOnly: true`. |
-| `dream` | Shell job + `inherit:` | `localOnly: true`. |
-| `doctor` | Shell job + `inherit:` (or no inherit if no DB) | `localOnly: true`. |
+| `sync` / `embed` / `extract` | Shell job + `inherit:` or direct local CLI | Thin-client refused; needs local filesystem/indexing. |
+| `dream` | Shell job + `inherit:` or direct local CLI | Local synthesis orchestration. |
+| `doctor` | HTTP MCP where supported, otherwise local CLI | Has remote report path for some checks; local filesystem checks need local CLI. |
 | `autopilot` | Run as a daemon directly on the host | Long-lived, not job-shaped. |
-| `init` / `secrets` | One-time host setup | Operator action, not agent action. |
+| `init` / host setup | One-time operator action | Creates/configures the local brain. |
 
 ## Recommended patterns
 
+- **For Hermes memory integration, keep shared writes out of the provider path.** See [`../architecture/hermes-gbrain-memory-boundary.md`](../architecture/hermes-gbrain-memory-boundary.md) for the decision: Hermes may eventually emit to a dedicated private capture source, but shared company truth still moves through candidate / PR / review / reindex governance. <!-- fork-only link; strip before upstreaming -->
 - **Prefer `inherit:` for secrets you don't want in the row.** Names land in
   `minion_jobs.data`; values resolve at child-spawn from the worker's config.
   If a brain DB ever traverses a trust boundary, secrets stay out.
@@ -165,9 +165,9 @@ proxy for worker env.
 - **`env:` still works** for non-secret values, or for cases where you
   WANT the value in the row (e.g. an opaque correlation token your audit
   flow needs to read back later). The validator doesn't second-guess you.
-- **Never try to route a `localOnly` op through thin-client MCP.** It will
-  fail with `localOnly op refused in thin-client mode`. Use shell-job +
-  `inherit:` (for secrets) or `env:` (for non-secrets).
+- **Never try to route a local-only CLI/admin command through thin-client MCP.** It will
+  fail as not routable; use shell-job + `inherit:` (for secrets) or `env:`
+  (for non-secrets).
 
 ## Migration: from pre-v0.36.5.0
 
