@@ -85,7 +85,11 @@ export const SEARCH_DESCRIPTION =
   "they surface activity bursts without needing a search term. " +
   "For code-symbol questions (callers, callees, definitions, blast radius), use " +
   "code_callers / code_callees / code_def / code_refs instead — those return " +
-  "structural graph data, not text chunks.";
+  "structural graph data, not text chunks. " +
+  "When keyword search returns no results and search.keyword_semantic_fallback is " +
+  "enabled, this op falls back to semantic retrieval; those rescued rows are " +
+  "labeled match_type:'semantic' (a semantic GUESS, not a verbatim match) with " +
+  "_meta.retrieval.fallback_fired=true — do not treat them as exact keyword matches.";
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Server-level retrieval-routing nudge. Surfaced in the MCP `initialize` result
