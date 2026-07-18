@@ -39,11 +39,14 @@ describe('applyKeywordSemanticFallback', () => {
     expect(called).toBe(0);
   });
 
-  test('knob ON + keyword hits: labels keyword, no fallback call, fallback_fired false', async () => {
+  test('knob ON + keyword hits: labels keyword (copies, no input mutation), no fallback call', async () => {
     let called = 0;
-    const out = await applyKeywordSemanticFallback([r('a'), r('b')], true, async () => { called += 1; return [r('z')]; });
+    const input = [r('a'), r('b')];
+    const out = await applyKeywordSemanticFallback(input, true, async () => { called += 1; return [r('z')]; });
     expect(out.fallback_fired).toBe(false);
     expect(out.results.map((x) => x.match_type)).toEqual(['keyword', 'keyword']);
+    expect(input.every((x) => x.match_type === undefined)).toBe(true); // input untouched (copies)
+    expect(out.results[0]).not.toBe(input[0]);
     expect(called).toBe(0);
   });
 
@@ -61,6 +64,18 @@ describe('applyKeywordSemanticFallback', () => {
     expect(out.fallback_fired).toBe(true);
     expect(out.results.some((x) => x.match_type === 'keyword')).toBe(false);
     expect(out.results.every((x) => x.match_type === 'semantic')).toBe(true);
+  });
+
+  test('cache-contamination guard: labels COPIES, never mutates the fallback fn output', async () => {
+    // hybridSearchCached's fire-and-forget cache store serializes the same
+    // objects the fallback returns (after an awaited DB round-trip), so an
+    // in-place label write would leak 'semantic' into query_cache and reach a
+    // later non-fallback `query` cache hit. The helper must copy.
+    const original = [r('x'), r('y')];
+    const out = await applyKeywordSemanticFallback([], true, async () => original);
+    expect(out.results.every((x) => x.match_type === 'semantic')).toBe(true);
+    expect(original.every((x) => x.match_type === undefined)).toBe(true); // originals untouched
+    expect(out.results[0]).not.toBe(original[0]);
   });
 
   test('abort/error in the fallback propagates (rejects) — no partial result', async () => {

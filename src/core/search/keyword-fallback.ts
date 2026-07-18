@@ -32,14 +32,28 @@ export async function applyKeywordSemanticFallback(
     return { results: keywordResults, fallback_fired: false };
   }
   // Keyword hit → label as exact keyword matches; no fallback.
+  //
+  // Label COPIES, never mutate in place: the rescued semantic rows below are
+  // the SAME objects `hybridSearchCached`'s fire-and-forget cache store is
+  // about to serialize — `store()` awaits a DB round-trip
+  // (buildPageGenerationsSnapshot) BEFORE it JSON.stringify's the results, so
+  // an in-place `match_type` write races into the persisted `query_cache` row
+  // and would leak a 'semantic' label to a later non-fallback `query` cache
+  // hit. Copy the keyword leg too for symmetry (its rows are fresh/uncached,
+  // but the invariant "this helper never mutates its inputs" is cheaper to keep
+  // than to reason about per-leg).
   if (keywordResults.length > 0) {
-    for (const r of keywordResults) r.match_type = 'keyword';
-    return { results: keywordResults, fallback_fired: false };
+    return {
+      results: keywordResults.map((r) => ({ ...r, match_type: 'keyword' as const })),
+      fallback_fired: false,
+    };
   }
   // Keyword empty → semantic rescue. Any abort/error propagates (the caller's
-  // await rejects before telemetry/return) — no partial write. Label the
-  // rescued results as semantic guesses.
+  // await rejects before telemetry/return) — no partial write. Label copies of
+  // the rescued rows as semantic guesses (see the cache-contamination note).
   const semantic = await runSemanticFallback();
-  for (const r of semantic) r.match_type = 'semantic';
-  return { results: semantic, fallback_fired: true };
+  return {
+    results: semantic.map((r) => ({ ...r, match_type: 'semantic' as const })),
+    fallback_fired: true,
+  };
 }
