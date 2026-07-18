@@ -51,6 +51,9 @@ const { slackConnector, fetchHistoryPage, readChannelWatermark, readBackfillCurs
   '../src/core/connectors/slack.ts'
 );
 const { landRecords } = await import('../src/core/connectors/base.ts');
+const { minCandidateBodyChars, MIN_CANDIDATE_BODY_CHARS_KEY, MIN_CANDIDATE_BODY_CHARS_DEFAULT } = await import(
+  '../src/core/connectors/candidate.ts'
+);
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────────
 
@@ -85,7 +88,7 @@ function makeSource(opts: { channels?: string[]; backfill_cursor?: Record<string
 
 // ── Fake engine: captures candidate INSERTs + models the per-channel monotonic write ──
 
-function makeFakeEngine(opts: { initialConfig?: Record<string, Record<string, unknown>> } = {}) {
+function makeFakeEngine(opts: { initialConfig?: Record<string, Record<string, unknown>>; configValues?: Record<string, string> } = {}) {
   const inserts: { source_record_id: string; provider: unknown; proposed_slug: unknown; proposed_markdown: string; confidence: unknown; redactions: unknown[]; status: unknown; allParams: unknown[] }[] = [];
   const watermarkUpdates: { channel: string; watermark: string; id: string }[] = [];
   const seenKeys = new Set<string>();
@@ -132,6 +135,19 @@ function makeFakeEngine(opts: { initialConfig?: Record<string, Record<string, un
       // toRow's fetch-on-conflict SELECT
       return [{ id: 0 }];
     },
+    // OPT-IN ONLY. Supplying `opts.configValues` gives the fake a `getConfig`, so
+    // `minCandidateBodyChars(engine)` resolves the real substance floor (64) and the
+    // production ingest gate becomes reachable in tests.
+    //
+    // Omitting it deliberately defines NO `getConfig` at all. `minCandidateBodyChars` then
+    // throws a TypeError, `landRecords`' defensive config-read catch (base.ts:231-236)
+    // degrades `minBodyChars` to 0, and the substance floor is OFF. Every other test in this
+    // file relies on that floor-off behavior. Do NOT "fix" the omission by always defining
+    // `getConfig` — it would silently flip the whole suite onto the live 64-char floor and
+    // change what those tests assert.
+    ...(opts.configValues
+      ? { getConfig: async (key: string) => opts.configValues![key] ?? null }
+      : {}),
   } as unknown as BrainEngine;
   return { engine, inserts, watermarkUpdates, configState };
 }
@@ -243,6 +259,51 @@ describe('Slack webhook: selected-channel message → candidate', () => {
   test('readOptInChannels reads sources.config.connectors.slack.channels[]', () => {
     const source = makeSource({ channels: [BUSY_CHANNEL, QUIET_CHANNEL] });
     expect(readOptInChannels(source)).toEqual([BUSY_CHANNEL, QUIET_CHANNEL]);
+  });
+});
+
+// ── 1b. the substance floor under PRODUCTION-LIKE config (documents CORRECT behavior) ──
+//
+// Every other test in this file runs with the floor OFF (see makeFakeEngine: no
+// `getConfig` → throw → landRecords degrades to 0). In production `getConfig` exists and the
+// floor is 64, so a Slack summary label — a structural pointer, not substance — is skipped
+// and nothing persists. That skip is CORRECT: the floor exists to keep contentless captures
+// out of the Brain, and a body made of field labels is exactly what it is meant to stop.
+// These tests pin that behavior. They are NOT a bug report and nothing here should be
+// "fixed" by making Slack labels clear the floor.
+
+describe('Slack substance floor under production-like config', () => {
+  const PROD_CONFIG = { [MIN_CANDIDATE_BODY_CHARS_KEY]: String(MIN_CANDIDATE_BODY_CHARS_DEFAULT) };
+
+  test('the opt-in config makes the production floor REACHABLE (resolves to 64, not the degraded 0)', async () => {
+    const { engine } = makeFakeEngine({ configValues: PROD_CONFIG });
+    expect(await minCandidateBodyChars(engine)).toBe(MIN_CANDIDATE_BODY_CHARS_DEFAULT);
+  });
+
+  test('WITHOUT the opt-in config minCandidateBodyChars REJECTS — the 0 is produced by landRecords one level up', async () => {
+    const { engine } = makeFakeEngine();
+    await expect(minCandidateBodyChars(engine)).rejects.toThrow(TypeError);
+  });
+
+  test('a public-channel post is CORRECTLY skipped by the substance floor under production config', async () => {
+    const { engine, inserts } = makeFakeEngine({ configValues: PROD_CONFIG });
+    const source = makeSource({ channels: [BUSY_CHANNEL] });
+
+    // The record survives every earlier gate (allowlist / DM-class / subtype) — normalize
+    // still yields exactly 1. The skip below is therefore the FLOOR, nothing upstream of it.
+    const records = slackConnector.normalize(selectedChannelEvent, source);
+    expect(records).toHaveLength(1);
+
+    // The summary label ("Message in C_ENG_GENERAL by U_JORDAN @ 1700000000.000100") is 50
+    // non-whitespace chars — below the 64 floor — so landRecords skips it.
+    const result = await landRecords(engine, source.id, slackConnector, records);
+    expect(result).toEqual({ written: 0, total: 1 });
+    expect(inserts).toHaveLength(0);
+
+    // Regression guard only: with zero inserts this holds trivially today. It becomes
+    // load-bearing only if the skip ever stops happening.
+    expect(JSON.stringify(inserts)).not.toContain('Decided to ship');
+    expect(JSON.stringify(inserts)).not.toContain(SECRET_MARKER);
   });
 });
 
