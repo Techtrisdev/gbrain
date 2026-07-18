@@ -565,6 +565,16 @@ export interface SearchResult {
   score: number;
   stale: boolean;
   /**
+   * v0.42 — how this result was matched. 'keyword' for a lexical (ts_rank)
+   * hit from the `search` op; 'semantic' when the keyword search returned
+   * zero results and the `keyword_semantic_fallback` path returned
+   * hybrid/semantic neighbors instead. Absent → treat as 'keyword' (the
+   * historical default; only the fallback path stamps 'semantic'). Lets a
+   * caller doing an existence check tell an exact keyword match from a
+   * semantic guess. Populated by the `search` handler in a later unit.
+   */
+  match_type?: 'keyword' | 'semantic';
+  /**
    * v0.36 (cross-modal wave): the chunk's modality discriminator from
    * content_chunks.modality. 'text' for the existing text-embedding rows,
    * 'image' for rows populated by importImageFile. Surfaced so callers /
@@ -1232,6 +1242,15 @@ export interface HybridSearchMeta {
    * reorder's firing/suppression rate before enabling on real traffic.
    */
   process_reorder_applied?: boolean;
+  /**
+   * v0.42 — true iff the keyword `search` op returned zero lexical results AND
+   * the `keyword_semantic_fallback` path fired to return semantic neighbors
+   * instead. False/absent when the flag is off or keyword had hits. Records the
+   * keyword-miss event independently of what the client ultimately received —
+   * the observability-preservation signal so a fallback can't mask the true
+   * keyword-miss rate. Set by the `search` handler in a later unit.
+   */
+  fallback_fired?: boolean;
   /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`
