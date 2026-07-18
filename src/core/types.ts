@@ -565,13 +565,15 @@ export interface SearchResult {
   score: number;
   stale: boolean;
   /**
-   * v0.42 — how this result was matched. 'keyword' for a lexical (ts_rank)
-   * hit from the `search` op; 'semantic' when the keyword search returned
-   * zero results and the `keyword_semantic_fallback` path returned
-   * hybrid/semantic neighbors instead. Absent → treat as 'keyword' (the
-   * historical default; only the fallback path stamps 'semantic'). Lets a
-   * caller doing an existence check tell an exact keyword match from a
-   * semantic guess. Populated by the `search` handler in a later unit.
+   * v0.42 — how a `search` (keyword) op result was matched. 'keyword' for a
+   * lexical (ts_rank) hit; 'semantic' when the keyword query returned zero
+   * results and the `keyword_semantic_fallback` path returned hybrid/semantic
+   * neighbors instead. Stamped by the `search` handler (a later unit). On the
+   * `search` op, absent → an exact keyword match, so an existence-check caller
+   * can tell a real match from a fallback guess. NOTE: the `query`/hybrid ops
+   * share SearchResult and leave this absent even though their results ARE
+   * semantic — so outside the `search` op 'absent' means 'unspecified', not
+   * 'keyword'. Only the `search`-op fallback path stamps a value.
    */
   match_type?: 'keyword' | 'semantic';
   /**
