@@ -69,6 +69,8 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   contextual_retrieval_disabled: 'Soft kill switch — neutralizes CR wrapping for queries + new embeds',
   // v0.40.x intent-conditional post-rerank process reorder
   process_reorder_enabled: 'Post-rerank reorder: lift process docs above person results for process/how-to queries (entity-guarded)',
+  // v0.42 keyword→semantic fallback
+  keyword_semantic_fallback: 'Keyword `search` falls back to semantic results when the lexical query returns zero (fallback results labeled match_type:semantic)',
 };
 
 interface SearchModesReport {

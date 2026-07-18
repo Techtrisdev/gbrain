@@ -74,6 +74,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'none',
       process_reorder_enabled: false,
+      keyword_semantic_fallback: false,
     });
   });
 
@@ -99,6 +100,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'title',
       process_reorder_enabled: false,
+      keyword_semantic_fallback: false,
     });
   });
 
@@ -122,6 +124,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       ...CR_DISABLED_DEFAULT,
       contextual_retrieval: 'per_chunk_synopsis',
       process_reorder_enabled: false,
+      keyword_semantic_fallback: false,
     });
   });
 
@@ -318,7 +321,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // written when the brain was on balanced (title-only) — different
     // embedding spaces. Sequenced behind salem's v=4 graph-signals work.
     // v=6 (v0.40.x): process_reorder_enabled (pr=) folded in — reorder changes order.
-    expect(KNOBS_HASH_VERSION).toBe(6);
+    // v=7 (v0.42): keyword_semantic_fallback (ksf=) folded in — fallback changes the result set.
+    expect(KNOBS_HASH_VERSION).toBe(7);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -344,6 +348,15 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
     expect(a).toBe(b);
   });
+
+  test('v0.42: keyword_semantic_fallback on vs off produces DIFFERENT hashes (result-set contamination prevention)', () => {
+    // A fallback-on write returns semantic neighbors for a keyword-empty query;
+    // serving that to a fallback-off lookup would leak semantic results into a
+    // caller expecting verbatim-keyword behavior. Must split the cache.
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const on = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { keyword_semantic_fallback: true } }));
+    expect(off).not.toBe(on);
+  });
 });
 
 describe('loadOverridesFromConfig flat-map parser', () => {
@@ -358,6 +371,22 @@ describe('loadOverridesFromConfig flat-map parser', () => {
     expect(loadOverridesFromConfig({ 'search.cache.enabled': 'true' }).cache_enabled).toBe(true);
     expect(loadOverridesFromConfig({ 'search.cache.enabled': 'false' }).cache_enabled).toBe(false);
     expect(loadOverridesFromConfig({ 'search.cache.enabled': 'TRUE' }).cache_enabled).toBe(true);
+  });
+
+  test('v0.42: keyword_semantic_fallback accepts 1 / true / 0 / false; absent → undefined (default off)', () => {
+    expect(loadOverridesFromConfig({}).keyword_semantic_fallback).toBeUndefined();
+    expect(loadOverridesFromConfig({ 'search.keyword_semantic_fallback': '1' }).keyword_semantic_fallback).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.keyword_semantic_fallback': 'true' }).keyword_semantic_fallback).toBe(true);
+    expect(loadOverridesFromConfig({ 'search.keyword_semantic_fallback': '0' }).keyword_semantic_fallback).toBe(false);
+    expect(loadOverridesFromConfig({ 'search.keyword_semantic_fallback': 'false' }).keyword_semantic_fallback).toBe(false);
+  });
+
+  test('v0.42: resolveSearchMode defaults keyword_semantic_fallback false in every mode; per-call & config override win', () => {
+    for (const m of SEARCH_MODES) {
+      expect(resolveSearchMode({ mode: m }).keyword_semantic_fallback).toBe(false);
+    }
+    expect(resolveSearchMode({ mode: 'balanced', perCall: { keyword_semantic_fallback: true } }).keyword_semantic_fallback).toBe(true);
+    expect(resolveSearchMode({ mode: 'balanced', overrides: { keyword_semantic_fallback: true } }).keyword_semantic_fallback).toBe(true);
   });
 
   test('numeric keys parse and clamp', () => {

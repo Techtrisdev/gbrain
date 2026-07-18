@@ -443,6 +443,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'search.image_query.max_bytes',
   'search.reranker.enabled',
   'search.track_retrieval',
+  'search.keyword_semantic_fallback',
   // Models tier system (v0.31.12)
   'models.default',
   'models.tier.utility',

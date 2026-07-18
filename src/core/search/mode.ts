@@ -190,6 +190,18 @@ export interface ModeBundle {
   process_reorder_enabled: boolean;
 
   /**
+   * v0.42 — keyword→semantic fallback. When true, the `search` (keyword) op
+   * falls back to the hybrid/semantic path when the keyword lexical query
+   * returns zero results, so a client on the keyword tool still gets useful
+   * results instead of nothing. Default false in ALL bundles (opt-in
+   * rollout; off = current verbatim-keyword behavior, bit-for-bit).
+   * Override: per-call SearchOpts → `search.keyword_semantic_fallback`
+   * config → bundle default. Fallback results are labeled `match_type:
+   * 'semantic'` so callers can tell a semantic guess from an exact match.
+   */
+  keyword_semantic_fallback: boolean;
+
+  /**
    * v0.40.3.0 — contextual retrieval tier per mode. Wraps chunks at embed
    * time so the embedder sees document-level orientation alongside the
    * chunk. Wrapper is built JUST IN TIME and never persisted as
@@ -262,6 +274,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     contextual_retrieval_disabled: false,
     // v0.40.x — process reorder OFF (conservative rollout; off = pure reranker order).
     process_reorder_enabled: false,
+    // v0.42 — keyword→semantic fallback OFF (opt-in rollout).
+    keyword_semantic_fallback: false,
   }),
   balanced: Object.freeze({
     cache_enabled: true,
@@ -309,6 +323,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     contextual_retrieval_disabled: false,
     // v0.40.x — process reorder OFF by default in balanced too (conservative rollout).
     process_reorder_enabled: false,
+    // v0.42 — keyword→semantic fallback OFF by default in balanced too (opt-in rollout).
+    keyword_semantic_fallback: false,
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
@@ -350,6 +366,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     contextual_retrieval_disabled: false,
     // v0.40.x — process reorder OFF by default in tokenmax too (conservative rollout).
     process_reorder_enabled: false,
+    // v0.42 — keyword→semantic fallback OFF by default in tokenmax too (opt-in rollout).
+    keyword_semantic_fallback: false,
   }),
 });
 
@@ -395,6 +413,8 @@ export interface SearchKeyOverrides {
   graph_signals?: boolean;
   // v0.40.x — process-reorder per-key (config) override.
   process_reorder_enabled?: boolean;
+  // v0.42 — keyword→semantic fallback per-key (config) override.
+  keyword_semantic_fallback?: boolean;
   // v0.40.3.0 contextual retrieval. CRMode override + soft kill switch.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -435,6 +455,8 @@ export interface SearchPerCallOpts {
   graph_signals?: boolean;
   // v0.40.x — process-reorder per-call override.
   process_reorder_enabled?: boolean;
+  // v0.42 — keyword→semantic fallback per-call override.
+  keyword_semantic_fallback?: boolean;
   // v0.40.3.0 contextual retrieval per-call overrides.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -510,6 +532,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     graph_signals: pick('graph_signals'),
     // v0.40.x — process reorder resolved via the same pick chain (perCall → config → bundle).
     process_reorder_enabled: pick('process_reorder_enabled'),
+    // v0.42 — keyword→semantic fallback resolved via the same pick chain.
+    keyword_semantic_fallback: pick('keyword_semantic_fallback'),
     // v0.40.3.0 contextual retrieval — resolved via the same pick chain.
     contextual_retrieval: pick('contextual_retrieval'),
     contextual_retrieval_disabled: pick('contextual_retrieval_disabled'),
@@ -592,7 +616,10 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // added under v=5 (per D8 sequencing — first to land claimed v=4; the
 // contextual-retrieval wave rebased to v=5). Mid-deploy hit-rate dip is
 // expected — clears within cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 6;
+// v0.42 bump 6→7: keyword_semantic_fallback added under v=7 (append-only). A
+// fallback-on write changes the RESULT SET of a keyword search (empty → semantic
+// neighbors), so it must not be served to a fallback-off lookup.
+export const KNOBS_HASH_VERSION = 7;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -691,6 +718,10 @@ export function knobsHash(
     // v=6 (append-only): process reorder changes result ORDER, so a reorder-on
     // write must not be served to a reorder-off lookup (and vice-versa on rollback).
     `pr=${knobs.process_reorder_enabled ? 1 : 0}`,
+    // v=7 (append-only): keyword_semantic_fallback changes the RESULT SET of a
+    // keyword search (empty → semantic neighbors), so a fallback-on write must
+    // not be served to a fallback-off lookup (and vice-versa on rollback).
+    `ksf=${knobs.keyword_semantic_fallback ? 1 : 0}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -843,6 +874,12 @@ export function loadOverridesFromConfig(
     out.process_reorder_enabled = pr === '1' || pr.toLowerCase() === 'true';
   }
 
+  // v0.42 — keyword_semantic_fallback (keyword search → semantic on zero results).
+  const ksf = get('search.keyword_semantic_fallback');
+  if (ksf !== undefined) {
+    out.keyword_semantic_fallback = ksf === '1' || ksf.toLowerCase() === 'true';
+  }
+
   return out;
 }
 
@@ -874,6 +911,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   // v0.40.4 graph signals
   'search.graph_signals',
   'search.process_reorder_enabled',
+  // v0.42 keyword→semantic fallback
+  'search.keyword_semantic_fallback',
   // v0.40.3.0 contextual retrieval — tier override + soft kill switch.
   // Per-mode default lives in the bundle; this key lets power users
   // override at the per-key level without flipping the global mode.
