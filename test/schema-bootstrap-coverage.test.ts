@@ -736,6 +736,15 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // existing installs." (source_id rides the same multi-ADD COLUMN ALTER; the
   // extractor only surfaces the first column, but it shares this exact posture.)
   'search_telemetry.client',
+  // TECH-2740 (migration v101 search_telemetry_fallback_fired) — identical posture to
+  // search_telemetry.client above. search_telemetry is MIGRATION-CREATED (v57), NOT in
+  // PGLITE_SCHEMA_SQL, so the schema blob never replays a CREATE TABLE / CREATE INDEX
+  // for it — there is no forward reference for the bootstrap to defend. v101 adds
+  // fallback_fired INTEGER NOT NULL DEFAULT 0 (additive, defaulted); its lone consumer
+  // (telemetry.ts flush INSERT / readSearchStats SUM) runs only on a fully-migrated
+  // brain — a pre-v101 brain never reaches it before v101 applies — so no downstream
+  // filter breaks. Bootstrap probe would be pure overhead.
+  'search_telemetry.fallback_fired',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {
