@@ -231,6 +231,7 @@ async function runStatsSubcommand(engine: BrainEngine, args: string[]): Promise<
           total_budget_dropped: 'sum of results dropped because the call exceeded its tokenBudget',
           caller_distribution: 'client (agent identity) → call count over the window — who is issuing searches',
           by_caller: 'per (client, source_id) rollup with its own mode/intent split — the query-vs-search adoption signal per agent',
+          fallback_fired: 'keyword `search` calls that returned 0 lexical hits and were rescued by the default-off semantic fallback (search.keyword_semantic_fallback) — the keyword-miss/rescue count over the window; 0 when the knob is off everywhere',
           graph_signals_enabled: 'whether graph_signals is on for the active mode (or via search.graph_signals override)',
           graph_signals_failures_count: 'count of fail-open events in the JSONL audit over the window',
         },
@@ -259,6 +260,7 @@ async function runStatsSubcommand(engine: BrainEngine, args: string[]): Promise<
   console.log(`  Avg results returned:  ${stats.avg_results.toFixed(1)}`);
   console.log(`  Avg tokens delivered:  ${stats.avg_tokens.toFixed(0)}  (char/4 heuristic)`);
   console.log(`  Budget drops total:    ${stats.total_budget_dropped}`);
+  console.log(`  Keyword fallbacks:     ${stats.fallback_fired}  (keyword misses rescued by the semantic fallback)`);
   console.log('');
   console.log('  Mode distribution:');
   for (const [m, c] of Object.entries(stats.mode_distribution).sort((a, b) => b[1] - a[1])) {

@@ -4706,6 +4706,33 @@ export const MIGRATIONS: Migration[] = [
       ].every((col) => cols.has(col));
     },
   },
+  {
+    version: 101,
+    name: 'search_telemetry_fallback_fired',
+    // TECH-2740 — persist the keyword→semantic fallback signal. `fallback_fired`
+    // counts, per (date,mode,intent,client,source_id) rollup bucket, how many
+    // keyword `search` calls returned ZERO lexical hits AND were rescued by the
+    // default-off search.keyword_semantic_fallback path. Paired with the search op
+    // now recording the KEYWORD result count (0 on a miss) in sum_results, this
+    // keeps the true keyword-miss rate observable instead of letting the semantic
+    // rescue mask it (sum_results would otherwise carry the rescued semantic count).
+    // Additive, defaulted, idempotent — safe on existing rows.
+    idempotent: true,
+    sql: `
+      ALTER TABLE search_telemetry
+        ADD COLUMN IF NOT EXISTS fallback_fired INTEGER NOT NULL DEFAULT 0;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'search_telemetry'
+            AND column_name = 'fallback_fired'`,
+      );
+      return rows.length === 1;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

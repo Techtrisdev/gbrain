@@ -70,4 +70,33 @@ describe('keyword-op telemetry (mode=keyword) is a distinct rollup bucket', () =
     expect(byMode['conservative'].rerank).toBe('off');
     expect(byMode['keyword'].rerank).toBe('n/a');         // keyword has no reranker
   });
+
+  test('TECH-2740 — fallback_fired counts rescued keyword misses; the miss stays visible in sum_results', async () => {
+    const w = getTelemetryWriter(); w.setEngine(engine);
+    const caller = { client: 'kf-agent', sourceId: 'kf-src' };
+    // A keyword HIT (no fallback): the op records the real keyword count.
+    recordSearchTelemetry(engine, meta({ mode: 'keyword', intent: 'general' }), { results_count: 5 }, caller);
+    // Two keyword MISSES rescued by the semantic fallback. The op records the KEYWORD
+    // count (0), NOT the rescued semantic count, plus fallback_fired — so the miss is
+    // NOT masked by the rescue.
+    recordSearchTelemetry(engine, meta({ mode: 'keyword', intent: 'general' }), { results_count: 0, fallback_fired: true }, caller);
+    recordSearchTelemetry(engine, meta({ mode: 'keyword', intent: 'general' }), { results_count: 0, fallback_fired: true }, caller);
+    await w.flush();
+
+    const row = (await engine.executeRaw<{ count: number; sum_results: number; fallback_fired: number }>(
+      `SELECT count, sum_results, fallback_fired FROM search_telemetry WHERE mode='keyword' AND client='kf-agent'`))[0];
+    expect(row.count).toBe(3);            // 3 keyword calls, one rollup bucket
+    expect(row.sum_results).toBe(5);      // 5 + 0 + 0 — misses recorded as 0, NOT the rescued count
+    expect(row.fallback_fired).toBe(2);   // 2 of the 3 missed and were rescued
+    // The keyword-miss/rescue rate is therefore derivable: fallback_fired / count = 2/3.
+  });
+
+  test('TECH-2740 — no fallback (knob off or keyword hit) records fallback_fired = 0', async () => {
+    const w = getTelemetryWriter(); w.setEngine(engine);
+    recordSearchTelemetry(engine, meta({ mode: 'keyword' }), { results_count: 4 }, { client: 'nf', sourceId: 's' });
+    await w.flush();
+    const row = (await engine.executeRaw<{ fallback_fired: number }>(
+      `SELECT fallback_fired FROM search_telemetry WHERE mode='keyword' AND client='nf'`))[0];
+    expect(row.fallback_fired).toBe(0);
+  });
 });
