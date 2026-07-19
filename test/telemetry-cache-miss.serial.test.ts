@@ -9,6 +9,14 @@
  * Mock the embedding surface so the cache path resolves to 'miss' (not 'disabled')
  * without a real provider. hybrid.ts is imported dynamically AFTER the mocks so
  * its static `embedQuery` import is intercepted (ESM hoisting otherwise wins).
+ *
+ * SERIAL (*.serial.test.ts) — REQUIRED; do not rename back to *.test.ts. The
+ * top-level `mock.module('embedding.ts' / 'ai/gateway.ts', …)` below are PROCESS-GLOBAL
+ * in bun and leak across files that share a shard process: the gateway stub omits
+ * resetGateway/configureGateway/etc., so a co-resident shard-1 test importing those
+ * from the real gateway.ts would crash on load ("export not found") — identical to the
+ * connector-slack/credentials incident (#62). run-serial-tests.sh runs each serial file
+ * in its OWN bun process, the only thing that truly contains the leak.
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, mock } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
