@@ -19,6 +19,16 @@
  * refresh-then-succeed flow against fixtures. fetch is stubbed to serve the recorded
  * history pages — no network. Candidate writes + the per-channel monotonic jsonb_set
  * watermark UPDATE go through a fake engine that captures params + models the SQL.
+ *
+ * SERIAL (*.serial.test.ts) — REQUIRED; do not rename back to *.test.ts. The
+ * top-level `mock.module('./credentials.ts', …)` below is PROCESS-GLOBAL in bun and
+ * leaks across files that share a shard process: its stub omits `withInProcessLock`,
+ * so a co-resident test that loads calendar.ts (`import { withInProcessLock } from
+ * './credentials.ts'`) crashes with "export not found" (this broke shard 2 after the
+ * timing shift in #58). run-serial-tests.sh runs each serial file in its OWN bun
+ * process — the only thing that truly contains the leak. See the
+ * connector-calendar.test.ts header for the real-custody pattern that drops
+ * mock.module entirely (the eventual migration target).
  */
 
 import { describe, test, expect, mock, afterEach } from 'bun:test';
