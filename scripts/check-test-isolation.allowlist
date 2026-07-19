@@ -88,4 +88,3 @@ test/connector-calendar.test.ts
 test/connector-credentials.test.ts
 test/connector-github.test.ts
 test/connector-granola.test.ts
-test/telemetry-cache-miss.test.ts
