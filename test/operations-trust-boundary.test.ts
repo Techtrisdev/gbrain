@@ -37,7 +37,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { operations, resolveQuerySourceScope, type OperationContext } from '../src/core/operations.ts';
-import { hasScope } from '../src/core/scope.ts';
+import { hasScope, resolveRequiredScope } from '../src/core/scope.ts';
 
 let engine: PGLiteEngine;
 
@@ -164,10 +164,10 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
 });
 
 describe('hasScope — read-only token cannot satisfy write or admin scopes', () => {
-  // The HTTP path computes `requiredScope = op.scope || 'read'` and gates
-  // every call on `hasScope(authInfo.scopes, requiredScope)`. Pin the
-  // semantics here so a refactor of the IMPLIES table can't silently
-  // grant admin via a read-class token.
+  // The HTTP path computes `requiredScope = resolveRequiredScope(op)` (TECH-2742:
+  // op.scope, EXCEPT readScopeCallable ops relax to 'read') and gates every call on
+  // `hasScope(authInfo.scopes, requiredScope)`. Pin the semantics here so a refactor
+  // of the IMPLIES table can't silently grant admin via a read-class token.
   test('read scope does NOT satisfy write', () => {
     expect(hasScope(['read'], 'write')).toBe(false);
   });
@@ -192,19 +192,39 @@ describe('hasScope — read-only token cannot satisfy write or admin scopes', ()
     expect(hasScope(['bogus'], 'write')).toBe(false);
   });
 
-  test('every read-scope op accepts a read-only token; every write-scope op rejects it', () => {
-    // Walk the op surface and assert that a synthetic read-only token
-    // satisfies every read-scope op but no write/admin op.
+  test('every read-required op accepts a read-only token; every write/admin-required op rejects it (via resolveRequiredScope)', () => {
+    // Walk the op surface against the REAL gate logic: requiredScope =
+    // resolveRequiredScope(op), which is op.scope EXCEPT readScopeCallable ops (the
+    // record_retrieval_use carve-out) relax to 'read'. A synthetic read-only token
+    // must satisfy every read-required op and no write/admin-required op.
     const READ_TOKEN_SCOPES = ['read'] as const;
     for (const op of operations) {
-      const required = op.scope ?? 'read';
+      const required = resolveRequiredScope(op);
       const accepted = hasScope(READ_TOKEN_SCOPES, required);
       if (required === 'read') {
-        expect(accepted, `read op "${op.name}" should accept read-only token`).toBe(true);
+        expect(accepted, `read-required op "${op.name}" should accept read-only token`).toBe(true);
       } else {
-        expect(accepted, `${required} op "${op.name}" must reject read-only token`).toBe(false);
+        expect(accepted, `${required}-required op "${op.name}" must reject read-only token`).toBe(false);
       }
     }
+  });
+
+  test('TECH-2742 — record_retrieval_use is the readScopeCallable carve-out (write op, read-token callable)', () => {
+    const op = operations.find(o => o.name === 'record_retrieval_use');
+    expect(op, 'record_retrieval_use must exist').toBeDefined();
+    // Opt-in flag set; scope stays 'write' (intent + CLI/other layers); mutating stays true.
+    expect(op!.readScopeCallable).toBe(true);
+    expect(op!.scope).toBe('write');
+    expect(op!.mutating).toBe(true);
+    // Net gate effect: a read-only token can call it.
+    expect(hasScope(['read'], resolveRequiredScope(op!))).toBe(true);
+    // Guard: it is the ONLY write-scoped op a read token can reach. Adding the flag to
+    // another write op (widening the trust boundary) fails this test → forces review.
+    const readReachableWriteOps = operations
+      .filter(o => o.scope === 'write' && hasScope(['read'], resolveRequiredScope(o)))
+      .map(o => o.name)
+      .sort();
+    expect(readReachableWriteOps).toEqual(['record_retrieval_use']);
   });
 });
 

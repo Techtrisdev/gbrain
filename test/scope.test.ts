@@ -1,6 +1,7 @@
 import { test, expect, describe } from 'bun:test';
 import {
   hasScope,
+  resolveRequiredScope,
   isScope,
   ALLOWED_SCOPES,
   ALLOWED_SCOPES_LIST,
@@ -204,5 +205,34 @@ describe('parseScopeString', () => {
   });
   test('does NOT validate (separation of concerns)', () => {
     expect(parseScopeString('read flying-unicorn')).toEqual(['read', 'flying-unicorn']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TECH-2742 — resolveRequiredScope: the read-scope carve-out for source-scoped,
+// own-row-only feedback writes (record_retrieval_use). It is the single place both
+// HTTP scope gates derive requiredScope, so the trust boundary can't drift.
+// ---------------------------------------------------------------------------
+
+describe('resolveRequiredScope (TECH-2742)', () => {
+  test('readScopeCallable op accepts read even though scope is write', () => {
+    expect(resolveRequiredScope({ scope: 'write', readScopeCallable: true })).toBe('read');
+    // ...so a read-scoped client passes the gate for it.
+    expect(hasScope(['read'], resolveRequiredScope({ scope: 'write', readScopeCallable: true }))).toBe(true);
+  });
+  test('a genuine write op (no flag) still requires write — read clients rejected', () => {
+    expect(resolveRequiredScope({ scope: 'write' })).toBe('write');
+    expect(hasScope(['read'], resolveRequiredScope({ scope: 'write' }))).toBe(false);
+  });
+  test('readScopeCallable:false behaves like an unset flag (uses declared scope)', () => {
+    expect(resolveRequiredScope({ scope: 'write', readScopeCallable: false })).toBe('write');
+  });
+  test('read op stays read; missing scope defaults to read', () => {
+    expect(resolveRequiredScope({ scope: 'read' })).toBe('read');
+    expect(resolveRequiredScope({})).toBe('read');
+  });
+  test('the flag only relaxes to read; it never elevates an admin op', () => {
+    expect(resolveRequiredScope({ scope: 'admin', readScopeCallable: true })).toBe('read');
+    expect(resolveRequiredScope({ scope: 'admin' })).toBe('admin');
   });
 });

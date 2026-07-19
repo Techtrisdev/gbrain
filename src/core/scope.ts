@@ -90,6 +90,18 @@ export function isScope(s: string): s is Scope {
 }
 
 /**
+ * TECH-2742 — the scope a transport must require to invoke an op. Normally the op's
+ * declared `scope` (default 'read'). A `readScopeCallable` op accepts `read` even though
+ * its `scope` is 'write': a source-scoped, own-row-only feedback write (record_retrieval_use)
+ * exposes no shared-knowledge write surface, so read-scoped clients may call it. Keeping
+ * the carve-out here means the two HTTP scope gates (http-transport.ts + serve-http.ts)
+ * cannot drift. Structural param (not the Operation type) to avoid an import cycle.
+ */
+export function resolveRequiredScope(op: { scope?: string; readScopeCallable?: boolean }): string {
+  return op.readScopeCallable ? 'read' : (op.scope || 'read');
+}
+
+/**
  * Validate that every scope in the input is allowed. Throws on the first
  * unknown scope. Used at OAuth client registration time (CLI, DCR, manual).
  */
