@@ -34,7 +34,7 @@ import { VERSION } from '../version.ts';
 import { dispatchToolCall } from './dispatch.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
-import { hasScope } from '../core/scope.ts';
+import { hasScope, resolveRequiredScope } from '../core/scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
 
@@ -391,7 +391,9 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // validateToken, so existing writers are unaffected.
         const op = operations.find(o => o.name === toolName);
         if (op) {
-          const requiredScope = op.scope || 'read';
+          // TECH-2742 — readScopeCallable ops accept `read` despite scope: 'write'
+          // (source-scoped own-row feedback writes, e.g. record_retrieval_use).
+          const requiredScope = resolveRequiredScope(op);
           if (!hasScope(auth.scopes ?? [], requiredScope)) {
             logRequest(auth.tokenName!, `tools/call:${toolName}`, 'insufficient_scope', Date.now() - startedMs);
             return Response.json(

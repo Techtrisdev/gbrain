@@ -27,7 +27,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
-import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { hasScope, resolveRequiredScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -1683,7 +1683,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // sources_admin / users_admin scopes resolve through the same
       // hierarchy. Plain string includes() at this site would have made
       // sources_admin tokens look like they couldn't even read.)
-      const requiredScope = op.scope || 'read';
+      // TECH-2742 — readScopeCallable ops accept `read` despite scope: 'write'
+      // (source-scoped own-row feedback writes, e.g. record_retrieval_use).
+      const requiredScope = resolveRequiredScope(op);
       if (!hasScope(authInfo.scopes, requiredScope)) {
         // v0.28.10: persist scope-rejected attempts. Same operator-visibility
         // motivation as the unknown-op path — and it makes the v0.26.3

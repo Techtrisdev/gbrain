@@ -570,6 +570,17 @@ export interface Operation {
    * because the trust boundary there is the OS, not OAuth scopes.
    */
   scope?: 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin';
+  /**
+   * TECH-2742 — allow a caller holding only `read` scope to invoke this op over an
+   * authenticated transport EVEN THOUGH `scope` is `write`. A trust-boundary carve-out
+   * for source-scoped, own-row-only feedback writes (record_retrieval_use): such ops
+   * mutate ONLY the caller's own row (source_id = callerSource, fail-closed on
+   * unknown/wrong-source) and expose no shared-knowledge write surface. Does NOT change
+   * `scope` (still documents intent + governs CLI/other layers) or `mutating`; ONLY the
+   * HTTP-transport scope gates read it. Default undefined/false = normal `scope`
+   * enforcement. Apply sparingly and only to ops proven to touch just the caller's row.
+   */
+  readScopeCallable?: boolean;
   localOnly?: boolean;
   cliHints?: {
     name?: string;
@@ -1801,6 +1812,13 @@ const record_retrieval_use: Operation = {
   },
   scope: 'write',
   mutating: true,
+  // TECH-2742 — read-scoped clients (JARVIS/Simon) may record retrieval feedback. This
+  // op mutates ONLY the caller's own source-scoped retrieval_events row (handler: both
+  // the SELECT and UPDATE filter source_id = callerSource, fail-closed on unknown/
+  // wrong-source), so exposing it to `read` scope grants no shared-knowledge write
+  // surface. scope stays 'write' (intent + CLI/other layers); only the HTTP scope gates
+  // honor this flag.
+  readScopeCallable: true,
   handler: async (ctx, p) => {
     const queryId = p.query_id as string;
     const usedRank = p.used_rank as number;
