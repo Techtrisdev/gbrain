@@ -14,6 +14,15 @@ export interface RetrievalEventInput {
 
 export interface RetrievalResponseMeta {
   query_id: string;
+  /**
+   * v0.42 — true iff the keyword `search` op returned zero lexical results and
+   * the keyword_semantic_fallback path returned semantic neighbors instead.
+   * Surfaced to the caller as `_meta.retrieval.fallback_fired` (dispatch.ts
+   * spreads this whole object) so an existence-check caller knows the results
+   * are a semantic guess, not exact keyword matches. Absent on the
+   * `query`/hybrid path and on non-fallback keyword hits.
+   */
+  fallback_fired?: boolean;
 }
 
 const responseMeta = new WeakMap<object, RetrievalResponseMeta>();

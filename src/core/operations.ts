@@ -17,6 +17,7 @@ import { dirname } from 'path';
 import { hybridSearch, hybridSearchCached } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
+import { applyKeywordSemanticFallback } from './search/keyword-fallback.ts';
 import { recordSearchTelemetry } from './search/telemetry.ts';
 import { attachRetrievalResponseMeta, hashQueryText, recordRetrievalEvent } from './search/retrieval-events.ts';
 import { classifyQueryIntent } from './search/query-intent.ts';
@@ -1458,7 +1459,28 @@ const search: Operation = {
       offset: (p.offset as number) || 0,
       ...sourceScopeOpts(ctx),
     });
-    const results = dedupResults(raw);
+    const keywordResults = dedupResults(raw);
+
+    // v0.42 — keyword→semantic fallback (default-off knob). When keyword returns
+    // ZERO results and search.keyword_semantic_fallback is enabled, fall back to
+    // the semantic (hybrid) path so a client on the keyword tool still gets
+    // useful results instead of nothing; rescued rows are labeled
+    // match_type:'semantic'. One config-key read; knob-off returns keywordResults
+    // untouched (bit-for-bit the prior verbatim-keyword behavior). Labeled at
+    // this envelope, not inside hybridSearch (its cache-rebuild drops labels).
+    const ksfRaw = await ctx.engine.getConfig('search.keyword_semantic_fallback').catch(() => null);
+    const fallbackEnabled = ksfRaw === '1' || (ksfRaw ?? '').toLowerCase() === 'true';
+    const { results, fallback_fired } = await applyKeywordSemanticFallback(
+      keywordResults,
+      fallbackEnabled,
+      () => hybridSearchCached(ctx.engine, queryText, {
+        limit: (p.limit as number) || 20,
+        offset: (p.offset as number) || 0,
+        caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
+        ...sourceScopeOpts(ctx),
+        onMeta: () => {},
+      }),
+    );
     const latency_ms = Date.now() - startedAt;
     const intent = classifyQueryIntent(queryText);
 
@@ -1466,6 +1488,7 @@ const search: Operation = {
     // here. mode='keyword' keeps it a DISTINCT rollup bucket from the semantic modes;
     // it has no vector/cache/rerank, so cache_hit_rate (over rows with cache activity)
     // is unaffected. Non-blocking (in-memory bucket); attributed like query/think.
+    // (fallback_fired telemetry persistence lands in TECH-2740.)
     recordSearchTelemetry(ctx.engine, {
       vector_enabled: false,
       detail_resolved: null,
@@ -1487,7 +1510,10 @@ const search: Operation = {
       resultCount: results.length,
       topResultSlug: results[0]?.slug ?? null,
     });
-    attachRetrievalResponseMeta(results, { query_id: queryId });
+    attachRetrievalResponseMeta(
+      results,
+      fallback_fired ? { query_id: queryId, fallback_fired: true } : { query_id: queryId },
+    );
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Fire-and-forget;
     // results already returned by engine, this just marks them as user-surfaced
