@@ -1488,14 +1488,20 @@ const search: Operation = {
     // here. mode='keyword' keeps it a DISTINCT rollup bucket from the semantic modes;
     // it has no vector/cache/rerank, so cache_hit_rate (over rows with cache activity)
     // is unaffected. Non-blocking (in-memory bucket); attributed like query/think.
-    // (fallback_fired telemetry persistence lands in TECH-2740.)
+    //
+    // TECH-2740 — record the KEYWORD result count (keywordResults.length, 0 on a
+    // miss), NOT results.length: when the fallback fired, `results` holds the
+    // semantic rescue, and recording that here would mask the keyword miss.
+    // fallback_fired is the rescue overlay, so the true keyword-miss rate stays
+    // observable in the rollup (sum_results = keyword hits; fallback_fired =
+    // misses rescued). The rescued count still persists per-event in retrieval_events.
     recordSearchTelemetry(ctx.engine, {
       vector_enabled: false,
       detail_resolved: null,
       expansion_applied: false,
       intent,
       mode: 'keyword',
-    }, { results_count: results.length }, {
+    }, { results_count: keywordResults.length, fallback_fired }, {
       client: ctx.auth?.clientName,
       sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
     });

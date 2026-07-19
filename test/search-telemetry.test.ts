@@ -89,6 +89,21 @@ describe('recordSearchTelemetry — in-memory bucket', () => {
     expect(b.count).toBe(4);
   });
 
+  test('fallback_fired counter fires from opts.fallback_fired; misses are not masked (TECH-2740)', () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    // Two keyword misses rescued by the semantic fallback (results_count 0 — the KEYWORD
+    // count) + one keyword hit (results_count 5, no fallback).
+    recordSearchTelemetry(engine, makeMeta({ mode: 'keyword' }), { results_count: 0, fallback_fired: true });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'keyword' }), { results_count: 0, fallback_fired: true });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'keyword' }), { results_count: 5 });
+    const today = new Date().toISOString().slice(0, 10);
+    const b = w.bucketForTest(today, 'keyword', 'general')!;
+    expect(b.count).toBe(3);
+    expect(b.fallback_fired).toBe(2);   // 2 rescued misses
+    expect(b.sum_results).toBe(5);      // 0 + 0 + 5 — the misses stay visible as 0
+  });
+
   test('sum_budget_dropped accumulates from meta.token_budget.dropped', () => {
     const w = getTelemetryWriter();
     w.setEngine(engine);
@@ -304,6 +319,18 @@ describe('readSearchStats — read-time derived averages', () => {
     expect(s.cache_hit_rate).toBeCloseTo(0.75, 5); // 3 / (3 + 1) = 0.75
   });
 
+  test('fallback_fired sums over the window across callers/rows (TECH-2740)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta({ mode: 'keyword' }), { results_count: 0, fallback_fired: true }, { client: 'a', sourceId: 'a' });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'keyword' }), { results_count: 0, fallback_fired: true }, { client: 'b', sourceId: 'b' });
+    recordSearchTelemetry(engine, makeMeta({ mode: 'balanced' }), { results_count: 3 }, { client: 'a', sourceId: 'a' }); // no fallback
+    await w.flush();
+
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.fallback_fired).toBe(2); // summed across the two distinct caller rows
+  });
+
   test('intent_distribution and mode_distribution surface counts', async () => {
     const w = getTelemetryWriter();
     w.setEngine(engine);
@@ -337,6 +364,7 @@ describe('readSearchStats — read-time derived averages', () => {
     // New caller-dimension fields are present + empty on the graceful path.
     expect(s.caller_distribution).toEqual({});
     expect(s.by_caller).toEqual([]);
+    expect(s.fallback_fired).toBe(0); // TECH-2740 field present + zero on the graceful path
     // Restore for subsequent tests in this describe block.
     await engine.initSchema();
   });

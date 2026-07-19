@@ -38,6 +38,7 @@ interface Bucket {
   sum_budget_dropped: number;
   cache_hit: number;
   cache_miss: number;
+  fallback_fired: number;
 }
 
 const FLUSH_INTERVAL_MS = 60_000;
@@ -73,7 +74,7 @@ class TelemetryWriter {
    */
   record(
     meta: HybridSearchMeta,
-    opts: { results_count: number; tokens_estimate?: number } = { results_count: 0 },
+    opts: { results_count: number; tokens_estimate?: number; fallback_fired?: boolean } = { results_count: 0 },
     caller?: { client?: string; sourceId?: string },
   ): void {
     const date = nowDate();
@@ -101,6 +102,7 @@ class TelemetryWriter {
         sum_budget_dropped: 0,
         cache_hit: 0,
         cache_miss: 0,
+        fallback_fired: 0,
       };
       this.buckets.set(key, b);
     }
@@ -111,6 +113,11 @@ class TelemetryWriter {
     b.sum_budget_dropped += Math.max(0, Math.floor(meta.token_budget?.dropped ?? 0));
     if (meta.cache?.status === 'hit') b.cache_hit += 1;
     if (meta.cache?.status === 'miss') b.cache_miss += 1;
+    // TECH-2740 — keyword→semantic fallback count. Set by the `search` op when
+    // keyword returned zero hits and the fallback rescued the call. Keeps the
+    // keyword-miss rate observable: the op records the KEYWORD result count (0 on
+    // a miss) in results_count, so this counter is the rescue overlay on it.
+    if (opts.fallback_fired) b.fallback_fired += 1;
 
     this.pendingCount += 1;
     if (this.pendingCount >= FLUSH_THRESHOLD_CALLS) {
@@ -143,8 +150,8 @@ class TelemetryWriter {
           try {
             await engine.executeRaw(
               `INSERT INTO search_telemetry
-                 (date, mode, intent, client, source_id, count, sum_results, sum_tokens, sum_budget_dropped, cache_hit, cache_miss, first_seen, last_seen)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now(), now())
+                 (date, mode, intent, client, source_id, count, sum_results, sum_tokens, sum_budget_dropped, cache_hit, cache_miss, fallback_fired, first_seen, last_seen)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
                ON CONFLICT (date, mode, intent, client, source_id) DO UPDATE SET
                  count = search_telemetry.count + EXCLUDED.count,
                  sum_results = search_telemetry.sum_results + EXCLUDED.sum_results,
@@ -152,8 +159,9 @@ class TelemetryWriter {
                  sum_budget_dropped = search_telemetry.sum_budget_dropped + EXCLUDED.sum_budget_dropped,
                  cache_hit = search_telemetry.cache_hit + EXCLUDED.cache_hit,
                  cache_miss = search_telemetry.cache_miss + EXCLUDED.cache_miss,
+                 fallback_fired = search_telemetry.fallback_fired + EXCLUDED.fallback_fired,
                  last_seen = now()`,
-              [b.date, b.mode, b.intent, b.client, b.source_id, b.count, b.sum_results, b.sum_tokens, b.sum_budget_dropped, b.cache_hit, b.cache_miss],
+              [b.date, b.mode, b.intent, b.client, b.source_id, b.count, b.sum_results, b.sum_tokens, b.sum_budget_dropped, b.cache_hit, b.cache_miss, b.fallback_fired],
             );
           } catch {
             // swallow — telemetry write must never break the hot path.
@@ -246,7 +254,7 @@ export function getTelemetryWriter(): TelemetryWriter {
 export function recordSearchTelemetry(
   engine: BrainEngine,
   meta: HybridSearchMeta,
-  opts: { results_count: number; tokens_estimate?: number } = { results_count: 0 },
+  opts: { results_count: number; tokens_estimate?: number; fallback_fired?: boolean } = { results_count: 0 },
   caller?: { client?: string; sourceId?: string },
 ): void {
   try {
@@ -289,6 +297,10 @@ export interface StatsWindow {
   cache_hits: number;
   cache_misses: number;
   cache_hit_rate: number;
+  /** TECH-2740 — # keyword `search` calls that missed (zero lexical hits) and were
+   *  rescued by the default-off semantic fallback, summed over the window. This is
+   *  the keyword-miss/rescue rate; 0 when the fallback knob is off everywhere. */
+  fallback_fired: number;
   avg_results: number;
   avg_tokens: number;
   total_budget_dropped: number;
@@ -322,6 +334,7 @@ export async function readSearchStats(
       sum_budget_dropped: number;
       cache_hit: number;
       cache_miss: number;
+      fallback_fired: number;
       first_seen: string;
       last_seen: string;
     }>(
@@ -337,6 +350,7 @@ export async function readSearchStats(
               SUM(sum_budget_dropped)::int AS sum_budget_dropped,
               SUM(cache_hit)::int         AS cache_hit,
               SUM(cache_miss)::int        AS cache_miss,
+              SUM(fallback_fired)::int    AS fallback_fired,
               MIN(first_seen)::text       AS first_seen,
               MAX(last_seen)::text        AS last_seen
        FROM search_telemetry
@@ -348,6 +362,7 @@ export async function readSearchStats(
     let total_calls = 0;
     let cache_hits = 0;
     let cache_misses = 0;
+    let fallback_fired = 0;
     let total_results = 0;
     let total_tokens = 0;
     let total_budget_dropped = 0;
@@ -362,6 +377,7 @@ export async function readSearchStats(
       total_calls += r.count;
       cache_hits += r.cache_hit;
       cache_misses += r.cache_miss;
+      fallback_fired += r.fallback_fired;
       total_results += r.sum_results;
       total_tokens += r.sum_tokens;
       total_budget_dropped += r.sum_budget_dropped;
@@ -391,6 +407,7 @@ export async function readSearchStats(
       cache_hits,
       cache_misses,
       cache_hit_rate: probe_total > 0 ? cache_hits / probe_total : 0,
+      fallback_fired,
       avg_results: total_calls > 0 ? total_results / total_calls : 0,
       avg_tokens: total_calls > 0 ? total_tokens / total_calls : 0,
       total_budget_dropped,
@@ -409,6 +426,7 @@ export async function readSearchStats(
       cache_hits: 0,
       cache_misses: 0,
       cache_hit_rate: 0,
+      fallback_fired: 0,
       avg_results: 0,
       avg_tokens: 0,
       total_budget_dropped: 0,
