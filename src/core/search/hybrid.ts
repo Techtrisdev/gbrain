@@ -1198,7 +1198,9 @@ export async function hybridSearchCached(
       // Mutually exclusive with the bare-hybridSearch record on the miss path, so
       // no double-count; recordSearchTelemetry is non-blocking (in-memory bucket),
       // so no hot-path latency. Caller threaded for attribution parity with query/think.
-      recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length }, opts?.caller);
+      if (!opts?._suppressTelemetry) {
+        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length }, opts?.caller);
+      }
       return budgeted;
     }
   }
@@ -1248,7 +1250,9 @@ export async function hybridSearchCached(
   // legs, carrying cache.status (the inner record was suppressed). Closes the
   // cache_miss-always-0 gap that pinned cache_hit_rate at a false ~100%. The hit
   // leg is recorded separately above (cachedMeta, cache.status='hit').
-  recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length }, opts?.caller);
+  if (!opts?._suppressTelemetry) {
+    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length }, opts?.caller);
+  }
 
   // Best-effort writeback (skip when search returned empty so we don't
   // cache zero-result queries forever — they often indicate a typo).

@@ -1479,6 +1479,13 @@ const search: Operation = {
         caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
         ...sourceScopeOpts(ctx),
         onMeta: () => {},
+        // TECH-2740 — this rescue is a keyword-op event, NOT a separate semantic
+        // `query` call, so suppress hybridSearchCached's own semantic-mode telemetry
+        // row. Otherwise one rescued call double-counts (keyword bucket + a semantic
+        // bucket), inflating mode_distribution / total_calls — the exact adoption
+        // signal this rollup exists to measure. The rescue is recorded ONCE below as
+        // the keyword bucket, with fallback_fired=1.
+        _suppressTelemetry: true,
       }),
     );
     const latency_ms = Date.now() - startedAt;
