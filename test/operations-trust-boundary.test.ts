@@ -218,13 +218,20 @@ describe('hasScope — read-only token cannot satisfy write or admin scopes', ()
     expect(op!.mutating).toBe(true);
     // Net gate effect: a read-only token can call it.
     expect(hasScope(['read'], resolveRequiredScope(op!))).toBe(true);
-    // Guard: it is the ONLY write-scoped op a read token can reach. Adding the flag to
-    // another write op (widening the trust boundary) fails this test → forces review.
-    const readReachableWriteOps = operations
-      .filter(o => o.scope === 'write' && hasScope(['read'], resolveRequiredScope(o)))
+    // Guard 1 (Fable finding A): readScopeCallable appears on EXACTLY
+    // record_retrieval_use across ALL ops, REGARDLESS of scope — so a flag misapplied
+    // to an admin-class op (which resolveRequiredScope would never downgrade, but
+    // defense-in-depth) is caught here too, not silently allowed.
+    const flaggedOps = operations.filter(o => o.readScopeCallable).map(o => o.name).sort();
+    expect(flaggedOps).toEqual(['record_retrieval_use']);
+    // Guard 2: record_retrieval_use is the ONLY non-read op a read token can reach —
+    // across every scope class, not just 'write'. Widening the trust boundary anywhere
+    // (a new readScopeCallable op, or an IMPLIES-table change) fails this → forces review.
+    const readReachableNonReadOps = operations
+      .filter(o => (o.scope ?? 'read') !== 'read' && hasScope(['read'], resolveRequiredScope(o)))
       .map(o => o.name)
       .sort();
-    expect(readReachableWriteOps).toEqual(['record_retrieval_use']);
+    expect(readReachableNonReadOps).toEqual(['record_retrieval_use']);
   });
 });
 

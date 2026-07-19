@@ -231,8 +231,13 @@ describe('resolveRequiredScope (TECH-2742)', () => {
     expect(resolveRequiredScope({ scope: 'read' })).toBe('read');
     expect(resolveRequiredScope({})).toBe('read');
   });
-  test('the flag only relaxes to read; it never elevates an admin op', () => {
-    expect(resolveRequiredScope({ scope: 'admin', readScopeCallable: true })).toBe('read');
+  test('the flag relaxes ONLY write→read; it NEVER downgrades an admin-class op', () => {
+    // Defense-in-depth (Fable finding A): a flag misapplied to an admin-class op must
+    // NOT silently grant read tokens access. Only a 'write' op is relaxed; admin,
+    // sources_admin, and users_admin pass through unchanged even WITH the flag.
+    expect(resolveRequiredScope({ scope: 'admin', readScopeCallable: true })).toBe('admin');
+    expect(resolveRequiredScope({ scope: 'sources_admin', readScopeCallable: true })).toBe('sources_admin');
+    expect(resolveRequiredScope({ scope: 'users_admin', readScopeCallable: true })).toBe('users_admin');
     expect(resolveRequiredScope({ scope: 'admin' })).toBe('admin');
   });
 });

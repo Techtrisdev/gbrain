@@ -98,7 +98,14 @@ export function isScope(s: string): s is Scope {
  * cannot drift. Structural param (not the Operation type) to avoid an import cycle.
  */
 export function resolveRequiredScope(op: { scope?: string; readScopeCallable?: boolean }): string {
-  return op.readScopeCallable ? 'read' : (op.scope || 'read');
+  const declared = op.scope || 'read';
+  // readScopeCallable relaxes ONLY a 'write' op to 'read' — the source-scoped, own-row
+  // feedback-write carve-out (record_retrieval_use). It MUST NOT downgrade admin-class
+  // scopes (admin / sources_admin / users_admin): a flag misapplied to a dangerous op
+  // must never silently grant read tokens access to it. Structural defense-in-depth,
+  // paired with the all-ops guard in operations-trust-boundary.test.ts.
+  if (op.readScopeCallable && declared === 'write') return 'read';
+  return declared;
 }
 
 /**
