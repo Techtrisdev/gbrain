@@ -2,8 +2,8 @@
  * TECH-2743 — reconstructed empty-keyword → semantic rescue evidence.
  *
  * PRODUCTION ANCHOR (retrieval_events, 2026-07): 400 of 439 keyword `search` calls
- * returned ZERO results — a 91% keyword-miss rate, almost entirely from read-only agents
- * (codex-readonly, simon-hermes) issuing conceptual `general`-intent queries. The raw
+ * returned ZERO results — a 91% keyword-miss rate, almost entirely from the read-only
+ * client agents issuing conceptual `general`-intent queries. The raw
  * query text is UNRECOVERABLE (retrieval_events keeps only a SHA-256 query_hash;
  * mcp_request_log.params is redacted), so we cannot replay the literal production
  * queries. Instead we replay a RECONSTRUCTED representative set — the labeled real-prose
