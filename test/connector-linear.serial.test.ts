@@ -15,6 +15,15 @@
  * refresh-then-succeed flow against fixtures. fetch is stubbed to serve the recorded
  * GraphQL pages — no network. Candidate writes go through a fake engine that captures
  * the toRow INSERT params (mirrors test/connector-base.test.ts).
+ *
+ * SERIAL (*.serial.test.ts) — REQUIRED; do not rename back to *.test.ts. The
+ * top-level `mock.module('./credentials.ts', …)` below is PROCESS-GLOBAL in bun and
+ * leaks across files that share a shard process: its stub omits `withInProcessLock`,
+ * so a co-resident test that loads calendar.ts (`import { withInProcessLock } from
+ * './credentials.ts'`) crashes with "export not found". run-serial-tests.sh runs each
+ * serial file in its OWN bun process — the only thing that truly contains the leak.
+ * See the connector-calendar.test.ts header for the real-custody pattern that drops
+ * mock.module entirely (the eventual migration target).
  */
 
 import { describe, test, expect, mock, afterEach } from 'bun:test';
