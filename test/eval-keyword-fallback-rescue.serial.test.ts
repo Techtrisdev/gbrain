@@ -14,6 +14,15 @@
  * Hermetic: frozen ZeroEntropy zembed-1 @1280 document + query vectors, no network — the
  * same rig as eval-realcorpus-gate.serial.test.ts. Serial (top-level mock-free but uses
  * the gateway test seam + module singletons; runs in its own process).
+ *
+ * WHAT THIS PROVES: the rescue MECHANISM — when keyword returns zero rows and the answer
+ * exists, hybridSearchCached (the production fallback leg) surfaces it and the real
+ * `search` op labels it match_type:'semantic'. WHAT IT DOES NOT: it does NOT measure what
+ * fraction of the live 91% would be rescued. The 20 queries are a hand-authored fixture
+ * (shared vocabulary with the ~30-doc corpus by design), so these recall numbers are a
+ * mechanism demonstration on a ceiling-regime set, NOT a production magnitude. The rescue
+ * floor below is the fallback-ELIGIBLE rate (empty-keyword only — the production fallback
+ * fires ONLY on zero keyword rows, never on non-empty-but-irrelevant misses).
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { readFileSync } from 'fs';
@@ -24,7 +33,7 @@ import {
 } from '../src/core/ai/gateway.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { hybridSearchCached } from '../src/core/search/hybrid.ts';
-import { applyKeywordSemanticFallback } from '../src/core/search/keyword-fallback.ts';
+import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import {
   EMBEDDINGS_PATH,
   EVAL_EMBEDDING_DIMS,
@@ -132,34 +141,55 @@ describe('TECH-2743 — keyword→semantic fallback rescues keyword misses (reco
       if (semFindsRel) semHit++;
       if (kw.length === 0 && semFindsRel) rescuedFromEmpty++;
       if (kw.length > 0 && !kwFindsRel && semFindsRel) rescuedFromMiss++;
-
-      // Prove the PRODUCTION fallback helper (TECH-2739) does exactly this on an empty
-      // keyword result: it fires and labels the rescued rows 'semantic'.
-      if (kw.length === 0) {
-        const fb = await applyKeywordSemanticFallback(kw, true, async () => semantic);
-        expect(fb.fallback_fired).toBe(true);
-        expect(fb.results.every((r) => (r as { match_type?: string }).match_type === 'semantic')).toBe(true);
-      }
     }
 
     const kwRecall = kwHit / total;
     const semRecall = semHit / total;
-    const keywordMisses = kwEmpty + kwMissNonEmpty;
-    const rescued = rescuedFromEmpty + rescuedFromMiss;
-    const rescueRate = keywordMisses > 0 ? rescued / keywordMisses : 0;
+    // The production fallback fires ONLY on zero keyword rows (keyword-fallback.ts), so the
+    // fallback-ELIGIBLE rescue rate is rescuedFromEmpty / kwEmpty — NOT a conflated rate over
+    // all misses (which would credit non-empty-irrelevant misses the real fallback can't touch).
+    const emptyRescueRate = kwEmpty > 0 ? rescuedFromEmpty / kwEmpty : 0;
 
     // Evidence, echoed to the run log (the durable artifact alongside the assertions).
-    console.log(`[TECH-2743] production anchor: 400/439 (91%) live keyword searches returned 0 results.`);
-    console.log(`[TECH-2743] reconstructed set (labeled corpus): queries=${total}`);
-    console.log(`[TECH-2743]   keyword  recall@${K} = ${(kwRecall * 100).toFixed(0)}%  (hit ${kwHit}/${total})`);
-    console.log(`[TECH-2743]   semantic recall@${K} = ${(semRecall * 100).toFixed(0)}%  (hit ${semHit}/${total})`);
-    console.log(`[TECH-2743]   keyword misses = ${keywordMisses} (empty=${kwEmpty}, non-empty-irrelevant=${kwMissNonEmpty})`);
-    console.log(`[TECH-2743]   semantic rescued ${rescued}/${keywordMisses} misses = ${(rescueRate * 100).toFixed(0)}% rescue rate`);
+    console.log(`[TECH-2743] production anchor: 400/439 (91%) live keyword searches returned 0 rows (motivation, not a target).`);
+    console.log(`[TECH-2743] reconstructed hand-authored set (labeled corpus): queries=${total}`);
+    console.log(`[TECH-2743]   keyword recall@${K} = ${(kwRecall * 100).toFixed(0)}%  (hit ${kwHit}/${total})`);
+    console.log(`[TECH-2743]   hybrid  recall@${K} = ${(semRecall * 100).toFixed(0)}%  (hit ${semHit}/${total})`);
+    console.log(`[TECH-2743]   keyword returned ZERO rows on ${kwEmpty} queries (fallback-eligible); non-empty-irrelevant=${kwMissNonEmpty}`);
+    console.log(`[TECH-2743]   semantic rescued ${rescuedFromEmpty}/${kwEmpty} fallback-eligible = ${(emptyRescueRate * 100).toFixed(0)}%`);
 
-    // The reconstructed corpus reproduces the production pattern: keyword fails on a real
-    // share of queries, and the guarded semantic fallback recovers the majority.
-    expect(keywordMisses, 'keyword must miss real labeled queries (else nothing to rescue)').toBeGreaterThan(0);
-    expect(semRecall, 'semantic recall must exceed keyword recall').toBeGreaterThan(kwRecall);
-    expect(rescueRate, 'semantic must rescue a majority of keyword misses').toBeGreaterThanOrEqual(0.6);
+    // Mechanism guard (a ceiling-regime demonstration, not a production magnitude — see header):
+    expect(kwEmpty, 'keyword must return ZERO rows on real labeled queries — the exact production fallback trigger').toBeGreaterThan(0);
+    expect(semRecall, 'hybrid recall must exceed keyword recall on this set').toBeGreaterThan(kwRecall);
+    expect(emptyRescueRate, 'semantic must rescue the fallback-ELIGIBLE (empty-keyword) misses').toBeGreaterThanOrEqual(0.8);
+  }, 120_000);
+
+  test('end-to-end: the real `search` op with the knob ON returns NON-EMPTY rescued rows labeled semantic', async () => {
+    // The measure test above uses hybridSearchCached directly; this drives the ACTUAL op
+    // handler (operationsByName['search']) with search.keyword_semantic_fallback=1 on a query
+    // that returns zero keyword rows, and asserts the rescue surfaces real content labeled
+    // 'semantic' — the end-to-end path the unit + op-on-empty-brain tests don't cover.
+    let emptyQuery: string | null = null;
+    for (const q of qrels) {
+      const kw = await engine.searchKeyword(q.query, { limit: LIMIT });
+      if (kw.length === 0) { emptyQuery = q.query; break; }
+    }
+    expect(emptyQuery, 'fixture must contain at least one empty-keyword query').not.toBeNull();
+
+    await engine.setConfig('search.keyword_semantic_fallback', '1');
+    try {
+      const op = operationsByName['search'];
+      const ctx = {
+        engine, remote: false, config: {}, logger: console, dryRun: false,
+        auth: { clientName: 'kf-2743', sourceId: 'default' }, sourceId: 'default',
+      } as unknown as OperationContext;
+      const out = (await op.handler(ctx, { query: emptyQuery })) as Array<{ match_type?: string }>;
+      // Keyword returned nothing, but the seeded corpus HAS the answer → the rescue is
+      // non-empty AND every rescued row is labeled a semantic guess (not a keyword match).
+      expect(out.length).toBeGreaterThan(0);
+      expect(out.every((r) => r.match_type === 'semantic')).toBe(true);
+    } finally {
+      await engine.setConfig('search.keyword_semantic_fallback', '0');
+    }
   }, 120_000);
 });
