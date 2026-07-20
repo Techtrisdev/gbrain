@@ -17,7 +17,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { SemanticQueryCache, cacheRowId } from '../src/core/search/query-cache.ts';
+import { SemanticQueryCache, cacheRowId, distinctiveTokens, entitySetsMatch } from '../src/core/search/query-cache.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import type { SearchResult, HybridSearchMeta } from '../src/core/types.ts';
 
@@ -177,6 +177,85 @@ describe('SemanticQueryCache \u2014 store + lookup', () => {
     await cache.store('q1', a, [makeResult('a')], META);
     const hit = await cache.lookup(b);
     expect(hit.hit).toBe(false);
+  });
+});
+
+// v0.42 — distinctive-token (entity) gate. The confirmed collision: entity-swapped
+// queries embed within the 0.08 threshold, so pre-fix the cache served one the
+// other's result. A near-neighbor embedding with a DIFFERENT distinctive entity
+// must now MISS; a same-entity paraphrase still hits.
+describe('distinctiveTokens (entity extraction)', () => {
+  test('extracts capitalized proper nouns, drops question/stop words', () => {
+    expect([...distinctiveTokens('What is Spendgo used for?')]).toEqual(['spendgo']);
+    expect([...distinctiveTokens('What is Punchh used for?')]).toEqual(['punchh']);
+    expect([...distinctiveTokens('What is Olo used for?')]).toEqual(['olo']);
+  });
+  test('multi-word entities + all-caps acronyms', () => {
+    const t = distinctiveTokens('Bahia Bowls POS integration status');
+    expect(t.has('bahia')).toBe(true);
+    expect(t.has('bowls')).toBe(true);
+    expect(t.has('pos')).toBe(true);
+  });
+  test('quoted phrases are distinctive', () => {
+    expect(distinctiveTokens('what does "closed won" mean').has('closed won')).toBe(true);
+  });
+  test('generic queries have no distinctive tokens', () => {
+    expect(distinctiveTokens('how does the loyalty flow work').size).toBe(0);
+  });
+  test('entitySetsMatch: swapped entities differ, same entity matches', () => {
+    expect(entitySetsMatch(distinctiveTokens('What is Spendgo used for?'), distinctiveTokens('What is Punchh used for?'))).toBe(false);
+    expect(entitySetsMatch(distinctiveTokens('What is Spendgo used for?'), distinctiveTokens('What does Spendgo do?'))).toBe(true);
+  });
+});
+
+describe('SemanticQueryCache — entity-collision gate', () => {
+  // A near-neighbor of `base` (cosine > 0.92), so ONLY the entity gate can
+  // differentiate — the embedding says "hit".
+  function nearNeighbor(base: Float32Array): Float32Array {
+    const near = new Float32Array(base);
+    for (let i = 0; i < 10; i++) near[i] += 0.005;
+    let mag = 0;
+    for (let i = 0; i < DIM; i++) mag += near[i] * near[i];
+    mag = Math.sqrt(mag);
+    for (let i = 0; i < DIM; i++) near[i] /= mag;
+    return near;
+  }
+
+  test('entity-swapped query within cosine threshold MISSES (the Spendgo/Punchh collision)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(500);
+    const near = nearNeighbor(base);
+    await cache.store('What is Spendgo used for?', base, [makeResult('integrations/spendgo')], META);
+    // Same embedding neighborhood, different entity → must NOT serve spendgo's row.
+    const hit = await cache.lookup(near, { queryText: 'What is Punchh used for?' });
+    expect(hit.hit).toBe(false);
+  });
+
+  test('same-entity paraphrase within cosine threshold still HITS', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(501);
+    const near = nearNeighbor(base);
+    await cache.store('What is Spendgo used for?', base, [makeResult('integrations/spendgo')], META);
+    const hit = await cache.lookup(near, { queryText: 'What does Spendgo do?' });
+    expect(hit.hit).toBe(true);
+  });
+
+  test('generic queries (no entities) are unaffected by the gate', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(502);
+    const near = nearNeighbor(base);
+    await cache.store('how does the loyalty flow work', base, [makeResult('a')], META);
+    const hit = await cache.lookup(near, { queryText: 'how does loyalty work here' });
+    expect(hit.hit).toBe(true); // both entity sets empty → gate is a no-op, cosine decides
+  });
+
+  test('back-compat: no queryText passed → gate is skipped (prior behavior)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(503);
+    const near = nearNeighbor(base);
+    await cache.store('What is Spendgo used for?', base, [makeResult('a')], META);
+    const hit = await cache.lookup(near); // no queryText
+    expect(hit.hit).toBe(true);
   });
 });
 

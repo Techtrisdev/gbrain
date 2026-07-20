@@ -39,6 +39,57 @@ export const DEFAULT_SIMILARITY_THRESHOLD = 0.92;
 /** Default TTL for cache entries, in seconds. */
 export const DEFAULT_TTL_SECONDS = 3600;
 
+// Question/stop words stripped before entity extraction — capitalized only
+// because a query starts with them or they are proper-noun-shaped by accident.
+const CACHE_ENTITY_STOPWORDS = new Set([
+  'what', 'when', 'where', 'which', 'who', 'whom', 'whose', 'why', 'how',
+  'is', 'are', 'was', 'were', 'the', 'a', 'an', 'of', 'for', 'to', 'in', 'on',
+  'and', 'or', 'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will',
+  'used', 'use', 'about', 'with', 'this', 'that', 'these', 'those', 'i', 'we',
+]);
+
+/**
+ * v0.42 — distinctive (entity) tokens for the cache anti-collision gate.
+ *
+ * The bi-encoder cannot distinguish entity-swapped queries: "What is Spendgo
+ * used for?" and "What is Punchh used for?" embed within the 0.08 cosine
+ * threshold, so the semantic cache served one the other's cached result (the
+ * confirmed defect — both returned integrations/olo at an identical score).
+ * Two queries may share a cache row ONLY if their distinctive-token sets are
+ * EQUAL, in addition to cosine proximity.
+ *
+ * Distinctive = capitalized proper nouns (Spendgo, Punchh, Bahia, Lennys, Hang),
+ * quoted strings, and ALL-CAPS acronyms — minus question/stop words. Chosen for
+ * determinism (no model call, no corpus IDF) and safety: a false negative only
+ * costs a cache miss (a recompute), never a wrong answer. Lowercase-only entity
+ * collisions are a documented residual; a miss there is still safe.
+ */
+export function distinctiveTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  if (!text) return out;
+  // Quoted spans → whole phrase is distinctive.
+  for (const m of text.matchAll(/"([^"]+)"|'([^']+)'/g)) {
+    const phrase = (m[1] ?? m[2] ?? '').trim().toLowerCase();
+    if (phrase) out.add(phrase);
+  }
+  for (const raw of text.split(/[^A-Za-z0-9]+/)) {
+    if (!raw) continue;
+    const lower = raw.toLowerCase();
+    if (CACHE_ENTITY_STOPWORDS.has(lower)) continue;
+    const isCapitalized = /^[A-Z][a-z]/.test(raw);      // Spendgo, Bahia
+    const isAllCaps = /^[A-Z0-9]{2,}$/.test(raw);        // API, POS, CRM
+    if (isCapitalized || isAllCaps) out.add(lower);
+  }
+  return out;
+}
+
+/** True when two distinctive-token sets are equal (same entities). */
+export function entitySetsMatch(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const t of a) if (!b.has(t)) return false;
+  return true;
+}
+
 export interface CacheLookupResult {
   hit: boolean;
   results?: SearchResult[];
@@ -126,7 +177,7 @@ export class SemanticQueryCache {
    */
   async lookup(
     queryEmbedding: Float32Array | null,
-    opts: { sourceId?: string; knobsHash?: string } = {},
+    opts: { sourceId?: string; knobsHash?: string; queryText?: string } = {},
   ): Promise<CacheLookupResult> {
     if (!this.enabled || !queryEmbedding || queryEmbedding.length === 0) {
       return { hit: false };
@@ -150,12 +201,13 @@ export class SemanticQueryCache {
       // + qc.page_generations against the live pages table.
       const rows = await this.engine.executeRaw<{
         id: string;
+        query_text: string | null;
         results: unknown;
         meta: unknown;
         distance: number;
         age_seconds: number;
       }>(
-        `SELECT qc.id, qc.results, qc.meta,
+        `SELECT qc.id, qc.query_text, qc.results, qc.meta,
                 qc.embedding <=> $1::vector AS distance,
                 EXTRACT(EPOCH FROM (now() - qc.created_at))::int AS age_seconds
          FROM query_cache qc
@@ -173,6 +225,21 @@ export class SemanticQueryCache {
       if (rows.length === 0) return { hit: false };
 
       const row = rows[0];
+
+      // v0.42 — distinctive-token (entity) gate. The nearest row is within the
+      // cosine threshold, but the bi-encoder cannot tell entity-swapped queries
+      // apart ("What is Spendgo used for?" vs "...Punchh..."). Require the
+      // distinctive-token sets to match, or this is an entity collision → miss
+      // (recompute). Skipped when the caller didn't pass queryText (back-compat)
+      // or the stored row has no text (legacy row) — degrade to prior behavior
+      // rather than block, since the gate is an additional safety filter.
+      if (opts.queryText !== undefined && row.query_text) {
+        const incoming = distinctiveTokens(opts.queryText);
+        const cached = distinctiveTokens(row.query_text);
+        if (!entitySetsMatch(incoming, cached)) {
+          return { hit: false };
+        }
+      }
       const results = Array.isArray(row.results)
         ? (row.results as SearchResult[])
         : safeJsonParse<SearchResult[]>(row.results, []);
