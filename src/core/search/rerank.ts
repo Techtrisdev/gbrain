@@ -37,6 +37,14 @@ export interface RerankerOpts {
    * Production must NEVER set this.
    */
   rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
+  /**
+   * v0.42 — fail-open notification. Invoked (best-effort, never throws through)
+   * when the reranker call errors and applyReranker returns the UN-reranked RRF
+   * order. This is a silent degradation — the caller serves results in the wrong
+   * order with no score signal — so `hybridSearch` uses this to stamp
+   * `reranker_failed` on `_meta`. Absent on the happy path.
+   */
+  onFailure?: (reason: RerankFailureReason) => void;
 }
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
@@ -96,6 +104,14 @@ export async function applyReranker(
       });
     } catch {
       // Audit logging must never break search.
+    }
+    // v0.42 — surface the fail-open to the caller so it can flag the silently
+    // wrong-ordered response in _meta. Best-effort; a throwing callback must not
+    // turn a degraded-but-served response into a hard error.
+    try {
+      opts.onFailure?.(reason);
+    } catch {
+      // Notification must never break search.
     }
     return results;
   }

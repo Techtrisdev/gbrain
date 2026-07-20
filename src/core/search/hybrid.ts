@@ -541,7 +541,7 @@ export async function hybridSearch(
       // v0.40.x — hybridSearchCached suppresses this so it can record ONE row
       // per request with the correct cache.status (hit/miss/disabled).
       if (!opts?._suppressTelemetry) {
-        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount, abstained: meta.abstained === true }, opts?.caller);
+        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount, abstained: meta.abstained === true, reranker_failed: meta.reranker_failed === true }, opts?.caller);
       }
     } catch {
       // swallow — telemetry must never break the search hot path.
@@ -997,8 +997,18 @@ export async function hybridSearch(
     model: resolvedMode.reranker_model,
     timeoutMs: resolvedMode.reranker_timeout_ms,
   };
+  // v0.42 — capture a reranker fail-open. On error applyReranker returns the
+  // UN-reranked RRF order (no rerank_score), so results are served in the wrong
+  // order silently — a distinct degraded-mode surface from a recall miss. Stamped
+  // on _meta below so it's observable instead of invisible. Note: this ALSO means
+  // the abstain gate won't fire (no finite rerank_score → maxRerank stays
+  // -Infinity), so a reranker outage serves un-reranked results, never abstains.
+  let rerankerFailed = false;
   const reranked = rerankerOpts.enabled
-    ? await applyReranker(query, deduped, rerankerOpts as any)
+    ? await applyReranker(query, deduped, {
+        ...rerankerOpts,
+        onFailure: () => { rerankerFailed = true; },
+      } as any)
     : deduped;
 
   // v0.40.x — Option A: intent-conditional post-rerank process reorder. Runs AFTER
@@ -1083,6 +1093,10 @@ export async function hybridSearch(
     // per-request; `count === 0` is total vector failure.
     vector_result_count: vectorResultCount,
     vector_requested_k: innerLimit,
+    // v0.42 — reranker fail-open marker. True iff the reranker errored and the
+    // results are served in un-reranked RRF order (wrong ordering, no rerank
+    // signal). Only emitted when true, so happy-path meta is unchanged.
+    ...(rerankerFailed ? { reranker_failed: true } : {}),
     ...(abstained
       ? {
           // v0.42 — the recall-health discrimination lives in the count/k pair
@@ -1285,6 +1299,7 @@ export async function hybridSearchCached(
         ...(hit.meta?.vector_requested_k !== undefined
           ? { vector_requested_k: hit.meta.vector_requested_k }
           : {}),
+        ...(hit.meta?.reranker_failed ? { reranker_failed: true } : {}),
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
@@ -1305,7 +1320,7 @@ export async function hybridSearchCached(
       // no double-count; recordSearchTelemetry is non-blocking (in-memory bucket),
       // so no hot-path latency. Caller threaded for attribution parity with query/think.
       if (!opts?._suppressTelemetry) {
-        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length, abstained: cachedMeta.abstained === true }, opts?.caller);
+        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length, abstained: cachedMeta.abstained === true, reranker_failed: cachedMeta.reranker_failed === true }, opts?.caller);
       }
       return budgeted;
     }
@@ -1361,6 +1376,7 @@ export async function hybridSearchCached(
     ...(innerMeta?.vector_requested_k !== undefined
       ? { vector_requested_k: innerMeta.vector_requested_k }
       : {}),
+    ...(innerMeta?.reranker_failed ? { reranker_failed: true } : {}),
     cache: { status: cacheStatus },
     ...(opts?.tokenBudget && opts.tokenBudget > 0
       ? { token_budget: budgetMeta }
@@ -1376,7 +1392,7 @@ export async function hybridSearchCached(
   // cache_miss-always-0 gap that pinned cache_hit_rate at a false ~100%. The hit
   // leg is recorded separately above (cachedMeta, cache.status='hit').
   if (!opts?._suppressTelemetry) {
-    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length, abstained: finalMeta.abstained === true }, opts?.caller);
+    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length, abstained: finalMeta.abstained === true, reranker_failed: finalMeta.reranker_failed === true }, opts?.caller);
   }
 
   // Best-effort writeback (skip when search returned empty so we don't

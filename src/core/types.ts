@@ -1317,6 +1317,15 @@ export interface HybridSearchMeta {
    */
   vector_requested_k?: number;
   /**
+   * v0.42 — reranker fail-open marker. True iff the cross-encoder reranker errored
+   * and results were served in un-reranked RRF order — a silent degradation: the
+   * ordering is wrong and no `rerank_score` is present. Also implies the abstain
+   * gate could not fire (it needs finite rerank scores). Only present when true.
+   * Distinct from a recall miss (`vector_result_count` low): here recall was fine
+   * but the RE-RANK stage failed.
+   */
+  reranker_failed?: boolean;
+  /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`
    * command can show "intent: temporal" alongside results to make the
