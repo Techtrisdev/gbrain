@@ -65,6 +65,7 @@ on user_asks_about(topic):
 3. **Don't use hybrid search for known names.** `gbrain query "Pedro Franceschi"` wastes embedding compute. Use `gbrain search "Pedro Franceschi"` or better yet `gbrain get pedro-franceschi` if you know the slug.
 4. **Token budget awareness.** A full page via `gbrain get` can be large. Read the search chunks first to confirm relevance before pulling the full page. "Did anyone mention the Series A?" -- search results (chunks) are probably enough. "Tell me everything about Pedro" -- get the full page.
 5. **Hybrid search needs embeddings to have been run.** If `gbrain query` returns nothing but `gbrain search` finds results, the embeddings haven't been generated yet. Run the embedding pipeline first.
+6. **An empty result may be a deliberate abstention, not "not found."** When the abstention floor (`search.rerank_abstain_floor`) is enabled, `query` returns *no results* rather than a low-confidence wrong page. Check `_meta.retrieval.abstained` — `true` means "the Brain has no confident answer" (a clean miss: fall back to another source, don't treat it as proof the thing doesn't exist), distinct from a genuine no-match (`abstained` absent). `isError` stays `false` either way. See `docs/architecture/RETRIEVAL.md` → "The honesty layer".
 
 ## How to Verify
 
