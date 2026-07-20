@@ -144,6 +144,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // Source is now KNOBS_HASH_VERSION=8 (search/mode.ts): v=6 process_reorder,
     // v=7 keyword_semantic_fallback, v=8 rerank_abstain_floor (all append-only,
     // result-affecting knobs).
+    // v=9 (v0.43): answerability_guard (aq=) — enforce mode changes the result set.
     expect(KNOBS_HASH_VERSION).toBe(9);
   });
 

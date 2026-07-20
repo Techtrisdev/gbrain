@@ -122,12 +122,14 @@ class TelemetryWriter {
     // keyword-miss rate observable: the op records the KEYWORD result count (0 on
     // a miss) in results_count, so this counter is the rescue overlay on it.
     if (opts.fallback_fired) b.fallback_fired += 1;
-    // v0.41 — abstention count. Set when the rerank-abstention gate returned no
-    // answer because no candidate cleared the confidence floor. abstention_rate =
-    // abstained / count, segmented by client. Unlike fallback_fired (which should
-    // trend to ~0 once routing is fixed), a nonzero abstention rate is HEALTHY —
-    // it means the Brain refused to manufacture confidence. Independent of
-    // fallback_fired; a single call can increment both.
+    // v0.41 — abstention count. Set when a query returned no answer via the
+    // rerank-abstention floor (below_confidence_threshold) OR, as of v0.43, the
+    // answerability guard in enforce mode (not_answerable). This counter does NOT
+    // split by reason — the reason is in _meta.abstain_reason, not telemetry; a
+    // per-reason split (an abstained_not_answerable column) is a follow-up to add
+    // BEFORE the answerability guard is ever enforced in prod. abstention_rate =
+    // abstained / count; a nonzero rate is HEALTHY (the Brain refused to guess).
+    // Independent of fallback_fired; a single call can increment both.
     if (opts.abstained) b.abstained += 1;
     if (opts.reranker_failed) b.reranker_failed += 1;
 

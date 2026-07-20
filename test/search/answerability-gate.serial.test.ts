@@ -3,9 +3,9 @@
  *
  * SERIAL: configureGateway + __setEmbedTransportForTests mutate the process-global
  * gateway singleton. The judge is stubbed via opts.answerabilityJudgeFn (no LLM
- * call). Asserts the tri-state contract: off = inert; shadow = judge + LOG but
- * SERVE NORMALLY; enforce = abstain on a NO. Plus band-gate, entity-exempt,
- * fail-open, text-only.
+ * call). Asserts the tri-state contract (off/shadow/enforce), the band-gate
+ * (above + below), fail-open, reranker-off, and the two false-abstain safety
+ * exemptions: known-entity queries and image modality are never judged.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
@@ -37,6 +37,8 @@ beforeAll(async () => {
   const pages: Array<[string, PageInput, string]> = [
     ['playbooks/governance', { type: 'playbook', title: 'Governance rules', compiled_truth: 'governance approval process' }, 'governance approval process for changes'],
     ['playbooks/notes', { type: 'playbook', title: 'General notes', compiled_truth: 'general process notes' }, 'general process notes and context'],
+    // A companies/ page so referencesKnownEntity matches "Widgetco" → entity query.
+    ['companies/widgetco', { type: 'company', title: 'Widgetco', compiled_truth: 'Widgetco governance approval process' }, 'widgetco governance approval process notes'],
   ];
   for (const [slug, page, chunk] of pages) {
     await engine.putPage(slug, page);
@@ -127,6 +129,24 @@ describe('answerability guard gate', () => {
       reranker: { enabled: false, topNIn: 30, topNOut: null },
       answerabilityJudgeFn: no,
     });
+    expect(meta?.answerability_outcome).toBeUndefined();
+    await engine.unsetConfig('search.answerability_guard');
+  });
+
+  test('known-entity query is EXEMPT (never judged — reranker strength, false-abstain exposure)', async () => {
+    await engine.setConfig('search.answerability_guard', 'enforce');
+    // "Widgetco" matches companies/widgetco title → referencesKnownEntity true → skip.
+    const { meta, results } = await run('Widgetco governance', { reranker: rerankAt(0.7), answerabilityJudgeFn: no });
+    expect(meta?.answerability_outcome).toBeUndefined();
+    expect(meta?.abstained).toBe(false);
+    expect(results.length).toBeGreaterThan(0);
+    await engine.unsetConfig('search.answerability_guard');
+  });
+
+  test('non-text modality is EXEMPT (the judge/reranker are text-only, mirror the floor)', async () => {
+    await engine.setConfig('search.answerability_guard', 'enforce');
+    // crossModal 'both' → effectiveModality != 'text' → abstainModalityOk false → skip.
+    const { meta } = await run('governance process', { reranker: rerankAt(0.7), answerabilityJudgeFn: no, crossModal: 'both' });
     expect(meta?.answerability_outcome).toBeUndefined();
     await engine.unsetConfig('search.answerability_guard');
   });

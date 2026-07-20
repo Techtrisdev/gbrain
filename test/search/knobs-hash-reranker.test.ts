@@ -55,6 +55,7 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // Source now 8 in search/mode.ts (v=6 process_reorder, v=7
     // keyword_semantic_fallback, v=8 rerank_abstain_floor — abstain-on/off
     // return different result sets). See search-mode.test.ts.
+    // v=9 (v0.43): answerability_guard (aq=) — enforce mode changes the result set.
     expect(KNOBS_HASH_VERSION).toBe(9);
   });
 

@@ -950,6 +950,14 @@ export function loadOverridesFromConfig(
     const n = parseFloat(abhi);
     if (Number.isFinite(n) && n >= 0 && n <= 1) out.answerability_band_hi = n;
   }
+  // Guard against an inverted band silently disabling the guard with no signal
+  // (the module's own "silent-disable must be visible" principle). If lo > hi the
+  // band is empty → force the guard 'off' so the operator sees inert, not a
+  // mysterious zero-verdict shadow.
+  if (out.answerability_band_lo !== undefined && out.answerability_band_hi !== undefined &&
+      out.answerability_band_lo > out.answerability_band_hi) {
+    out.answerability_guard = 'off';
+  }
 
   // v0.36 cross-modal overrides (D3 registry)
   const cmbt = get('search.cross_modal.both_mode_text_weight');

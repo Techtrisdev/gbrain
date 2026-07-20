@@ -1085,6 +1085,10 @@ export async function hybridSearch(
   //   - top rerank in [band_lo, band_hi] (below: floor handled it; above: trusted),
   //   - NOT a known-entity query (entity lookups are the reranker's strength =
   //     pure false-abstain exposure; exempt them, same guard the process-reorder uses).
+  //   - NOT when the process reorder moved the top slot: the guard judges
+  //     reranked[0], but a reorder can promote a weaker doc there, and abstaining
+  //     on it would discard the true top — the exact masking the floor's
+  //     max-not-position-0 rule avoids. Skip rather than judge the wrong doc.
   // SHADOW logs the verdict + would-abstain + discarded #2 but SERVES NORMALLY;
   // ENFORCE abstains on a NO. Fail-open (error/timeout/unavailable → serve).
   const guardMode = resolvedMode.answerability_guard;
@@ -1097,6 +1101,7 @@ export async function hybridSearch(
     !abstained &&
     rerankerOpts.enabled &&
     abstainModalityOk &&
+    !processReorderApplied &&
     reranked.length > 0
   ) {
     const top = reranked[0] as { rerank_score?: number; chunk_text?: string; title?: string };
@@ -1115,7 +1120,14 @@ export async function hybridSearch(
           if (guardMode === 'enforce') {
             abstained = true;
             abstainReason = 'not_answerable';
-            abstainCandidateCount = reranked.length;
+            // candidate_count = the number the reranker actually SCORED (same
+            // contract as the floor path), not reranked.length (which includes
+            // the un-reranked topNIn tail).
+            let scoredCount = 0;
+            for (const r of reranked) {
+              if (typeof (r as { rerank_score?: number }).rerank_score === 'number') scoredCount += 1;
+            }
+            abstainCandidateCount = scoredCount;
           }
         }
       }
