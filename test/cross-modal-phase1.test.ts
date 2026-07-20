@@ -141,9 +141,10 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // with 7 cross-modal knobs + column/provider context. v0.40.4 (salem) +
     // v0.39 T21 (master) bump to v=4 for graph_signals + schema-pack fields.
     // v0.40.3.0 D8 bumps to v=5 (sequenced behind salem's v=4 graph-signals).
-    // Source is now KNOBS_HASH_VERSION=7 (search/mode.ts): v=6 process_reorder,
-    // v=7 keyword_semantic_fallback (both append-only, result-affecting knobs).
-    expect(KNOBS_HASH_VERSION).toBe(7);
+    // Source is now KNOBS_HASH_VERSION=8 (search/mode.ts): v=6 process_reorder,
+    // v=7 keyword_semantic_fallback, v=8 rerank_abstain_floor (all append-only,
+    // result-affecting knobs).
+    expect(KNOBS_HASH_VERSION).toBe(8);
   });
 
   test('flipping unified_multimodal changes the hash', () => {
