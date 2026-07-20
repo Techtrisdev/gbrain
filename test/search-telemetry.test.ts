@@ -104,6 +104,22 @@ describe('recordSearchTelemetry — in-memory bucket', () => {
     expect(b.sum_results).toBe(5);      // 0 + 0 + 5 — the misses stay visible as 0
   });
 
+  test('reranker_failed counter fires from opts + survives a flush→DB round-trip (v0.42)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5, reranker_failed: true });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5, reranker_failed: true });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 5 }); // healthy
+    const today = new Date().toISOString().slice(0, 10);
+    expect(w.bucketForTest(today, 'balanced', 'general')!.reranker_failed).toBe(2);
+    // Flush + read back: this is the check that catches an INSERT column/placeholder
+    // mismatch (which silently swallows the write → 0 rows), invisible to _meta tests.
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.reranker_failed).toBe(2);
+    expect(s.total_calls).toBe(3);
+  });
+
   test('sum_budget_dropped accumulates from meta.token_budget.dropped', () => {
     const w = getTelemetryWriter();
     w.setEngine(engine);

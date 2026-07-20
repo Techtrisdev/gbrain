@@ -37,6 +37,14 @@ export interface RerankerOpts {
    * Production must NEVER set this.
    */
   rerankerFn?: (input: RerankInput) => Promise<RerankResult[]>;
+  /**
+   * v0.42 — fail-open notification. Invoked (best-effort, never throws through)
+   * when the reranker call errors and applyReranker returns the UN-reranked RRF
+   * order. This is a silent degradation — the caller serves results in the wrong
+   * order with no score signal — so `hybridSearch` uses this to stamp
+   * `reranker_failed` on `_meta`. Absent on the happy path.
+   */
+  onFailure?: (reason: RerankFailureReason) => void;
 }
 
 /** SHA-256 prefix (8 chars) of the query text for privacy-preserving audit. */
@@ -97,11 +105,29 @@ export async function applyReranker(
     } catch {
       // Audit logging must never break search.
     }
+    // v0.42 — surface the fail-open to the caller so it can flag the silently
+    // wrong-ordered response in _meta. Best-effort; a throwing callback must not
+    // turn a degraded-but-served response into a hard error.
+    try {
+      opts.onFailure?.(reason);
+    } catch {
+      // Notification must never break search.
+    }
     return results;
   }
 
-  // Defensive: if the reranker returned a malformed shape, pass through.
-  if (!Array.isArray(reranked) || reranked.length === 0) return results;
+  // Defensive: if the reranker returned a malformed/empty shape, pass through.
+  // This ALSO serves un-reranked RRF order (same silent degradation as a throw),
+  // so mark it — a reranker that returns [] without throwing must not look like a
+  // healthy rerank to the abstain gate + consumers.
+  if (!Array.isArray(reranked) || reranked.length === 0) {
+    try {
+      opts.onFailure?.('unknown');
+    } catch {
+      // Notification must never break search.
+    }
+    return results;
+  }
 
   // Build the reordered head. We keep ONLY indices the reranker returned
   // (so a top_n response with fewer items than head.length naturally

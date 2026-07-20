@@ -257,3 +257,72 @@ describe('recall-health signal (vector_result_count)', () => {
     }
   });
 });
+
+// v0.42 — reranker fail-open observability (degraded-mode honesty, part 2). When
+// the cross-encoder errors, applyReranker returns the UN-reranked RRF order with
+// no rerank_score — results served in the wrong order, silently. The reranker_failed
+// marker makes that observable, and (as a corollary) proves a reranker outage does
+// NOT abstain (the gate needs finite rerank scores).
+describe('reranker fail-open marker (reranker_failed)', () => {
+  const rerankThrows = {
+    enabled: true,
+    topNIn: 30,
+    topNOut: null,
+    rerankerFn: async (): Promise<RerankResult[]> => { throw new Error('reranker gateway 502'); },
+  };
+
+  test('a reranker error stamps reranker_failed and serves un-reranked results (never abstains)', async () => {
+    // Need a healthy vector recall so the pool reaches the reranker; stub it.
+    const orig = (engine as any).searchVector.bind(engine);
+    (engine as any).searchVector = async () => ([
+      { slug: 'clients/acme', page_id: 1, title: 'Acme Corp', type: 'client', score: 0.9, chunk_text: 'acme loyalty', chunk_source: 'compiled_truth', source_id: 'default' },
+      { slug: 'integrations/loyalty-x', page_id: 2, title: 'Loyalty X', type: 'integration', score: 0.8, chunk_text: 'loyalty x', chunk_source: 'compiled_truth', source_id: 'default' },
+    ] as any);
+    try {
+      // Floor ON: proves a reranker outage does NOT abstain even with the gate armed.
+      await engine.setConfig('search.rerank_abstain_floor', '0.5');
+      const { meta, results } = await metaFor('loyalty', { reranker: rerankThrows });
+      expect(meta?.reranker_failed).toBe(true);
+      expect(meta?.abstained).not.toBe(true);   // no rerank_score → gate can't fire
+      expect(results.length).toBeGreaterThan(0); // served, in un-reranked order
+      await engine.unsetConfig('search.rerank_abstain_floor');
+    } finally {
+      (engine as any).searchVector = orig;
+    }
+  });
+
+  test('the happy path does NOT stamp reranker_failed', async () => {
+    const { meta } = await metaFor('loyalty', { reranker: rerankOn(0.9) });
+    expect(meta?.reranker_failed).toBeUndefined();
+  });
+
+  test('reranker_failed propagates through hybridSearchCached (miss-path finalMeta)', async () => {
+    const orig = (engine as any).searchVector.bind(engine);
+    (engine as any).searchVector = async () => ([
+      { slug: 'clients/acme', page_id: 1, title: 'Acme Corp', type: 'client', score: 0.9, chunk_text: 'acme loyalty', chunk_source: 'compiled_truth', source_id: 'default' },
+    ] as any);
+    try {
+      let captured: HybridSearchMeta | null = null;
+      await hybridSearchCached(engine, 'loyalty', { reranker: rerankThrows, onMeta: (m) => { captured = m; } });
+      expect((captured as HybridSearchMeta | null)?.reranker_failed).toBe(true);
+    } finally {
+      (engine as any).searchVector = orig;
+    }
+  });
+
+  test('a MALFORMED/empty reranker response (no throw) also marks reranker_failed', async () => {
+    // The other fail-open: the reranker returns [] without throwing. Same silent
+    // wrong-order serve → must be marked (types contract: flag absent ⇒ reranked).
+    const rerankEmpty = { enabled: true, topNIn: 30, topNOut: null, rerankerFn: async (): Promise<RerankResult[]> => [] };
+    const orig = (engine as any).searchVector.bind(engine);
+    (engine as any).searchVector = async () => ([
+      { slug: 'clients/acme', page_id: 1, title: 'Acme Corp', type: 'client', score: 0.9, chunk_text: 'acme loyalty', chunk_source: 'compiled_truth', source_id: 'default' },
+    ] as any);
+    try {
+      const { meta } = await metaFor('loyalty', { reranker: rerankEmpty });
+      expect(meta?.reranker_failed).toBe(true);
+    } finally {
+      (engine as any).searchVector = orig;
+    }
+  });
+});

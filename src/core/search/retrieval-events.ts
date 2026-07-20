@@ -46,6 +46,11 @@ export interface RetrievalResponseMeta {
   vector_result_count?: number;
   /** v0.42 — per-list vector recall limit requested (denominator for vector_result_count). */
   vector_requested_k?: number;
+  /** v0.42 — reranker fail-open marker: results served in un-reranked order (the
+   *  cross-encoder errored/returned nothing). A consumer that relies on rerank
+   *  ordering should treat this response as degraded. Present (true) only when it
+   *  fired; independent of `abstained` (a fail-open never abstains). */
+  reranker_failed?: boolean;
 }
 
 const responseMeta = new WeakMap<object, RetrievalResponseMeta>();

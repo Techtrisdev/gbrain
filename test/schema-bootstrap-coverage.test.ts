@@ -753,6 +753,10 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // fully-migrated brain, so no downstream filter breaks. Bootstrap probe would be
   // pure overhead.
   'search_telemetry.abstained',
+  // v0.42 (migration v103 search_telemetry_reranker_failed) — same posture as the
+  // other search_telemetry additions: migration-created table, not in
+  // PGLITE_SCHEMA_SQL, additive/defaulted, lone consumer runs post-migration.
+  'search_telemetry.reranker_failed',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

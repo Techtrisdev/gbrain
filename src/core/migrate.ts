@@ -4759,6 +4759,30 @@ export const MIGRATIONS: Migration[] = [
       return rows.length === 1;
     },
   },
+  {
+    version: 103,
+    name: 'search_telemetry_reranker_failed',
+    // v0.42 — persist the reranker fail-open signal. `reranker_failed` counts, per
+    // rollup bucket, how many query calls served results in UN-reranked RRF order
+    // because the cross-encoder errored (a silent wrong-ordering degradation).
+    // Lets the operator query the reranker-flake rate instead of scraping per-request
+    // _meta. Additive, defaulted, idempotent — safe on existing rows.
+    idempotent: true,
+    sql: `
+      ALTER TABLE search_telemetry
+        ADD COLUMN IF NOT EXISTS reranker_failed INTEGER NOT NULL DEFAULT 0;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'search_telemetry'
+            AND column_name = 'reranker_failed'`,
+      );
+      return rows.length === 1;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

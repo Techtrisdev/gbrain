@@ -1525,13 +1525,17 @@ const search: Operation = {
     // per the TARS contract). Only true when the rescue actually ran and returned
     // no-confident-answer — a pure keyword exact-miss with no rescue never sets it.
     const rescueAbstained = (rescueMeta as HybridSearchMeta | null)?.abstained === true;
+    // v0.42 — a reranker fail-open INSIDE the semantic rescue is the dominant
+    // client path's degraded-mode surface; count + surface it here or it's inert
+    // for most real traffic (same reasoning as abstained above).
+    const rescueRerankerFailed = (rescueMeta as HybridSearchMeta | null)?.reranker_failed === true;
     recordSearchTelemetry(ctx.engine, {
       vector_enabled: false,
       detail_resolved: null,
       expansion_applied: false,
       intent,
       mode: 'keyword',
-    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained }, {
+    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained, reranker_failed: rescueRerankerFailed }, {
       client: ctx.auth?.clientName,
       sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
     });
@@ -1563,6 +1567,7 @@ const search: Operation = {
             vector_requested_k: rescueMetaFinal?.vector_requested_k,
           }
         : {}),
+      ...(rescueRerankerFailed ? { reranker_failed: true } : {}),
     });
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Fire-and-forget;
@@ -1797,19 +1802,21 @@ const query: Operation = {
     // _meta stays byte-identical to pre-abstention behavior. Attaches to the
     // (possibly empty) results object — the WeakMap keys on identity, and an
     // empty array is still a distinct object dispatch.ts spreads meta off of.
-    attachRetrievalResponseMeta(
-      results,
-      retrievalMeta?.abstained
-        ? {
-            query_id: queryId,
-            abstained: true,
-            abstain_reason: retrievalMeta.abstain_reason ?? 'below_confidence_threshold',
-            candidate_count: retrievalMeta.candidate_count,
-            vector_result_count: retrievalMeta.vector_result_count,
-            vector_requested_k: retrievalMeta.vector_requested_k,
-          }
-        : { query_id: queryId },
-    );
+    // v0.42 — reranker_failed rides back independently of abstention (a fail-open
+    // NEVER abstains), so it must be attached on the non-abstain branch too, or no
+    // real client ever sees the degradation.
+    const responseMeta: import('./search/retrieval-events.ts').RetrievalResponseMeta = retrievalMeta?.abstained
+      ? {
+          query_id: queryId,
+          abstained: true,
+          abstain_reason: retrievalMeta.abstain_reason ?? 'below_confidence_threshold',
+          candidate_count: retrievalMeta.candidate_count,
+          vector_result_count: retrievalMeta.vector_result_count,
+          vector_requested_k: retrievalMeta.vector_requested_k,
+        }
+      : { query_id: queryId };
+    if (retrievalMeta?.reranker_failed) responseMeta.reranker_failed = true;
+    attachRetrievalResponseMeta(results, responseMeta);
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.
