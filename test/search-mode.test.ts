@@ -70,6 +70,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       rerank_abstain_floor: undefined,
+      answerability_guard: 'off' as const,
+      answerability_band_lo: 0.5,
+      answerability_band_hi: 0.85,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: false,
       ...CR_DISABLED_DEFAULT,
@@ -97,6 +100,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       rerank_abstain_floor: undefined,
+      answerability_guard: 'off' as const,
+      answerability_band_lo: 0.5,
+      answerability_band_hi: 0.85,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -122,6 +128,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       rerank_abstain_floor: undefined,
+      answerability_guard: 'off' as const,
+      answerability_band_lo: 0.5,
+      answerability_band_hi: 0.85,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -328,7 +337,7 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // v=8 (v0.41 abstention): rerank_abstain_floor (raf=) folded in — an abstain-on lookup
     // returns [] where abstain-off returns the top hits, so it changes the result set and a
     // write under one setting must never be served to the other.
-    expect(KNOBS_HASH_VERSION).toBe(8);
+    expect(KNOBS_HASH_VERSION).toBe(9);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {

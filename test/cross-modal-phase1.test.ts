@@ -144,7 +144,7 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // Source is now KNOBS_HASH_VERSION=8 (search/mode.ts): v=6 process_reorder,
     // v=7 keyword_semantic_fallback, v=8 rerank_abstain_floor (all append-only,
     // result-affecting knobs).
-    expect(KNOBS_HASH_VERSION).toBe(8);
+    expect(KNOBS_HASH_VERSION).toBe(9);
   });
 
   test('flipping unified_multimodal changes the hash', () => {

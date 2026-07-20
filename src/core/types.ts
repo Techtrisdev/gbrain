@@ -1283,7 +1283,7 @@ export interface HybridSearchMeta {
    * RESERVED — declared for a future classifier but NOT currently emitted, so
    * consumers must not branch on them expecting a live signal.
    */
-  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall';
+  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall' | 'not_answerable';
   /**
    * v0.41 — how many candidates existed at the moment the gate fired (i.e.
    * the reranked-set size before abstention emptied the response). Lets a
@@ -1325,6 +1325,22 @@ export interface HybridSearchMeta {
    * but the RE-RANK stage failed.
    */
   reranker_failed?: boolean;
+  /**
+   * v0.43 — answerability guard outcome, emitted whenever the LLM judge RAN
+   * (shadow or enforce mode). answered|not_answered = a live verdict;
+   * error|timeout|unavailable = fail-open (served regardless). A high
+   * unavailable/timeout share means the guard is silently disabled, not protecting.
+   */
+  answerability_outcome?: 'answered' | 'not_answered' | 'error' | 'timeout' | 'unavailable';
+  /** v0.43 — true iff the judge said the top result does NOT answer (regardless of
+   *  mode). In shadow this is the "would-have-abstained" signal; in enforce it is
+   *  why `abstained` + `abstain_reason:'not_answerable'` fired. */
+  answerability_would_abstain?: boolean;
+  /** v0.43 — slug of the #2 result discarded when the guard rejected #1. Lets the
+   *  discarded-viable-second rate be measured in shadow before enforcing. */
+  answerability_discarded_slug?: string;
+  /** v0.43 — rerank score of that #2 result. */
+  answerability_discarded_score?: number;
   /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`

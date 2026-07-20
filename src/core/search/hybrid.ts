@@ -19,6 +19,7 @@ import { dedupResults } from './dedup.ts';
 import { applyReranker } from './rerank.ts';
 import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery, isProcessQuery } from './query-intent.ts';
 import { applyProcessReorder, referencesKnownEntity } from './process-reorder.ts';
+import { judgeAnswerability, type AnswerabilityOutcome } from './answerability.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget } from './token-budget.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
@@ -412,6 +413,12 @@ export interface HybridSearchOpts extends SearchOpts {
    * read a false ~100%).
    */
   _suppressTelemetry?: boolean;
+  /**
+   * v0.43 — test seam for the answerability judge (mirrors reranker.rerankerFn).
+   * When set, the guard calls this instead of the gateway LLM. Production must
+   * NEVER set it.
+   */
+  answerabilityJudgeFn?: (query: string, chunk: string) => Promise<string>;
 }
 
 export async function hybridSearch(
@@ -1067,6 +1074,53 @@ export async function hybridSearch(
       abstainCandidateCount = scored;
     }
   }
+  let abstainReason: 'below_confidence_threshold' | 'not_answerable' = 'below_confidence_threshold';
+
+  // v0.43 — answerability guard. For a top result that CLEARED the abstain floor
+  // (so the reranker is confident) but sits in the ambiguous band, ask an LLM
+  // judge whether it actually ANSWERS the question — the high-confidence-WRONG
+  // class the cross-encoder (topical) + floor cannot catch. Runs only:
+  //   - guard mode shadow|enforce, reranker ran, text modality (mirror the floor),
+  //   - not already abstained,
+  //   - top rerank in [band_lo, band_hi] (below: floor handled it; above: trusted),
+  //   - NOT a known-entity query (entity lookups are the reranker's strength =
+  //     pure false-abstain exposure; exempt them, same guard the process-reorder uses).
+  // SHADOW logs the verdict + would-abstain + discarded #2 but SERVES NORMALLY;
+  // ENFORCE abstains on a NO. Fail-open (error/timeout/unavailable → serve).
+  const guardMode = resolvedMode.answerability_guard;
+  let answerabilityOutcome: AnswerabilityOutcome | undefined;
+  let answerabilityWouldAbstain = false;       // judge said NO (regardless of mode)
+  let answerabilityDiscardedSlug: string | undefined;   // #2 slug when a NO fired
+  let answerabilityDiscardedScore: number | undefined;
+  if (
+    (guardMode === 'shadow' || guardMode === 'enforce') &&
+    !abstained &&
+    rerankerOpts.enabled &&
+    abstainModalityOk &&
+    reranked.length > 0
+  ) {
+    const top = reranked[0] as { rerank_score?: number; chunk_text?: string; title?: string };
+    const topScore = typeof top.rerank_score === 'number' ? top.rerank_score : undefined;
+    if (topScore !== undefined && topScore >= resolvedMode.answerability_band_lo && topScore <= resolvedMode.answerability_band_hi) {
+      const guardSources = opts?.sourceIds ?? (opts?.sourceId ? [opts.sourceId] : ['default']);
+      const isEntity = await referencesKnownEntity(engine, query, guardSources);
+      if (!isEntity) {
+        const verdict = await judgeAnswerability(query, top.chunk_text || top.title || '', { judgeFn: opts?.answerabilityJudgeFn });
+        answerabilityOutcome = verdict.outcome;
+        answerabilityWouldAbstain = verdict.reject;
+        if (verdict.reject) {
+          const second = reranked[1] as { slug?: string; rerank_score?: number } | undefined;
+          answerabilityDiscardedSlug = second?.slug;
+          answerabilityDiscardedScore = typeof second?.rerank_score === 'number' ? second.rerank_score : undefined;
+          if (guardMode === 'enforce') {
+            abstained = true;
+            abstainReason = 'not_answerable';
+            abstainCandidateCount = reranked.length;
+          }
+        }
+      }
+    }
+  }
 
   const sliced = abstained ? [] : reranked.slice(offset, offset + limit);
   // v0.32.3 search-lite: budget enforcement at the main return path.
@@ -1099,13 +1153,27 @@ export async function hybridSearch(
     ...(rerankerFailed ? { reranker_failed: true } : {}),
     ...(abstained
       ? {
-          // v0.42 — the recall-health discrimination lives in the count/k pair
-          // above, NOT a per-request reason code: no fixed count threshold cleanly
-          // separates a partial-miss abstain from a genuine one without the k
-          // denominator, and `degraded_recall` stays RESERVED for a later
-          // classifier. Reason is always below_confidence_threshold today.
-          abstain_reason: 'below_confidence_threshold' as const,
+          // v0.42/v0.43 — reason is below_confidence_threshold for a floor abstain,
+          // or not_answerable when the v0.43 answerability guard (enforce) rejected
+          // a confident-but-non-answering top result. degraded_recall stays RESERVED.
+          abstain_reason: abstainReason,
           candidate_count: abstainCandidateCount,
+        }
+      : {}),
+    // v0.43 — answerability guard observability. Emitted whenever the judge RAN
+    // (shadow or enforce), so shadow mode is a passive measurement channel: the
+    // verdict, whether it WOULD abstain (independent of mode), and the #2 slug/score
+    // discarded on a NO (quantify the discarded-viable-second rate before enforce).
+    ...(answerabilityOutcome !== undefined
+      ? {
+          answerability_outcome: answerabilityOutcome,
+          answerability_would_abstain: answerabilityWouldAbstain,
+          ...(answerabilityDiscardedSlug !== undefined
+            ? { answerability_discarded_slug: answerabilityDiscardedSlug }
+            : {}),
+          ...(answerabilityDiscardedScore !== undefined
+            ? { answerability_discarded_score: answerabilityDiscardedScore }
+            : {}),
         }
       : {}),
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
@@ -1300,6 +1368,21 @@ export async function hybridSearchCached(
           ? { vector_requested_k: hit.meta.vector_requested_k }
           : {}),
         ...(hit.meta?.reranker_failed ? { reranker_failed: true } : {}),
+        // v0.43 — carry the answerability verdict through the cache-HIT path so a
+        // replayed shadow row keeps its harvest signal (query_cache.meta is the
+        // shadow harvest channel: query_text + outcome + would_abstain).
+        ...(hit.meta?.answerability_outcome !== undefined
+          ? {
+              answerability_outcome: hit.meta.answerability_outcome,
+              answerability_would_abstain: hit.meta.answerability_would_abstain,
+              ...(hit.meta.answerability_discarded_slug !== undefined
+                ? { answerability_discarded_slug: hit.meta.answerability_discarded_slug }
+                : {}),
+              ...(hit.meta.answerability_discarded_score !== undefined
+                ? { answerability_discarded_score: hit.meta.answerability_discarded_score }
+                : {}),
+            }
+          : {}),
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
@@ -1377,6 +1460,20 @@ export async function hybridSearchCached(
       ? { vector_requested_k: innerMeta.vector_requested_k }
       : {}),
     ...(innerMeta?.reranker_failed ? { reranker_failed: true } : {}),
+    // v0.43 — carry the answerability verdict up from the inner hybridSearch so
+    // the cache writeback (query_cache.meta) records the shadow harvest signal.
+    ...(innerMeta?.answerability_outcome !== undefined
+      ? {
+          answerability_outcome: innerMeta.answerability_outcome,
+          answerability_would_abstain: innerMeta.answerability_would_abstain,
+          ...(innerMeta.answerability_discarded_slug !== undefined
+            ? { answerability_discarded_slug: innerMeta.answerability_discarded_slug }
+            : {}),
+          ...(innerMeta.answerability_discarded_score !== undefined
+            ? { answerability_discarded_score: innerMeta.answerability_discarded_score }
+            : {}),
+        }
+      : {}),
     cache: { status: cacheStatus },
     ...(opts?.tokenBudget && opts.tokenBudget > 0
       ? { token_budget: budgetMeta }

@@ -138,6 +138,34 @@ export interface ModeBundle {
    */
   rerank_abstain_floor: number | undefined;
 
+  /**
+   * v0.43 — answerability guard. A second-stage LLM "does this passage actually
+   * ANSWER the question?" check on the top result, for the high-confidence-WRONG
+   * class the reranker + floor cannot catch (a topically-adjacent page reranks
+   * ABOVE the floor but does not answer, e.g. "Forge approval gates" → a Context
+   * Mirror page @ 0.69). The cross-encoder scores topical relevance, not
+   * answerability; the judge is a genuinely different objective.
+   *
+   * TRI-STATE (default 'off'):
+   *   - 'off'     — inert, no LLM call.
+   *   - 'shadow'  — judge the in-band top result, LOG the verdict + would-abstain
+   *                 + discarded-#2, but SERVE NORMALLY. The only way to harvest a
+   *                 labeled in-band eval set (the verdict doesn't exist passively).
+   *   - 'enforce' — as shadow, but a NO verdict ABSTAINS (abstain_reason
+   *                 'not_answerable'). Only-ever-abstains: worst case is a clean
+   *                 miss, never a new wrong answer.
+   * Fail-open (judge error/timeout/unavailable → serve). Only 'enforce' changes
+   * the result set, so it participates in knobsHash. Runs only for band-eligible,
+   * non-known-entity, text-modality queries.
+   */
+  answerability_guard: 'off' | 'shadow' | 'enforce';
+  /** v0.43 — lower/upper rerank bound of the "ambiguous" band the guard judges.
+   *  Below lo: the abstain floor already handled it. Above hi: trusted, skip the
+   *  LLM cost. Config knobs (not constants) so the band is tunable from shadow
+   *  data + re-tunable when reranker_model changes. */
+  answerability_band_lo: number;
+  answerability_band_hi: number;
+
   // v0.36 cross-modal wave knobs (D2 + D3 + D6 + D8 + D13 + LLM-intent).
   // All three mode bundles default these to the same values — cross-modal
   // is opt-in per-call (D6 weighting), opt-in per-brain (D8 unified flags),
@@ -284,6 +312,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.41 — rerank-abstention floor; undefined = OFF for all bundles
     // (preserves prior behavior bit-for-bit). Operator opts in per-brain.
     rerank_abstain_floor: undefined,
+    // v0.43 — answerability guard; 'off' for all bundles (inert until enabled).
+    answerability_guard: 'off',
+    answerability_band_lo: 0.5,
+    answerability_band_hi: 0.85,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -331,6 +363,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.41 — rerank-abstention floor; undefined = OFF for all bundles
     // (preserves prior behavior bit-for-bit). Operator opts in per-brain.
     rerank_abstain_floor: undefined,
+    // v0.43 — answerability guard; 'off' for all bundles (inert until enabled).
+    answerability_guard: 'off',
+    answerability_band_lo: 0.5,
+    answerability_band_hi: 0.85,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -380,6 +416,10 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.41 — rerank-abstention floor; undefined = OFF for all bundles
     // (preserves prior behavior bit-for-bit). Operator opts in per-brain.
     rerank_abstain_floor: undefined,
+    // v0.43 — answerability guard; 'off' for all bundles (inert until enabled).
+    answerability_guard: 'off',
+    answerability_band_lo: 0.5,
+    answerability_band_hi: 0.85,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -436,6 +476,10 @@ export interface SearchKeyOverrides {
   floor_ratio?: number;
   // v0.41 — rerank-abstention floor override.
   rerank_abstain_floor?: number;
+  // v0.43 — answerability guard overrides.
+  answerability_guard?: 'off' | 'shadow' | 'enforce';
+  answerability_band_lo?: number;
+  answerability_band_hi?: number;
   // v0.36 cross-modal overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -480,6 +524,10 @@ export interface SearchPerCallOpts {
   floor_ratio?: number;
   // v0.41 — rerank-abstention floor per-call override.
   rerank_abstain_floor?: number;
+  // v0.43 — answerability guard per-call overrides.
+  answerability_guard?: 'off' | 'shadow' | 'enforce';
+  answerability_band_lo?: number;
+  answerability_band_hi?: number;
   // v0.36 cross-modal per-call overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -559,6 +607,9 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     floor_ratio: pick('floor_ratio'),
     // v0.41 — rerank-abstention floor resolved via the same pick chain.
     rerank_abstain_floor: pick('rerank_abstain_floor'),
+    answerability_guard: pick('answerability_guard'),
+    answerability_band_lo: pick('answerability_band_lo'),
+    answerability_band_hi: pick('answerability_band_hi'),
     // v0.36 cross-modal knobs
     cross_modal_both_text_weight: pick('cross_modal_both_text_weight'),
     cross_modal_both_image_weight: pick('cross_modal_both_image_weight'),
@@ -658,7 +709,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // v0.42 bump 6→7: keyword_semantic_fallback added under v=7 (append-only). A
 // fallback-on write changes the RESULT SET of a keyword search (empty → semantic
 // neighbors), so it must not be served to a fallback-off lookup.
-export const KNOBS_HASH_VERSION = 8;
+export const KNOBS_HASH_VERSION = 9;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -766,6 +817,14 @@ export function knobsHash(
     // write made under one setting must never be served to the other. 4-decimal
     // precision so 0.50 and 0.501 differ; undefined uses literal 'none'.
     `raf=${knobs.rerank_abstain_floor === undefined ? 'none' : knobs.rerank_abstain_floor.toFixed(4)}`,
+    // v=9 (append-only): answerability guard in ENFORCE mode changes the RESULT
+    // SET (a NO verdict abstains), so an enforce write must not serve an off/shadow
+    // lookup. 'off' and 'shadow' serve identically (shadow only logs), so they
+    // fold to the same 'ns' (no-suppression) token; only 'enforce' is distinct.
+    // Band bounds only matter under enforce, so they fold in only then.
+    `aq=${knobs.answerability_guard === 'enforce'
+        ? `enf:${knobs.answerability_band_lo.toFixed(3)}:${knobs.answerability_band_hi.toFixed(3)}`
+        : 'ns'}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -873,6 +932,25 @@ export function loadOverridesFromConfig(
     if (Number.isFinite(n) && n >= 0 && n <= 1) out.rerank_abstain_floor = n;
   }
 
+  // v0.43 — answerability guard. Only 'shadow'/'enforce' activate it; anything
+  // else (incl. malformed) leaves it 'off' — a bad config value can never start
+  // judging/abstaining. Band bounds accept [0,1]; out-of-range falls through.
+  const ag = get('search.answerability_guard');
+  if (ag !== undefined) {
+    const v = ag.trim().toLowerCase();
+    if (v === 'shadow' || v === 'enforce' || v === 'off') out.answerability_guard = v;
+  }
+  const ablo = get('search.answerability_band_lo');
+  if (ablo !== undefined) {
+    const n = parseFloat(ablo);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.answerability_band_lo = n;
+  }
+  const abhi = get('search.answerability_band_hi');
+  if (abhi !== undefined) {
+    const n = parseFloat(abhi);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.answerability_band_hi = n;
+  }
+
   // v0.36 cross-modal overrides (D3 registry)
   const cmbt = get('search.cross_modal.both_mode_text_weight');
   if (cmbt !== undefined) {
@@ -956,6 +1034,9 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.floor_ratio',
   // v0.41 — rerank-abstention floor
   'search.rerank_abstain_floor',
+  'search.answerability_guard',
+  'search.answerability_band_lo',
+  'search.answerability_band_hi',
   // v0.36 cross-modal keys (D3)
   'search.cross_modal.both_mode_text_weight',
   'search.cross_modal.both_mode_image_weight',
