@@ -1251,7 +1251,7 @@ export async function hybridSearchCached(
   }
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
-    const hit = await cache.lookup(queryEmbedding, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash });
+    const hit = await cache.lookup(queryEmbedding, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash, queryText: query });
     if (hit.hit && hit.results) {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;

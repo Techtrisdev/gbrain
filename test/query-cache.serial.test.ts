@@ -17,7 +17,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { SemanticQueryCache, cacheRowId } from '../src/core/search/query-cache.ts';
+import { SemanticQueryCache, cacheRowId, distinctiveTokens, entitySetsMatch, cacheEntityGate } from '../src/core/search/query-cache.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
 import type { SearchResult, HybridSearchMeta } from '../src/core/types.ts';
 
@@ -180,6 +180,119 @@ describe('SemanticQueryCache \u2014 store + lookup', () => {
   });
 });
 
+// v0.42 — distinctive-token (entity) gate. The confirmed collision: entity-swapped
+// queries embed within the 0.08 threshold, so pre-fix the cache served one the
+// other's result. A near-neighbor embedding with a DIFFERENT distinctive entity
+// must now MISS; a same-entity paraphrase still hits.
+describe('distinctiveTokens (entity extraction)', () => {
+  test('extracts capitalized proper nouns, drops question/stop words', () => {
+    expect([...distinctiveTokens('What is Spendgo used for?')]).toEqual(['spendgo']);
+    expect([...distinctiveTokens('What is Punchh used for?')]).toEqual(['punchh']);
+    expect([...distinctiveTokens('What is Olo used for?')]).toEqual(['olo']);
+  });
+  test('multi-word entities + all-caps acronyms', () => {
+    const t = distinctiveTokens('Bahia Bowls POS integration status');
+    expect(t.has('bahia')).toBe(true);
+    expect(t.has('bowls')).toBe(true);
+    expect(t.has('pos')).toBe(true);
+  });
+  test('double-quoted phrases are distinctive; apostrophes do NOT pair', () => {
+    expect(distinctiveTokens('what does "closed won" mean').has('closed won')).toBe(true);
+    // "Lenny's" apostrophe must not create a spurious quoted span (false-miss guard).
+    const t = distinctiveTokens("What is Lenny's loyalty");
+    expect(t.has('s loyalty')).toBe(false);
+    expect(t.has('lenny')).toBe(true);
+  });
+  test('generic queries have no distinctive tokens', () => {
+    expect(distinctiveTokens('how does the loyalty flow work').size).toBe(0);
+  });
+  test('entitySetsMatch: swapped entities differ, same entity matches', () => {
+    expect(entitySetsMatch(distinctiveTokens('What is Spendgo used for?'), distinctiveTokens('What is Punchh used for?'))).toBe(false);
+    expect(entitySetsMatch(distinctiveTokens('What is Spendgo used for?'), distinctiveTokens('What does Spendgo do?'))).toBe(true);
+  });
+});
+
+describe('cacheEntityGate — the serve-or-miss decision', () => {
+  test('capitalized entity swap is rejected', () => {
+    expect(cacheEntityGate('What is Spendgo used for?', 'What is Punchh used for?')).toBe(false);
+  });
+  test('LOWERCASE entity swap is ALSO rejected (content-token fallback)', () => {
+    // Neither has a capitalized token → distinctive sets both empty → without the
+    // fallback these would collide (a WRONG hit). The content-token fallback
+    // ({spendgo,used} vs {punchh,used}) catches it.
+    expect(cacheEntityGate('what is spendgo used for', 'what is punchh used for')).toBe(false);
+  });
+  test('same entity (any casing) is allowed', () => {
+    expect(cacheEntityGate('What is Spendgo used for?', 'What does Spendgo do?')).toBe(true);
+    expect(cacheEntityGate('what is spendgo used for', 'what is spendgo used for')).toBe(true);
+  });
+});
+
+describe('SemanticQueryCache — entity-collision gate', () => {
+  // A near-neighbor of `base` (cosine > 0.92), so ONLY the entity gate can
+  // differentiate — the embedding says "hit".
+  function nearNeighbor(base: Float32Array): Float32Array {
+    const near = new Float32Array(base);
+    for (let i = 0; i < 10; i++) near[i] += 0.005;
+    let mag = 0;
+    for (let i = 0; i < DIM; i++) mag += near[i] * near[i];
+    mag = Math.sqrt(mag);
+    for (let i = 0; i < DIM; i++) near[i] /= mag;
+    return near;
+  }
+
+  test('entity-swapped query within cosine threshold MISSES (the Spendgo/Punchh collision)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(500);
+    const near = nearNeighbor(base);
+    await cache.store('What is Spendgo used for?', base, [makeResult('integrations/spendgo')], META);
+    // Same embedding neighborhood, different entity → must NOT serve spendgo's row.
+    const hit = await cache.lookup(near, { queryText: 'What is Punchh used for?' });
+    expect(hit.hit).toBe(false);
+    expect(hit.entityGateRejected).toBe(true); // distinguishable from a cosine miss
+  });
+
+  test('LOWERCASE entity-swapped query within cosine threshold ALSO misses', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(510);
+    const near = nearNeighbor(base);
+    await cache.store('what is spendgo used for', base, [makeResult('integrations/spendgo')], META);
+    const hit = await cache.lookup(near, { queryText: 'what is punchh used for' });
+    expect(hit.hit).toBe(false);
+    expect(hit.entityGateRejected).toBe(true);
+  });
+
+  test('same-entity paraphrase within cosine threshold still HITS', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(501);
+    const near = nearNeighbor(base);
+    await cache.store('What is Spendgo used for?', base, [makeResult('integrations/spendgo')], META);
+    const hit = await cache.lookup(near, { queryText: 'What does Spendgo do?' });
+    expect(hit.hit).toBe(true);
+  });
+
+  test('generic query with the SAME content tokens hits; different content tokens miss (safe)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(502);
+    const near = nearNeighbor(base);
+    await cache.store('how does the loyalty flow work', base, [makeResult('a')], META);
+    // Same content tokens (stopwords 'the'/'does'/'how' dropped) → HIT.
+    expect((await cache.lookup(near, { queryText: 'how does loyalty flow work' })).hit).toBe(true);
+    // Different content word ('here' vs 'flow') → the no-entity content-token
+    // fallback misses. Safe (a recompute) and the price of closing lowercase swaps.
+    expect((await cache.lookup(near, { queryText: 'how does loyalty work here' })).hit).toBe(false);
+  });
+
+  test('back-compat: no queryText passed → gate is skipped (prior behavior)', async () => {
+    const cache = new SemanticQueryCache(engine);
+    const base = makeEmbedding(503);
+    const near = nearNeighbor(base);
+    await cache.store('What is Spendgo used for?', base, [makeResult('a')], META);
+    const hit = await cache.lookup(near); // no queryText
+    expect(hit.hit).toBe(true);
+  });
+});
+
 describe('SemanticQueryCache \u2014 TTL', () => {
   test('stale row (past TTL) is not returned', async () => {
     const cache = new SemanticQueryCache(engine, { ttlSeconds: 1 });
@@ -247,6 +360,15 @@ describe('SemanticQueryCache \u2014 management', () => {
     expect(stats.total_hits).toBeGreaterThanOrEqual(1);
   });
 });
+
+// NOTE on the production wiring (finding #2): hybrid.ts threads `queryText: query`
+// into cache.lookup(), and the gate is proven at the lookup level above +
+// mutation-verified. A full hybridSearchCached\u2192writeback\u2192lookup round-trip test
+// was attempted but hit pre-existing PGLite friction in the two-layer
+// page-generations writeback (unrelated to this change; the store roundtrip tests
+// above pass). The end-to-end wiring is verified LIVE against prod when the cache
+// is re-enabled (the Spendgo/Punchh/Olo entity-swap must return distinct correct
+// entities with cache ON) \u2014 a stronger proof than a PGLite integration test.
 
 describe('SemanticQueryCache \u2014 disabled', () => {
   test('disabled cache is a pure no-op on lookup', async () => {
