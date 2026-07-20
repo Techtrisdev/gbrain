@@ -41,6 +41,11 @@ export interface AnswerabilityVerdict {
    *  denominator for the reject rate; excludes error/timeout/unavailable. */
   judged: boolean;
   cached: boolean;
+  /** v0.43.1 — diagnostic detail for outcome 'error': the thrown message (capped)
+   *  or `unparseable:<raw>` when the model replied but not with a clean yes/no.
+   *  Surfaced so a shadow run reveals WHY the judge failed instead of a silent
+   *  'error'. Truncated + never contains query/passage text (privacy). */
+  error_detail?: string;
 }
 
 const SYSTEM_PROMPT =
@@ -95,14 +100,19 @@ export async function judgeAnswerability(
   const doc = (chunkText || '').slice(0, MAX_CHUNK_CHARS);
 
   if (opts.judgeFn) {
-    // Test path — still exercises parse + cache, never the gateway.
-    let outcome: 'answered' | 'not_answered' | 'error';
+    // Test path — still exercises parse + cache + error_detail, never the gateway.
+    let raw: string;
     try {
-      outcome = parseVerdict(await opts.judgeFn(query, doc));
-    } catch {
-      return { outcome: 'error', reject: false, judged: false, cached: false };
+      raw = await opts.judgeFn(query, doc);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { outcome: 'error', reject: false, judged: false, cached: false, error_detail: msg.slice(0, 120) };
     }
-    if (outcome === 'error') return { outcome: 'error', reject: false, judged: false, cached: false };
+    const outcome = parseVerdict(raw);
+    if (outcome === 'error') {
+      return { outcome: 'error', reject: false, judged: false, cached: false,
+               error_detail: `unparseable:${(raw ?? '').trim().slice(0, 40)}` };
+    }
     verdictCache.set(key, { outcome, at: now });
     return { outcome, reject: outcome === 'not_answered', judged: true, cached: false };
   }
@@ -126,17 +136,25 @@ export async function judgeAnswerability(
       model: JUDGE_MODEL,
       system: SYSTEM_PROMPT,
       messages: [{ role: 'user', content: `QUESTION: ${query.slice(0, 500)}\n\nPASSAGE: ${doc}` }],
-      maxTokens: 4,
+      // v0.43.1 — 16 (was 4; matches the working classifyModalityWithLLM budget).
+      // A leading whitespace/format token could eat a 4-token budget before the
+      // verdict word, producing an unparseable (empty) reply → false 'error'.
+      maxTokens: 16,
       abortSignal: controller.signal,
     });
     const outcome = parseVerdict(result.text);
-    if (outcome === 'error') return { outcome: 'error', reject: false, judged: false, cached: false };
+    if (outcome === 'error') {
+      // Model replied but not a clean yes/no — capture what it said (short, no
+      // query/passage text) so shadow shows the real shape.
+      return { outcome: 'error', reject: false, judged: false, cached: false,
+               error_detail: `unparseable:${(result.text ?? '').trim().slice(0, 40)}` };
+    }
     verdictCache.set(key, { outcome, at: now });
     return { outcome, reject: outcome === 'not_answered', judged: true, cached: false };
-  } catch {
-    return timedOut
-      ? { outcome: 'timeout', reject: false, judged: false, cached: false }
-      : { outcome: 'error', reject: false, judged: false, cached: false };
+  } catch (err) {
+    if (timedOut) return { outcome: 'timeout', reject: false, judged: false, cached: false };
+    const msg = err instanceof Error ? err.message : String(err);
+    return { outcome: 'error', reject: false, judged: false, cached: false, error_detail: msg.slice(0, 120) };
   } finally {
     clearTimeout(timer);
   }
