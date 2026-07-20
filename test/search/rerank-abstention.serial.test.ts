@@ -190,3 +190,61 @@ describe('rerank-abstention gate', () => {
     await engine.unsetConfig('search.rerank_abstain_floor');
   });
 });
+
+// v0.42 — recall-health signal (degraded-mode honesty, T9). vector_result_count
+// makes a degraded-recall abstention (vector recall returned nothing / a short
+// list — e.g. an HNSW cold/under-load miss) DISTINGUISHABLE from a genuine
+// no-answer, instead of both looking identical (`vector_enabled:true`,
+// `abstained:true`). Without this, a transient recall miss silently withholds an
+// answer the Brain has, indistinguishable from "the Brain has nothing".
+describe('recall-health signal (vector_result_count)', () => {
+  test('degraded recall (vector returned nothing) stamps vector_result_count=0 on the abstention', async () => {
+    // Harness chunks have NULL embeddings → searchVector returns [] → the classic
+    // silent-abstain surface: vector contributed nothing, keyword candidates all
+    // rerank below the floor, and the abstention would otherwise look identical to
+    // a healthy one. The 0 count is the fingerprint that flags it.
+    await engine.setConfig('search.rerank_abstain_floor', '0.5');
+    const { meta } = await metaFor('loyalty', { reranker: rerankOn(0.1) });
+    expect(meta?.abstained).toBe(true);
+    expect(meta?.vector_result_count).toBe(0);
+    await engine.unsetConfig('search.rerank_abstain_floor');
+  });
+
+  test('healthy vector recall stamps vector_result_count > 0', async () => {
+    // Force searchVector to return a non-empty neighbor list (simulating healthy
+    // recall) so the count reflects real recall, not the NULL-embedding artifact.
+    const orig = (engine as any).searchVector.bind(engine);
+    (engine as any).searchVector = async () => ([
+      { slug: 'clients/acme', page_id: 1, title: 'Acme Corp', type: 'client', score: 0.9, chunk_text: 'acme loyalty', chunk_source: 'compiled_truth', source_id: 'default' },
+      { slug: 'integrations/loyalty-x', page_id: 2, title: 'Loyalty X', type: 'integration', score: 0.8, chunk_text: 'loyalty x', chunk_source: 'compiled_truth', source_id: 'default' },
+    ] as any);
+    try {
+      await engine.setConfig('search.rerank_abstain_floor', '0.5');
+      // rerankOn(0.9) → clears the floor → not abstained, but the count is still stamped.
+      const { meta } = await metaFor('loyalty', { reranker: rerankOn(0.9) });
+      expect(meta?.abstained).toBe(false);
+      expect((meta?.vector_result_count ?? 0)).toBeGreaterThan(0);
+      await engine.unsetConfig('search.rerank_abstain_floor');
+    } finally {
+      (engine as any).searchVector = orig;
+    }
+  });
+
+  test('a THROWING vector/embed failure takes the keyword-only path (vector_enabled=false), never abstains', async () => {
+    // The other degraded surface: a THROWN embed/vector failure is caught and
+    // downgraded to a SIGNALED keyword-only answer (vector_enabled:false), which
+    // returns BEFORE the abstain gate — so it must never abstain (a silent
+    // withhold), it returns whatever keyword found.
+    __setEmbedTransportForTests(async () => { throw new Error('embed gateway down'); });
+    try {
+      await engine.setConfig('search.rerank_abstain_floor', '0.5');
+      const { meta, results } = await metaFor('loyalty', { reranker: rerankOn(0.1) });
+      expect(meta?.vector_enabled).toBe(false);
+      expect(meta?.abstained).not.toBe(true);
+      expect(results.length).toBeGreaterThan(0); // keyword results served, not withheld
+      await engine.unsetConfig('search.rerank_abstain_floor');
+    } finally {
+      stubEmbeddings();
+    }
+  });
+});

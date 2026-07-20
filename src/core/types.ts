@@ -1273,12 +1273,18 @@ export interface HybridSearchMeta {
    */
   abstained?: boolean;
   /**
-   * v0.41 — bounded reason code accompanying `abstained: true`. Only
-   * `below_confidence_threshold` is emitted today; the wider set
-   * (insufficient_evidence, conflicting_evidence, no_visible_evidence) is
-   * reserved so consumers can switch on it without a later contract break.
+   * v0.41 — bounded reason code accompanying `abstained: true`.
+   * - `below_confidence_threshold`: recall was healthy, the reranker scored real
+   *   candidates, and none cleared the floor → a trustworthy "no confident answer".
+   * - `degraded_recall` (v0.42): vector recall returned NOTHING
+   *   (`vector_result_count === 0`) yet the code did not take the keyword-only
+   *   fallback, so the abstention is NOT a trustworthy no-answer — the candidate
+   *   pool itself was degraded (e.g. an HNSW cold/under-load miss). Consumers
+   *   should treat this as "ask again / transient", not "the Brain has nothing".
+   * The reserved set (insufficient_evidence, conflicting_evidence,
+   * no_visible_evidence) may be added without a contract break.
    */
-  abstain_reason?: 'below_confidence_threshold';
+  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall';
   /**
    * v0.41 — how many candidates existed at the moment the gate fired (i.e.
    * the reranked-set size before abstention emptied the response). Lets a
@@ -1286,6 +1292,17 @@ export interface HybridSearchMeta {
    * but none cleared the confidence floor".
    */
   candidate_count?: number;
+  /**
+   * v0.42 — recall-health signal: how many candidates the VECTOR recall stage
+   * returned (pre-fusion, pre-rerank). Emitted on every query that reached the
+   * vector path. This is the honest recall-health number that `vector_enabled`
+   * is not — `vector_enabled:true` only means "the vector code ran", NOT that it
+   * returned anything. A low/zero `vector_result_count` on an abstention is the
+   * fingerprint of a degraded-recall abstention (a transient miss surfacing as a
+   * silent "no answer") vs a genuine one. Lets monitoring flag abstains whose
+   * recall count sits well below the healthy baseline.
+   */
+  vector_result_count?: number;
   /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`

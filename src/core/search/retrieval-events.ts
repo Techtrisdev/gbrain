@@ -33,10 +33,14 @@ export interface RetrievalResponseMeta {
    * to detect abstention. Independent of fallback_fired; both may be true.
    */
   abstained?: boolean;
-  /** v0.41 — bounded reason code when abstained is true. */
-  abstain_reason?: 'below_confidence_threshold';
+  /** v0.41/v0.42 — bounded reason code when abstained is true. `degraded_recall`
+   *  = vector recall returned nothing (transient/degraded), NOT a trustworthy
+   *  no-answer; consumers should treat it as "ask again", not "the Brain lacks it". */
+  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall';
   /** v0.41 — candidate count at the moment the gate fired (before emptying). */
   candidate_count?: number;
+  /** v0.42 — vector recall count (recall-health signal; 0 on a degraded_recall abstain). */
+  vector_result_count?: number;
 }
 
 const responseMeta = new WeakMap<object, RetrievalResponseMeta>();
