@@ -538,7 +538,7 @@ export async function hybridSearch(
       // v0.40.x — hybridSearchCached suppresses this so it can record ONE row
       // per request with the correct cache.status (hit/miss/disabled).
       if (!opts?._suppressTelemetry) {
-        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount }, opts?.caller);
+        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount, abstained: meta.abstained === true }, opts?.caller);
       }
     } catch {
       // swallow — telemetry must never break the search hot path.
@@ -1000,7 +1000,39 @@ export async function hybridSearch(
     if (!hasEntity) processReorderApplied = applyProcessReorder(reranked);
   }
 
-  const sliced = reranked.slice(offset, offset + limit);
+  // v0.41 — rerank-abstention gate. When the reranker ran but NO candidate
+  // cleared the absolute confidence floor, the cross-encoder is telling us that
+  // nothing in the corpus actually answers this query. Return no answer instead
+  // of confident hub-noise (see ResolvedSearchMode.rerank_abstain_floor + the
+  // JARVIS/TARS contract). Design points, each load-bearing:
+  //   - Gate ONLY when the reranker was enabled AND produced at least one score.
+  //     With the reranker off there is no signal to gate on; on a silent
+  //     reranker fail-open (network/timeout → scores absent) we must NOT read
+  //     the absence of a signal as "no confident answer" and suppress results.
+  //   - Score on the MAX rerank across candidates, not position 0, so a
+  //     post-rerank process reorder can't mask a strong answer sitting just
+  //     below the top slot.
+  //   - Abstention is an explicit decision: `abstained` is set here, never
+  //     inferred downstream from an empty list (an empty list is also a genuine
+  //     no-match, a different outcome). Empty results carry candidate_count so a
+  //     consumer can tell "nothing retrieved" from "candidates existed, none
+  //     confident".
+  const abstainFloor = resolvedMode.rerank_abstain_floor;
+  let abstained = false;
+  let abstainCandidateCount = 0;
+  if (abstainFloor !== undefined && rerankerOpts.enabled) {
+    let maxRerank = Number.NEGATIVE_INFINITY;
+    for (const r of reranked) {
+      const rs = (r as { rerank_score?: number }).rerank_score;
+      if (typeof rs === 'number' && rs > maxRerank) maxRerank = rs;
+    }
+    if (Number.isFinite(maxRerank) && maxRerank < abstainFloor) {
+      abstained = true;
+      abstainCandidateCount = reranked.length;
+    }
+  }
+
+  const sliced = abstained ? [] : reranked.slice(offset, offset + limit);
   // v0.32.3 search-lite: budget enforcement at the main return path.
   // hybridSearchCached used to be the only place this fired; now bare
   // hybridSearch enforces it too so eval-replay + eval-longmemeval see
@@ -1017,6 +1049,12 @@ export async function hybridSearch(
     // v0.40.x — observability for the process reorder (suppression rate = process
     // queries where this stayed false). True only when a doc was actually moved.
     process_reorder_applied: processReorderApplied,
+    // v0.41 — abstention signal. Always emitted (explicit false on the normal
+    // path); reason + candidate_count only when actually abstaining.
+    abstained,
+    ...(abstained
+      ? { abstain_reason: 'below_confidence_threshold' as const, candidate_count: abstainCandidateCount }
+      : {}),
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
       : {}),
@@ -1179,6 +1217,18 @@ export async function hybridSearchCached(
         // cache hit implies same-mode). Needed so cache-hit telemetry buckets by
         // mode instead of falling back to 'unset'.
         mode: resolvedForCache.resolved_mode,
+        // v0.41 — carry abstention through the cache-HIT path. knobsHash (raf=)
+        // segregates abstain-on rows from abstain-off, so a stored abstention is
+        // only ever replayed under the same floor; without copying it here a
+        // replayed abstention would surface as [] with abstained:false — the
+        // empty-vs-abstention conflation TARS's contract forbids.
+        ...(hit.meta?.abstained
+          ? {
+              abstained: true as const,
+              abstain_reason: hit.meta.abstain_reason ?? ('below_confidence_threshold' as const),
+              candidate_count: hit.meta.candidate_count,
+            }
+          : { abstained: false as const }),
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
@@ -1199,7 +1249,7 @@ export async function hybridSearchCached(
       // no double-count; recordSearchTelemetry is non-blocking (in-memory bucket),
       // so no hot-path latency. Caller threaded for attribution parity with query/think.
       if (!opts?._suppressTelemetry) {
-        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length }, opts?.caller);
+        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length, abstained: cachedMeta.abstained === true }, opts?.caller);
       }
       return budgeted;
     }
@@ -1236,6 +1286,17 @@ export async function hybridSearchCached(
     // v0.40.x — mode for THIS request (already resolved for the knobsHash), so
     // the miss/disabled telemetry row buckets by mode instead of 'unset'.
     mode: resolvedForCache.resolved_mode,
+    // v0.41 — carry abstention up from the inner hybridSearch. innerMeta is the
+    // only place the gate's decision exists; this reconstructed meta explicitly
+    // enumerates fields and would otherwise drop it, so a miss-path abstention
+    // would reach the caller as [] with abstained:false.
+    ...(innerMeta?.abstained
+      ? {
+          abstained: true as const,
+          abstain_reason: innerMeta.abstain_reason ?? ('below_confidence_threshold' as const),
+          candidate_count: innerMeta.candidate_count,
+        }
+      : { abstained: false as const }),
     cache: { status: cacheStatus },
     ...(opts?.tokenBudget && opts.tokenBudget > 0
       ? { token_budget: budgetMeta }
@@ -1251,7 +1312,7 @@ export async function hybridSearchCached(
   // cache_miss-always-0 gap that pinned cache_hit_rate at a false ~100%. The hit
   // leg is recorded separately above (cachedMeta, cache.status='hit').
   if (!opts?._suppressTelemetry) {
-    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length }, opts?.caller);
+    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length, abstained: finalMeta.abstained === true }, opts?.caller);
   }
 
   // Best-effort writeback (skip when search returned empty so we don't

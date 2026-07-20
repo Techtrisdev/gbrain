@@ -1765,7 +1765,23 @@ const query: Operation = {
       resultCount: results.length,
       topResultSlug: results[0]?.slug ?? null,
     });
-    attachRetrievalResponseMeta(results, { query_id: queryId });
+    // v0.41 — surface the abstention decision to the caller via _meta.retrieval.
+    // The gate lives in hybridSearch; its verdict rides back on the captured
+    // meta. Only forwarded when it actually abstained, so a normal response's
+    // _meta stays byte-identical to pre-abstention behavior. Attaches to the
+    // (possibly empty) results object — the WeakMap keys on identity, and an
+    // empty array is still a distinct object dispatch.ts spreads meta off of.
+    attachRetrievalResponseMeta(
+      results,
+      retrievalMeta?.abstained
+        ? {
+            query_id: queryId,
+            abstained: true,
+            abstain_reason: retrievalMeta.abstain_reason ?? 'below_confidence_threshold',
+            candidate_count: retrievalMeta.candidate_count,
+          }
+        : { query_id: queryId },
+    );
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.

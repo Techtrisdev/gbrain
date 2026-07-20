@@ -23,6 +23,20 @@ export interface RetrievalResponseMeta {
    * `query`/hybrid path and on non-fallback keyword hits.
    */
   fallback_fired?: boolean;
+  /**
+   * v0.41 — true iff the rerank-abstention gate returned NO answer because no
+   * candidate cleared search.rerank_abstain_floor. Surfaced to the caller as
+   * `_meta.retrieval.abstained` (dispatch.ts spreads this whole object). An
+   * abstained response has an empty result list BUT is a deliberate "no
+   * confident answer" decision, not a transport error (isError stays false) and
+   * not a plain no-match — the proxy/agent uses this flag, never an empty list,
+   * to detect abstention. Independent of fallback_fired; both may be true.
+   */
+  abstained?: boolean;
+  /** v0.41 — bounded reason code when abstained is true. */
+  abstain_reason?: 'below_confidence_threshold';
+  /** v0.41 — candidate count at the moment the gate fired (before emptying). */
+  candidate_count?: number;
 }
 
 const responseMeta = new WeakMap<object, RetrievalResponseMeta>();
