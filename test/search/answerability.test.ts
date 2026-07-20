@@ -37,11 +37,18 @@ describe('judgeAnswerability (stubbed judge)', () => {
     expect(v.judged).toBe(false);
   });
 
-  test('judge throwing → error, fail-open', async () => {
-    const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => { throw new Error('down'); } });
+  test('judge throwing → error, fail-open, error_detail carries the message', async () => {
+    const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => { throw new Error('gateway 429'); } });
     expect(v.outcome).toBe('error');
     expect(v.reject).toBe(false);
     expect(v.judged).toBe(false);
+    expect(v.error_detail).toContain('gateway 429'); // v0.43.1: cause is visible, not swallowed
+  });
+
+  test('unparseable verdict → error_detail shows what the model actually said', async () => {
+    const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => 'I think probably yes' });
+    expect(v.outcome).toBe('error');
+    expect(v.error_detail).toContain('unparseable');
   });
 
   test('verdict is cached (exact query+chunk) and replayed', async () => {

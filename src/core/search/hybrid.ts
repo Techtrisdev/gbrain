@@ -1094,6 +1094,7 @@ export async function hybridSearch(
   const guardMode = resolvedMode.answerability_guard;
   let answerabilityOutcome: AnswerabilityOutcome | undefined;
   let answerabilityWouldAbstain = false;       // judge said NO (regardless of mode)
+  let answerabilityError: string | undefined;  // v0.43.1 diagnostic on outcome 'error'
   let answerabilityDiscardedSlug: string | undefined;   // #2 slug when a NO fired
   let answerabilityDiscardedScore: number | undefined;
   if (
@@ -1113,6 +1114,7 @@ export async function hybridSearch(
         const verdict = await judgeAnswerability(query, top.chunk_text || top.title || '', { judgeFn: opts?.answerabilityJudgeFn });
         answerabilityOutcome = verdict.outcome;
         answerabilityWouldAbstain = verdict.reject;
+        answerabilityError = verdict.error_detail;
         if (verdict.reject) {
           const second = reranked[1] as { slug?: string; rerank_score?: number } | undefined;
           answerabilityDiscardedSlug = second?.slug;
@@ -1180,6 +1182,9 @@ export async function hybridSearch(
       ? {
           answerability_outcome: answerabilityOutcome,
           answerability_would_abstain: answerabilityWouldAbstain,
+          ...(answerabilityError !== undefined
+            ? { answerability_error: answerabilityError }
+            : {}),
           ...(answerabilityDiscardedSlug !== undefined
             ? { answerability_discarded_slug: answerabilityDiscardedSlug }
             : {}),
@@ -1387,6 +1392,9 @@ export async function hybridSearchCached(
           ? {
               answerability_outcome: hit.meta.answerability_outcome,
               answerability_would_abstain: hit.meta.answerability_would_abstain,
+              ...(hit.meta.answerability_error !== undefined
+                ? { answerability_error: hit.meta.answerability_error }
+                : {}),
               ...(hit.meta.answerability_discarded_slug !== undefined
                 ? { answerability_discarded_slug: hit.meta.answerability_discarded_slug }
                 : {}),
@@ -1478,6 +1486,9 @@ export async function hybridSearchCached(
       ? {
           answerability_outcome: innerMeta.answerability_outcome,
           answerability_would_abstain: innerMeta.answerability_would_abstain,
+          ...(innerMeta.answerability_error !== undefined
+            ? { answerability_error: innerMeta.answerability_error }
+            : {}),
           ...(innerMeta.answerability_discarded_slug !== undefined
             ? { answerability_discarded_slug: innerMeta.answerability_discarded_slug }
             : {}),

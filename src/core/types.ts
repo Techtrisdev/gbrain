@@ -1332,6 +1332,9 @@ export interface HybridSearchMeta {
    * unavailable/timeout share means the guard is silently disabled, not protecting.
    */
   answerability_outcome?: 'answered' | 'not_answered' | 'error' | 'timeout' | 'unavailable';
+  /** v0.43.1 — diagnostic for outcome 'error' (thrown message or unparseable:<raw>),
+   *  so a shadow run reveals WHY the judge failed. Never contains query/passage text. */
+  answerability_error?: string;
   /** v0.43 — true iff the judge said the top result does NOT answer (regardless of
    *  mode). In shadow this is the "would-have-abstained" signal; in enforce it is
    *  why `abstained` + `abstain_reason:'not_answerable'` fired. */
