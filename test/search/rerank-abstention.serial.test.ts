@@ -206,7 +206,13 @@ describe('recall-health signal (vector_result_count)', () => {
     await engine.setConfig('search.rerank_abstain_floor', '0.5');
     const { meta } = await metaFor('loyalty', { reranker: rerankOn(0.1) });
     expect(meta?.abstained).toBe(true);
+    // The premise of the defect: it looks identical to a healthy abstain —
+    // vector_enabled:true — yet vector recall returned nothing. The count is the
+    // only tell, and it sits below the requested k (0 << k) = degraded.
+    expect(meta?.vector_enabled).toBe(true);
     expect(meta?.vector_result_count).toBe(0);
+    expect((meta?.vector_requested_k ?? 0)).toBeGreaterThan(0);
+    expect((meta?.vector_result_count ?? 0)).toBeLessThan(meta?.vector_requested_k ?? 0);
     await engine.unsetConfig('search.rerank_abstain_floor');
   });
 
@@ -223,7 +229,10 @@ describe('recall-health signal (vector_result_count)', () => {
       // rerankOn(0.9) → clears the floor → not abstained, but the count is still stamped.
       const { meta } = await metaFor('loyalty', { reranker: rerankOn(0.9) });
       expect(meta?.abstained).toBe(false);
-      expect((meta?.vector_result_count ?? 0)).toBeGreaterThan(0);
+      // Exactly the 2 stubbed vector rows flow through to the count (capture is
+      // pre-fusion/dedup/rerank) — toBe(2), not >0, so a future double-counting
+      // regression (e.g. summing image/expansion lists) fails here.
+      expect(meta?.vector_result_count).toBe(2);
       await engine.unsetConfig('search.rerank_abstain_floor');
     } finally {
       (engine as any).searchVector = orig;
