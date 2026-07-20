@@ -37,6 +37,24 @@ describe('judgeAnswerability (stubbed judge)', () => {
     expect(v.judged).toBe(false);
   });
 
+  test('verbose NO ("NO\\n\\nThe passage discusses…") parses as not_answered (the live-diagnosed case)', async () => {
+    const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => 'NO\n\nThe passage discusses update actions, not approval gates.' });
+    expect(v.outcome).toBe('not_answered');
+    expect(v.reject).toBe(true);
+    expect(v.judged).toBe(true);
+  });
+
+  test('verbose YES parses as answered', async () => {
+    const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => 'YES. The passage states the rules directly.' });
+    expect(v.outcome).toBe('answered');
+  });
+
+  test('soft refusal "Not enough information" → error (first token "not" != "no"), NOT a manufactured abstain', async () => {
+    const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => 'Not enough information to say.' });
+    expect(v.outcome).toBe('error');
+    expect(v.reject).toBe(false);
+  });
+
   test('judge throwing → error, fail-open, error_detail carries the message', async () => {
     const v = await judgeAnswerability('q', 'passage', { judgeFn: async () => { throw new Error('gateway 429'); } });
     expect(v.outcome).toBe('error');

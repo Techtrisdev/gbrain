@@ -56,14 +56,17 @@ const SYSTEM_PROMPT =
   'Reply with exactly one word: YES or NO.';
 
 function parseVerdict(raw: string): 'answered' | 'not_answered' | 'error' {
-  // EXACT match (not startsWith): a verbose reply like "No, because there is no
-  // pricing…" normalizes to "nobecause…" and must fail-open to 'error', NOT
-  // manufacture a NO abstention. maxTokens:4 + the one-word prompt keep real
-  // verdicts to "YES"/"NO" (which normalize to exactly 'yes'/'no').
-  const v = raw.trim().toLowerCase().replace(/[^a-z]+/g, '');
-  if (v === 'yes') return 'answered';
-  if (v === 'no') return 'not_answered';
-  return 'error'; // unparseable / verbose → fail-open
+  // Match on the FIRST whitespace-delimited token. Haiku obeys "reply YES or NO"
+  // but often adds an explanation: "NO\n\nThe passage discusses…" — the verdict
+  // is the first token, and requiring the WHOLE reply to equal yes/no wrongly
+  // rejected those (the live shadow-diagnosed bug: outcome 'error' on a correct
+  // NO). First-token match also preserves the F5 guard against a soft refusal:
+  // "Not enough information" → first token "not" ≠ "no" → error (fail-open), never
+  // a manufactured abstain. Strip trailing punctuation only (YES. / NO,).
+  const first = raw.trim().split(/\s+/, 1)[0]?.toLowerCase().replace(/[^a-z]+/g, '') ?? '';
+  if (first === 'yes') return 'answered';
+  if (first === 'no') return 'not_answered';
+  return 'error'; // no clean leading verdict → fail-open
 }
 
 /** Content-hash cache key: (query, chunk text). Chunk-content-keyed (NOT slug)
