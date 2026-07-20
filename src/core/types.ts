@@ -891,6 +891,14 @@ export interface SearchOpts {
    */
   floorRatio?: number;
   /**
+   * v0.41 — per-call rerank-abstention floor (mirrors the search.rerank_abstain_floor
+   * config key). Number in [0, 1] or undefined (default = off). Threaded into the
+   * SAME resolveSearchMode call that feeds both the gate and knobsHash, so gate and
+   * cache key can never disagree. Config is the production surface; this exists for
+   * callers/tests that set it per call.
+   */
+  rerankAbstainFloor?: number;
+  /**
    * v0.36 cross-modal wave: route this search through the multimodal
    * embedding space (Voyage multimodal-3 by default).
    *
@@ -1253,6 +1261,31 @@ export interface HybridSearchMeta {
    * keyword-miss rate. Set by the `search` handler in a later unit.
    */
   fallback_fired?: boolean;
+  /**
+   * v0.41 — rerank-abstention gate. True iff the reranker ran, the top
+   * reranked result fell below `search.rerank_abstain_floor`, and the server
+   * therefore returned NO answer rather than confident hub-noise. Independent
+   * of `fallback_fired`: an exact-search miss can trigger the semantic rescue
+   * (fallback_fired) and STILL abstain if the rescue is not confident, so both
+   * may be true on one call. Set EXPLICITLY by the gate after final ranking —
+   * an empty result list on its own never sets this (an empty list can also be
+   * a genuine exact-lexical miss, which is a different, non-abstention outcome).
+   */
+  abstained?: boolean;
+  /**
+   * v0.41 — bounded reason code accompanying `abstained: true`. Only
+   * `below_confidence_threshold` is emitted today; the wider set
+   * (insufficient_evidence, conflicting_evidence, no_visible_evidence) is
+   * reserved so consumers can switch on it without a later contract break.
+   */
+  abstain_reason?: 'below_confidence_threshold';
+  /**
+   * v0.41 — how many candidates existed at the moment the gate fired (i.e.
+   * the reranked-set size before abstention emptied the response). Lets a
+   * consumer distinguish "nothing retrieved at all" from "candidates existed
+   * but none cleared the confidence floor".
+   */
+  candidate_count?: number;
   /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`

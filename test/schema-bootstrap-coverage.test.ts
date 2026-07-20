@@ -745,6 +745,14 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // brain — a pre-v101 brain never reaches it before v101 applies — so no downstream
   // filter breaks. Bootstrap probe would be pure overhead.
   'search_telemetry.fallback_fired',
+  // v0.41 (migration v102 search_telemetry_abstained) — same posture as
+  // search_telemetry.fallback_fired above. search_telemetry is migration-created
+  // (v57), NOT in PGLITE_SCHEMA_SQL, so there is no forward reference to defend.
+  // v102 adds abstained INTEGER NOT NULL DEFAULT 0 (additive, defaulted); its lone
+  // consumer (telemetry.ts flush INSERT / readSearchStats SUM) runs only on a
+  // fully-migrated brain, so no downstream filter breaks. Bootstrap probe would be
+  // pure overhead.
+  'search_telemetry.abstained',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

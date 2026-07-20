@@ -52,9 +52,10 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // graph-off; cross-pack contamination structurally impossible).
     // v0.40.3.0 (D8): 4→5 to fold contextual_retrieval + kill switch,
     // sequenced behind salem's v=4 graph-signals.
-    // Source now 7 in search/mode.ts (v=6 process_reorder, v=7
-    // keyword_semantic_fallback). See search-mode.test.ts.
-    expect(KNOBS_HASH_VERSION).toBe(7);
+    // Source now 8 in search/mode.ts (v=6 process_reorder, v=7
+    // keyword_semantic_fallback, v=8 rerank_abstain_floor — abstain-on/off
+    // return different result sets). See search-mode.test.ts.
+    expect(KNOBS_HASH_VERSION).toBe(8);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

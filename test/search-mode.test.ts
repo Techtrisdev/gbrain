@@ -69,6 +69,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
+      rerank_abstain_floor: undefined,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: false,
       ...CR_DISABLED_DEFAULT,
@@ -95,6 +96,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
+      rerank_abstain_floor: undefined,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -119,6 +121,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_top_n_out: null,
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
+      rerank_abstain_floor: undefined,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -322,7 +325,10 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // embedding spaces. Sequenced behind salem's v=4 graph-signals work.
     // v=6 (v0.40.x): process_reorder_enabled (pr=) folded in — reorder changes order.
     // v=7 (v0.42): keyword_semantic_fallback (ksf=) folded in — fallback changes the result set.
-    expect(KNOBS_HASH_VERSION).toBe(7);
+    // v=8 (v0.41 abstention): rerank_abstain_floor (raf=) folded in — an abstain-on lookup
+    // returns [] where abstain-off returns the top hits, so it changes the result set and a
+    // write under one setting must never be served to the other.
+    expect(KNOBS_HASH_VERSION).toBe(8);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -347,6 +353,21 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
     const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { floor_ratio: 0.85 } }));
     expect(a).toBe(b);
+  });
+
+  test('v=8: rerank_abstain_floor set vs unset produces DIFFERENT hashes (abstention cache isolation)', () => {
+    // An abstain-on lookup returns [] where abstain-off returns the top hits, so
+    // an abstain-off write must never be served to an abstain-on read (and
+    // vice-versa on rollback). Same cache-correctness class as floor_ratio.
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced' }));
+    const on = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { rerank_abstain_floor: 0.5 } }));
+    expect(off).not.toBe(on);
+  });
+
+  test('v=8: different rerank_abstain_floor values produce different hashes', () => {
+    const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { rerank_abstain_floor: 0.5 } }));
+    const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { rerank_abstain_floor: 0.6 } }));
+    expect(a).not.toBe(b);
   });
 
   test('v0.42: keyword_semantic_fallback on vs off produces DIFFERENT hashes (result-set contamination prevention)', () => {

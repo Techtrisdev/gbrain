@@ -114,6 +114,30 @@ export interface ModeBundle {
    */
   floor_ratio: number | undefined;
 
+  /**
+   * v0.41 — rerank-abstention floor. `undefined` = OFF (default; the Brain
+   * always returns its top results, prior behavior). When set to a number in
+   * [0, 1], hybridSearch returns NO answer (empty list + abstained meta)
+   * whenever the reranker ran and the top reranked score is below this floor —
+   * i.e. the cross-encoder found nothing that actually answers the question, so
+   * the Brain refuses to serve confident hub-noise. Distinct from `floor_ratio`
+   * (a RELATIVE gate on boost stages): this is an ABSOLUTE confidence floor on
+   * the final top result. Only fires when the reranker is enabled (no rerank
+   * score → no abstention) and only on TEXT-modality queries (the text
+   * cross-encoder can't score image chunks). Validated operating point ~0.5
+   * (JARVIS real-traffic eval: real answers reranked 0.63–0.98, junk ≤0.12).
+   *
+   * SCOPE: this gates EVERY hybridSearch consumer, not just the `query` op —
+   * think/gather, whoknows, and brainstorm also empty out when the floor is on
+   * (they don't read the abstained meta, so they simply see no results). That's
+   * a per-surface behavior change to weigh before ENABLING the floor.
+   *
+   * MODEL-COUPLED: 0.5 is calibrated to the current reranker's score scale.
+   * Re-tune when reranker_model changes (the cache is safe — rrm= is in the
+   * knobsHash — but the gate decision is not model-aware).
+   */
+  rerank_abstain_floor: number | undefined;
+
   // v0.36 cross-modal wave knobs (D2 + D3 + D6 + D8 + D13 + LLM-intent).
   // All three mode bundles default these to the same values — cross-modal
   // is opt-in per-call (D6 weighting), opt-in per-brain (D8 unified flags),
@@ -257,6 +281,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
     // (TODOS.md) gates any default flip.
     floor_ratio: undefined,
+    // v0.41 — rerank-abstention floor; undefined = OFF for all bundles
+    // (preserves prior behavior bit-for-bit). Operator opts in per-brain.
+    rerank_abstain_floor: undefined,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -301,6 +328,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
     // (TODOS.md) gates any default flip.
     floor_ratio: undefined,
+    // v0.41 — rerank-abstention floor; undefined = OFF for all bundles
+    // (preserves prior behavior bit-for-bit). Operator opts in per-brain.
+    rerank_abstain_floor: undefined,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -347,6 +377,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     // v0.35.6.0 — undefined for all three bundles; the per-corpus ablation
     // (TODOS.md) gates any default flip.
     floor_ratio: undefined,
+    // v0.41 — rerank-abstention floor; undefined = OFF for all bundles
+    // (preserves prior behavior bit-for-bit). Operator opts in per-brain.
+    rerank_abstain_floor: undefined,
     // v0.36 cross-modal defaults (same across all modes — opt-in)
     cross_modal_both_text_weight: 0.6,
     cross_modal_both_image_weight: 0.4,
@@ -401,6 +434,8 @@ export interface SearchKeyOverrides {
   reranker_timeout_ms?: number;
   // v0.35.6.0 — floor-ratio gate override.
   floor_ratio?: number;
+  // v0.41 — rerank-abstention floor override.
+  rerank_abstain_floor?: number;
   // v0.36 cross-modal overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -443,6 +478,8 @@ export interface SearchPerCallOpts {
   reranker_timeout_ms?: number;
   // v0.35.6.0 — floor-ratio per-call override.
   floor_ratio?: number;
+  // v0.41 — rerank-abstention floor per-call override.
+  rerank_abstain_floor?: number;
   // v0.36 cross-modal per-call overrides
   cross_modal_both_text_weight?: number;
   cross_modal_both_image_weight?: number;
@@ -520,6 +557,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     reranker_timeout_ms: pick('reranker_timeout_ms'),
     // v0.35.6.0 — floor-ratio resolved via the same pick chain.
     floor_ratio: pick('floor_ratio'),
+    // v0.41 — rerank-abstention floor resolved via the same pick chain.
+    rerank_abstain_floor: pick('rerank_abstain_floor'),
     // v0.36 cross-modal knobs
     cross_modal_both_text_weight: pick('cross_modal_both_text_weight'),
     cross_modal_both_image_weight: pick('cross_modal_both_image_weight'),
@@ -619,7 +658,7 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // v0.42 bump 6→7: keyword_semantic_fallback added under v=7 (append-only). A
 // fallback-on write changes the RESULT SET of a keyword search (empty → semantic
 // neighbors), so it must not be served to a fallback-off lookup.
-export const KNOBS_HASH_VERSION = 7;
+export const KNOBS_HASH_VERSION = 8;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -722,6 +761,11 @@ export function knobsHash(
     // keyword search (empty → semantic neighbors), so a fallback-on write must
     // not be served to a fallback-off lookup (and vice-versa on rollback).
     `ksf=${knobs.keyword_semantic_fallback ? 1 : 0}`,
+    // v=8 (append-only): rerank_abstain_floor changes the RESULT SET — an
+    // abstain-on lookup returns [] where abstain-off returns the top hits, so a
+    // write made under one setting must never be served to the other. 4-decimal
+    // precision so 0.50 and 0.501 differ; undefined uses literal 'none'.
+    `raf=${knobs.rerank_abstain_floor === undefined ? 'none' : knobs.rerank_abstain_floor.toFixed(4)}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -819,6 +863,16 @@ export function loadOverridesFromConfig(
     if (Number.isFinite(n) && n >= 0 && n <= 1) out.floor_ratio = n;
   }
 
+  // v0.41 — rerank-abstention floor config key. Accepts a number in [0, 1];
+  // out-of-range or malformed values silently fall through (feature stays OFF),
+  // so a bad config value can never start suppressing results. The gate in
+  // hybridSearch also treats undefined as "no abstention" — defense in depth.
+  const raf = get('search.rerank_abstain_floor');
+  if (raf !== undefined) {
+    const n = parseFloat(raf);
+    if (Number.isFinite(n) && n >= 0 && n <= 1) out.rerank_abstain_floor = n;
+  }
+
   // v0.36 cross-modal overrides (D3 registry)
   const cmbt = get('search.cross_modal.both_mode_text_weight');
   if (cmbt !== undefined) {
@@ -900,6 +954,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.reranker.timeout_ms',
   // v0.35.6.0 — floor-ratio gate
   'search.floor_ratio',
+  // v0.41 — rerank-abstention floor
+  'search.rerank_abstain_floor',
   // v0.36 cross-modal keys (D3)
   'search.cross_modal.both_mode_text_weight',
   'search.cross_modal.both_mode_image_weight',

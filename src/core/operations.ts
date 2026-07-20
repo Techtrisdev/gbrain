@@ -1481,6 +1481,13 @@ const search: Operation = {
     // this envelope, not inside hybridSearch (its cache-rebuild drops labels).
     const ksfRaw = await ctx.engine.getConfig('search.keyword_semantic_fallback').catch(() => null);
     const fallbackEnabled = ksfRaw === '1' || (ksfRaw ?? '').toLowerCase() === 'true';
+    // v0.41 — capture the rescue's meta so an abstention decided INSIDE the
+    // semantic rescue survives to the caller + telemetry. fallback_fired and
+    // abstained are independent: a keyword miss can trigger the rescue AND the
+    // rescue can still abstain (nothing confident) — the search tool is JARVIS's
+    // dominant path, so dropping this here would leave abstention inert for most
+    // real traffic. Stays null when the keyword hit (rescue thunk never runs).
+    let rescueMeta: HybridSearchMeta | null = null;
     const { results, fallback_fired } = await applyKeywordSemanticFallback(
       keywordResults,
       fallbackEnabled,
@@ -1489,7 +1496,7 @@ const search: Operation = {
         offset: (p.offset as number) || 0,
         caller: { client: ctx.auth?.clientName, sourceId: ctx.auth?.sourceId ?? ctx.sourceId },
         ...sourceScopeOpts(ctx),
-        onMeta: () => {},
+        onMeta: (m) => { rescueMeta = m; },
         // TECH-2740 — this rescue is a keyword-op event, NOT a separate semantic
         // `query` call, so suppress hybridSearchCached's own semantic-mode telemetry
         // row. Otherwise one rescued call double-counts (keyword bucket + a semantic
@@ -1513,13 +1520,18 @@ const search: Operation = {
     // fallback_fired is the rescue overlay, so the true keyword-miss rate stays
     // observable in the rollup (sum_results = keyword hits; fallback_fired =
     // misses rescued). The rescued count still persists per-event in retrieval_events.
+    // v0.41 — an abstention decided inside the semantic rescue is recorded on
+    // this keyword bucket alongside fallback_fired (both signals kept together,
+    // per the TARS contract). Only true when the rescue actually ran and returned
+    // no-confident-answer — a pure keyword exact-miss with no rescue never sets it.
+    const rescueAbstained = (rescueMeta as HybridSearchMeta | null)?.abstained === true;
     recordSearchTelemetry(ctx.engine, {
       vector_enabled: false,
       detail_resolved: null,
       expansion_applied: false,
       intent,
       mode: 'keyword',
-    }, { results_count: keywordResults.length, fallback_fired }, {
+    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained }, {
       client: ctx.auth?.clientName,
       sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
     });
@@ -1534,10 +1546,22 @@ const search: Operation = {
       resultCount: results.length,
       topResultSlug: results[0]?.slug ?? null,
     });
-    attachRetrievalResponseMeta(
-      results,
-      fallback_fired ? { query_id: queryId, fallback_fired: true } : { query_id: queryId },
-    );
+    // v0.41 — surface both independent signals. fallback_fired says the results
+    // are a semantic rescue of a keyword miss; abstained says the rescue found
+    // nothing confident and returned no answer (empty list, isError stays false).
+    // A consumer must read abstained, never the empty list, to detect abstention.
+    const rescueMetaFinal = rescueMeta as HybridSearchMeta | null;
+    attachRetrievalResponseMeta(results, {
+      query_id: queryId,
+      ...(fallback_fired ? { fallback_fired: true } : {}),
+      ...(rescueAbstained
+        ? {
+            abstained: true,
+            abstain_reason: rescueMetaFinal?.abstain_reason ?? 'below_confidence_threshold',
+            candidate_count: rescueMetaFinal?.candidate_count,
+          }
+        : {}),
+    });
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Fire-and-forget;
     // results already returned by engine, this just marks them as user-surfaced
@@ -1765,7 +1789,23 @@ const query: Operation = {
       resultCount: results.length,
       topResultSlug: results[0]?.slug ?? null,
     });
-    attachRetrievalResponseMeta(results, { query_id: queryId });
+    // v0.41 — surface the abstention decision to the caller via _meta.retrieval.
+    // The gate lives in hybridSearch; its verdict rides back on the captured
+    // meta. Only forwarded when it actually abstained, so a normal response's
+    // _meta stays byte-identical to pre-abstention behavior. Attaches to the
+    // (possibly empty) results object — the WeakMap keys on identity, and an
+    // empty array is still a distinct object dispatch.ts spreads meta off of.
+    attachRetrievalResponseMeta(
+      results,
+      retrievalMeta?.abstained
+        ? {
+            query_id: queryId,
+            abstained: true,
+            abstain_reason: retrievalMeta.abstain_reason ?? 'below_confidence_threshold',
+            candidate_count: retrievalMeta.candidate_count,
+          }
+        : { query_id: queryId },
+    );
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
     // search handler — fire-and-forget, internal callers bypass this path.

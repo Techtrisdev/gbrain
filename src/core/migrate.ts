@@ -4733,6 +4733,32 @@ export const MIGRATIONS: Migration[] = [
       return rows.length === 1;
     },
   },
+  {
+    version: 102,
+    name: 'search_telemetry_abstained',
+    // v0.41 — persist the rerank-abstention signal. `abstained` counts, per
+    // (date,mode,intent,client,source_id) rollup bucket, how many query calls the
+    // gate returned NO answer for because no candidate cleared the default-off
+    // search.rerank_abstain_floor. abstention_rate = abstained / count; unlike
+    // fallback_fired it is a HEALTH metric (nonzero is good — the Brain refused to
+    // manufacture confidence), so it's monitored for deltas not driven to zero.
+    // Additive, defaulted, idempotent — safe on existing rows.
+    idempotent: true,
+    sql: `
+      ALTER TABLE search_telemetry
+        ADD COLUMN IF NOT EXISTS abstained INTEGER NOT NULL DEFAULT 0;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'search_telemetry'
+            AND column_name = 'abstained'`,
+      );
+      return rows.length === 1;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
