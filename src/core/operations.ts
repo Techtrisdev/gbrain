@@ -1559,6 +1559,8 @@ const search: Operation = {
             abstained: true,
             abstain_reason: rescueMetaFinal?.abstain_reason ?? 'below_confidence_threshold',
             candidate_count: rescueMetaFinal?.candidate_count,
+            vector_result_count: rescueMetaFinal?.vector_result_count,
+            vector_requested_k: rescueMetaFinal?.vector_requested_k,
           }
         : {}),
     });
@@ -1803,6 +1805,8 @@ const query: Operation = {
             abstained: true,
             abstain_reason: retrievalMeta.abstain_reason ?? 'below_confidence_threshold',
             candidate_count: retrievalMeta.candidate_count,
+            vector_result_count: retrievalMeta.vector_result_count,
+            vector_requested_k: retrievalMeta.vector_requested_k,
           }
         : { query_id: queryId },
     );

@@ -1273,19 +1273,49 @@ export interface HybridSearchMeta {
    */
   abstained?: boolean;
   /**
-   * v0.41 — bounded reason code accompanying `abstained: true`. Only
-   * `below_confidence_threshold` is emitted today; the wider set
-   * (insufficient_evidence, conflicting_evidence, no_visible_evidence) is
-   * reserved so consumers can switch on it without a later contract break.
+   * v0.41 — bounded reason code accompanying `abstained: true`.
+   * NOTE: `below_confidence_threshold` is the ONLY value emitted today, and it is
+   * stamped on EVERY abstention — it does NOT by itself imply recall was healthy.
+   * To tell a genuine no-answer from a degraded-recall abstention, compare
+   * `vector_result_count` against `vector_requested_k` (below); do not rely on
+   * the reason code for that distinction yet. `degraded_recall` and the wider set
+   * (insufficient_evidence, conflicting_evidence, no_visible_evidence) are
+   * RESERVED — declared for a future classifier but NOT currently emitted, so
+   * consumers must not branch on them expecting a live signal.
    */
-  abstain_reason?: 'below_confidence_threshold';
+  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall';
   /**
    * v0.41 — how many candidates existed at the moment the gate fired (i.e.
    * the reranked-set size before abstention emptied the response). Lets a
    * consumer distinguish "nothing retrieved at all" from "candidates existed
-   * but none cleared the confidence floor".
+   * but none cleared the confidence floor". Distinct from `vector_result_count`:
+   * this is the post-fusion/dedup/topNIn set the reranker actually SCORED, which
+   * can be far smaller than the raw vector recall (per-page dedup + topNIn caps).
    */
   candidate_count?: number;
+  /**
+   * v0.42 — recall-health signal: total candidates the VECTOR recall stage
+   * returned, summed across query-expansion variant lists (pre-fusion, pre-dedup).
+   * This is the honest recall number `vector_enabled` is not — `vector_enabled:true`
+   * only means the vector code RAN, not that it returned anything. Compare against
+   * `vector_requested_k`: `vector_result_count` well below `vector_requested_k`
+   * (when the scoped corpus has >= k chunks) is the fingerprint of a DEGRADED
+   * recall — a transient/partial miss (e.g. HNSW cold/under-load) that would
+   * otherwise surface as a silent "no answer". `=== 0` is total vector failure.
+   * Caveats for baseline use (not the abstain check): with expansion ON it SUMS
+   * across N variants (same chunk counted N times); on 'both' modality it includes
+   * the image list. Neither affects the text-only abstain path (the gate is
+   * text-only and the image list is not appended there).
+   */
+  vector_result_count?: number;
+  /**
+   * v0.42 — the per-list vector recall LIMIT requested (min(limit*2, MAX)). The
+   * denominator for `vector_result_count`: a healthy text query returns exactly
+   * this many rows whenever the scoped corpus has >= this many chunks, so
+   * `vector_result_count < vector_requested_k` (on a single-list text query) flags
+   * a partial recall miss per-request, with no baseline needed.
+   */
+  vector_requested_k?: number;
   /**
    * v0.32.x (search-lite): the intent the zero-LLM classifier inferred for
    * this query. Surfaced for debugging — agents and the `gbrain query`

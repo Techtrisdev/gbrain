@@ -827,6 +827,18 @@ export async function hybridSearch(
     }
   }
 
+  // v0.42 — recall-health signal. Total candidates the vector recall returned
+  // (summed across query-expansion variant lists; pre-fusion, pre-dedup).
+  // Distinct from `vector_enabled` (which only says the code path ran): a THROWN
+  // embed/vector failure leaves vectorLists empty and is handled by the signaled
+  // keyword-only path below, but a NON-throwing incomplete recall (e.g. an HNSW
+  // cold/under-load miss that drops a thin page) leaves a short list that proceeds
+  // to the abstain gate and can silently withhold a real answer. Emitted alongside
+  // `vector_requested_k` (innerLimit) so a consumer can flag `count < requested_k`
+  // as a degraded abstention per-request — no baseline needed. NOT auto-classified
+  // into a reason code here: the discrimination lives in the count/k comparison.
+  const vectorResultCount = vectorLists.reduce((n, l) => n + l.length, 0);
+
   if (vectorLists.length === 0) {
     // Embed/vector failed silently; record that vector did not run.
     // v0.29.1 codex pass-2 #4: this is the third return path. Apply
@@ -1066,8 +1078,21 @@ export async function hybridSearch(
     // v0.41 — abstention signal. Always emitted (explicit false on the normal
     // path); reason + candidate_count only when actually abstaining.
     abstained,
+    // v0.42 — recall-health signal + its denominator, emitted on every vector-path
+    // query. `count < requested_k` (corpus >= k) flags a degraded/partial recall
+    // per-request; `count === 0` is total vector failure.
+    vector_result_count: vectorResultCount,
+    vector_requested_k: innerLimit,
     ...(abstained
-      ? { abstain_reason: 'below_confidence_threshold' as const, candidate_count: abstainCandidateCount }
+      ? {
+          // v0.42 — the recall-health discrimination lives in the count/k pair
+          // above, NOT a per-request reason code: no fixed count threshold cleanly
+          // separates a partial-miss abstain from a genuine one without the k
+          // denominator, and `degraded_recall` stays RESERVED for a later
+          // classifier. Reason is always below_confidence_threshold today.
+          abstain_reason: 'below_confidence_threshold' as const,
+          candidate_count: abstainCandidateCount,
+        }
       : {}),
     ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
       ? { token_budget: budgetMeta }
@@ -1251,6 +1276,15 @@ export async function hybridSearchCached(
               candidate_count: hit.meta.candidate_count,
             }
           : { abstained: false as const }),
+        // v0.42 — carry the recall-health signal (+ its denominator) through the
+        // cache-HIT path. Note: a hit replays the WRITE-time count, so it reflects
+        // the original computation, not this request's recall.
+        ...(hit.meta?.vector_result_count !== undefined
+          ? { vector_result_count: hit.meta.vector_result_count }
+          : {}),
+        ...(hit.meta?.vector_requested_k !== undefined
+          ? { vector_requested_k: hit.meta.vector_requested_k }
+          : {}),
         cache: {
           status: 'hit',
           similarity: cacheSimilarity,
@@ -1319,6 +1353,14 @@ export async function hybridSearchCached(
           candidate_count: innerMeta.candidate_count,
         }
       : { abstained: false as const }),
+    // v0.42 — carry the recall-health signal (+ its denominator) up from the inner
+    // hybridSearch (these reconstructed metas enumerate fields, so unlisted ones drop).
+    ...(innerMeta?.vector_result_count !== undefined
+      ? { vector_result_count: innerMeta.vector_result_count }
+      : {}),
+    ...(innerMeta?.vector_requested_k !== undefined
+      ? { vector_requested_k: innerMeta.vector_requested_k }
+      : {}),
     cache: { status: cacheStatus },
     ...(opts?.tokenBudget && opts.tokenBudget > 0
       ? { token_budget: budgetMeta }

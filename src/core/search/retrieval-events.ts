@@ -33,10 +33,19 @@ export interface RetrievalResponseMeta {
    * to detect abstention. Independent of fallback_fired; both may be true.
    */
   abstained?: boolean;
-  /** v0.41 — bounded reason code when abstained is true. */
-  abstain_reason?: 'below_confidence_threshold';
-  /** v0.41 — candidate count at the moment the gate fired (before emptying). */
+  /** v0.41 — bounded reason code when abstained is true. Only
+   *  `below_confidence_threshold` is emitted today (stamped on ALL abstentions —
+   *  it does NOT imply healthy recall). `degraded_recall` is RESERVED, not yet
+   *  emitted — to spot a degraded abstain, compare vector_result_count vs
+   *  vector_requested_k, not this field. */
+  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall';
+  /** v0.41 — candidate count the reranker SCORED at the gate (post dedup/topNIn). */
   candidate_count?: number;
+  /** v0.42 — vector recall count (recall-health signal). Compare to vector_requested_k:
+   *  count << k (corpus >= k) = degraded/partial recall; count === 0 = total vector failure. */
+  vector_result_count?: number;
+  /** v0.42 — per-list vector recall limit requested (denominator for vector_result_count). */
+  vector_requested_k?: number;
 }
 
 const responseMeta = new WeakMap<object, RetrievalResponseMeta>();
