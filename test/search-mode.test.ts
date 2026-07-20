@@ -70,6 +70,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       rerank_abstain_floor: undefined,
+      answerability_guard: 'off' as const,
+      answerability_band_lo: 0.5,
+      answerability_band_hi: 0.85,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: false,
       ...CR_DISABLED_DEFAULT,
@@ -97,6 +100,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       rerank_abstain_floor: undefined,
+      answerability_guard: 'off' as const,
+      answerability_band_lo: 0.5,
+      answerability_band_hi: 0.85,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -122,6 +128,9 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       reranker_timeout_ms: 5000,
       floor_ratio: undefined,
       rerank_abstain_floor: undefined,
+      answerability_guard: 'off' as const,
+      answerability_band_lo: 0.5,
+      answerability_band_hi: 0.85,
       ...CROSS_MODAL_DEFAULTS,
       graph_signals: true,
       ...CR_DISABLED_DEFAULT,
@@ -328,7 +337,8 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // v=8 (v0.41 abstention): rerank_abstain_floor (raf=) folded in — an abstain-on lookup
     // returns [] where abstain-off returns the top hits, so it changes the result set and a
     // write under one setting must never be served to the other.
-    expect(KNOBS_HASH_VERSION).toBe(8);
+    // v=9 (v0.43): answerability_guard (aq=) — enforce mode changes the result set.
+    expect(KNOBS_HASH_VERSION).toBe(9);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {
@@ -368,6 +378,27 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     const a = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { rerank_abstain_floor: 0.5 } }));
     const b = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { rerank_abstain_floor: 0.6 } }));
     expect(a).not.toBe(b);
+  });
+
+  test('v=9: answerability off==shadow (identical result set), off!=enforce (enforce changes it)', () => {
+    // Only enforce changes the result set (a NO abstains), so off and shadow must
+    // fold to the same hash (shadow serves normally), and enforce must be distinct
+    // — else an unjudged off/shadow-cached row could be served to an enforce lookup,
+    // bypassing enforcement.
+    const off = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'off' } }));
+    const shadow = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'shadow' } }));
+    const enforce = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'enforce' } }));
+    expect(off).toBe(shadow);
+    expect(off).not.toBe(enforce);
+  });
+
+  test('v=9: band bounds fold into the hash ONLY under enforce', () => {
+    const enfA = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'enforce', answerability_band_hi: 0.85 } }));
+    const enfB = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'enforce', answerability_band_hi: 0.9 } }));
+    expect(enfA).not.toBe(enfB); // enforce: band affects which results abstain
+    const shA = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'shadow', answerability_band_hi: 0.85 } }));
+    const shB = knobsHash(resolveSearchMode({ mode: 'balanced', perCall: { answerability_guard: 'shadow', answerability_band_hi: 0.9 } }));
+    expect(shA).toBe(shB);       // shadow: serves normally, band is cosmetic
   });
 
   test('v0.42: keyword_semantic_fallback on vs off produces DIFFERENT hashes (result-set contamination prevention)', () => {

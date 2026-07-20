@@ -55,6 +55,9 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   reranker_timeout_ms: 'HTTP timeout for the reranker call',
   floor_ratio: 'Floor-ratio gate for metadata boosts (0..1, undefined = off)',
   rerank_abstain_floor: 'Abstain (return no answer) when top rerank score < this (0..1, undefined = off)',
+  answerability_guard: "Answerability guard: off | shadow (judge+log) | enforce (abstain on 'not answerable')",
+  answerability_band_lo: 'Lower rerank bound of the band the answerability guard judges (0..1)',
+  answerability_band_hi: 'Upper rerank bound of the band the answerability guard judges (0..1)',
   // v0.36 cross-modal knobs (D3 registry)
   cross_modal_both_text_weight: "D6 'both'-mode RRF weight for text branch (0.6 default)",
   cross_modal_both_image_weight: "D6 'both'-mode RRF weight for image branch (0.4 default)",

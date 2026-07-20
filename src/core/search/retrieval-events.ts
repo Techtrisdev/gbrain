@@ -38,7 +38,7 @@ export interface RetrievalResponseMeta {
    *  it does NOT imply healthy recall). `degraded_recall` is RESERVED, not yet
    *  emitted — to spot a degraded abstain, compare vector_result_count vs
    *  vector_requested_k, not this field. */
-  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall';
+  abstain_reason?: 'below_confidence_threshold' | 'degraded_recall' | 'not_answerable';
   /** v0.41 — candidate count the reranker SCORED at the gate (post dedup/topNIn). */
   candidate_count?: number;
   /** v0.42 — vector recall count (recall-health signal). Compare to vector_requested_k:
