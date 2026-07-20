@@ -117,14 +117,24 @@ export interface ModeBundle {
   /**
    * v0.41 — rerank-abstention floor. `undefined` = OFF (default; the Brain
    * always returns its top results, prior behavior). When set to a number in
-   * [0, 1], the query path returns NO answer (empty list + abstained meta)
+   * [0, 1], hybridSearch returns NO answer (empty list + abstained meta)
    * whenever the reranker ran and the top reranked score is below this floor —
    * i.e. the cross-encoder found nothing that actually answers the question, so
    * the Brain refuses to serve confident hub-noise. Distinct from `floor_ratio`
    * (a RELATIVE gate on boost stages): this is an ABSOLUTE confidence floor on
    * the final top result. Only fires when the reranker is enabled (no rerank
-   * score → no abstention). Validated operating point ~0.5 (JARVIS real-traffic
-   * eval: real answers reranked 0.63–0.98, junk ≤0.12; clean gap).
+   * score → no abstention) and only on TEXT-modality queries (the text
+   * cross-encoder can't score image chunks). Validated operating point ~0.5
+   * (JARVIS real-traffic eval: real answers reranked 0.63–0.98, junk ≤0.12).
+   *
+   * SCOPE: this gates EVERY hybridSearch consumer, not just the `query` op —
+   * think/gather, whoknows, and brainstorm also empty out when the floor is on
+   * (they don't read the abstained meta, so they simply see no results). That's
+   * a per-surface behavior change to weigh before ENABLING the floor.
+   *
+   * MODEL-COUPLED: 0.5 is calibrated to the current reranker's score scale.
+   * Re-tune when reranker_model changes (the cache is safe — rrm= is in the
+   * knobsHash — but the gate decision is not model-aware).
    */
   rerank_abstain_floor: number | undefined;
 

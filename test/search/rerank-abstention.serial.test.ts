@@ -131,13 +131,59 @@ describe('rerank-abstention gate', () => {
     expect(results.length).toBeGreaterThan(0);
   });
 
+  test('fail-open reranker (throws → no scores) does NOT abstain', async () => {
+    await engine.setConfig('search.rerank_abstain_floor', '0.5');
+    // applyReranker returns the input unmodified on any error → no rerank_score
+    // on any item → the gate has no signal and must fall through to results,
+    // NOT read the absence of a signal as "no confident answer".
+    const throwingReranker = {
+      enabled: true,
+      topNIn: 30,
+      topNOut: null,
+      rerankerFn: async (): Promise<RerankResult[]> => { throw new Error('reranker down'); },
+    };
+    const { meta, results } = await metaFor('loyalty', { reranker: throwingReranker });
+    expect(meta?.abstained).toBe(false);
+    expect(results.length).toBeGreaterThan(0);
+    await engine.unsetConfig('search.rerank_abstain_floor');
+  });
+
+  test('a score exactly at the floor passes (boundary: < floor, not <=)', async () => {
+    await engine.setConfig('search.rerank_abstain_floor', '0.5');
+    const { meta, results } = await metaFor('loyalty', { reranker: rerankOn(0.5) });
+    expect(meta?.abstained).toBe(false);
+    expect(results.length).toBeGreaterThan(0);
+    await engine.unsetConfig('search.rerank_abstain_floor');
+  });
+
+  test('abstentions are NOT written to cache (writeback requires results.length>0)', async () => {
+    await engine.setConfig('search.rerank_abstain_floor', '0.5');
+    // First call abstains (empty) — must not be cached. A second identical call
+    // re-runs the pipeline (cache miss again), not served an abstained [] from
+    // cache. We assert the second call still abstains via a fresh evaluation:
+    // if the empty had been cached AS a plain no-result, abstained could be lost.
+    let firstMeta: HybridSearchMeta | null = null;
+    await hybridSearchCached(engine, 'loyalty', { reranker: rerankOn(0.1), onMeta: (m) => { firstMeta = m; } });
+    expect((firstMeta as HybridSearchMeta | null)?.abstained).toBe(true);
+    expect((firstMeta as HybridSearchMeta | null)?.cache?.status).not.toBe('hit');
+
+    let secondMeta: HybridSearchMeta | null = null;
+    await hybridSearchCached(engine, 'loyalty', { reranker: rerankOn(0.1), onMeta: (m) => { secondMeta = m; } });
+    // Not served from cache (an abstained [] was never stored), and it still
+    // carries the abstention flag from a fresh evaluation.
+    expect((secondMeta as HybridSearchMeta | null)?.cache?.status).not.toBe('hit');
+    expect((secondMeta as HybridSearchMeta | null)?.abstained).toBe(true);
+    await engine.unsetConfig('search.rerank_abstain_floor');
+  });
+
   test('abstention propagates through hybridSearchCached (miss-path finalMeta)', async () => {
     await engine.setConfig('search.rerank_abstain_floor', '0.5');
-    let meta: HybridSearchMeta | null = null;
+    let captured: HybridSearchMeta | null = null;
     const results = await hybridSearchCached(engine, 'loyalty', {
       reranker: rerankOn(0.1),
-      onMeta: (m) => { meta = m; },
+      onMeta: (m) => { captured = m; },
     });
+    const meta = captured as HybridSearchMeta | null;
     expect(meta?.abstained).toBe(true);
     expect(meta?.abstain_reason).toBe('below_confidence_threshold');
     expect(results.length).toBe(0);

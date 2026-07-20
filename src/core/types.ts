@@ -891,6 +891,14 @@ export interface SearchOpts {
    */
   floorRatio?: number;
   /**
+   * v0.41 — per-call rerank-abstention floor (mirrors the search.rerank_abstain_floor
+   * config key). Number in [0, 1] or undefined (default = off). Threaded into the
+   * SAME resolveSearchMode call that feeds both the gate and knobsHash, so gate and
+   * cache key can never disagree. Config is the production surface; this exists for
+   * callers/tests that set it per call.
+   */
+  rerankAbstainFloor?: number;
+  /**
    * v0.36 cross-modal wave: route this search through the multimodal
    * embedding space (Voyage multimodal-3 by default).
    *

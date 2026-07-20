@@ -442,6 +442,9 @@ export async function hybridSearch(
       // over per-key config wins over mode bundle (currently undefined for
       // all 3 bundles — pending ablation evidence).
       floor_ratio: opts?.floorRatio,
+      // v0.41 — rerank-abstention floor threaded the same way. Feeds both the
+      // gate and knobsHash off this single resolvedMode, so they can't diverge.
+      rerank_abstain_floor: opts?.rerankAbstainFloor,
       // v0.40.4 — graph_signals thread-through. Per-call wins over config
       // override wins over mode bundle. Without this thread the eval gate
       // would be a no-op (both branches resolve to the same mode default).
@@ -1017,18 +1020,29 @@ export async function hybridSearch(
   //     no-match, a different outcome). Empty results carry candidate_count so a
   //     consumer can tell "nothing retrieved" from "candidates existed, none
   //     confident".
+  //   - TEXT modality ONLY. The reranker is a text cross-encoder; on an image /
+  //     'both' query it scores OCR scraps or empty strings near zero, which the
+  //     floor would read as blanket abstention. Skip the gate off the text path.
+  //   - candidate_count is the number of candidates the reranker actually SCORED
+  //     (topNIn-bounded), not the full pool — "candidates existed, none cleared
+  //     the floor" is a statement about what was judged.
   const abstainFloor = resolvedMode.rerank_abstain_floor;
+  const abstainModalityOk = effectiveModality === undefined || effectiveModality === 'text';
   let abstained = false;
   let abstainCandidateCount = 0;
-  if (abstainFloor !== undefined && rerankerOpts.enabled) {
+  if (abstainFloor !== undefined && rerankerOpts.enabled && abstainModalityOk) {
     let maxRerank = Number.NEGATIVE_INFINITY;
+    let scored = 0;
     for (const r of reranked) {
       const rs = (r as { rerank_score?: number }).rerank_score;
-      if (typeof rs === 'number' && rs > maxRerank) maxRerank = rs;
+      if (typeof rs === 'number') {
+        scored += 1;
+        if (rs > maxRerank) maxRerank = rs;
+      }
     }
     if (Number.isFinite(maxRerank) && maxRerank < abstainFloor) {
       abstained = true;
-      abstainCandidateCount = reranked.length;
+      abstainCandidateCount = scored;
     }
   }
 
@@ -1108,6 +1122,10 @@ export async function hybridSearchCached(
       // Without this, a no-floor write would be served to a floor-enabled
       // read (ranking-correctness leak, codex T1).
       floor_ratio: opts?.floorRatio,
+      // v0.41 — rerank-abstention floor threaded through the cache resolver too
+      // so knobsHash(raf=) reflects a per-call override, keeping abstain-on/off
+      // cache rows segregated when the floor is set per call rather than by config.
+      rerank_abstain_floor: opts?.rerankAbstainFloor,
       // v0.40.4 — graph_signals threaded through cache resolver too so
       // knobsHash() includes the per-call override (KNOBS_HASH_VERSION=4
       // folds gs= into the hash). Without this thread, a per-call
@@ -1217,11 +1235,15 @@ export async function hybridSearchCached(
         // cache hit implies same-mode). Needed so cache-hit telemetry buckets by
         // mode instead of falling back to 'unset'.
         mode: resolvedForCache.resolved_mode,
-        // v0.41 — carry abstention through the cache-HIT path. knobsHash (raf=)
-        // segregates abstain-on rows from abstain-off, so a stored abstention is
-        // only ever replayed under the same floor; without copying it here a
-        // replayed abstention would surface as [] with abstained:false — the
-        // empty-vs-abstention conflation TARS's contract forbids.
+        // v0.41 — carry abstention through the cache-HIT path. DEFENSIVE today:
+        // abstained calls return [] and the cache writeback below requires
+        // results.length > 0, so an abstained row is never actually stored and
+        // hit.meta?.abstained is currently never truthy (a test pins that
+        // abstentions are not cached). This branch exists so that IF abstention
+        // caching is ever added — the natural optimization to skip re-running the
+        // reranker on a repeated junk query — the flag replays correctly instead
+        // of surfacing as [] with abstained:false. knobsHash (raf=) keeps such a
+        // row scoped to the same floor.
         ...(hit.meta?.abstained
           ? {
               abstained: true as const,
