@@ -116,8 +116,18 @@ export async function applyReranker(
     return results;
   }
 
-  // Defensive: if the reranker returned a malformed shape, pass through.
-  if (!Array.isArray(reranked) || reranked.length === 0) return results;
+  // Defensive: if the reranker returned a malformed/empty shape, pass through.
+  // This ALSO serves un-reranked RRF order (same silent degradation as a throw),
+  // so mark it — a reranker that returns [] without throwing must not look like a
+  // healthy rerank to the abstain gate + consumers.
+  if (!Array.isArray(reranked) || reranked.length === 0) {
+    try {
+      opts.onFailure?.('unknown');
+    } catch {
+      // Notification must never break search.
+    }
+    return results;
+  }
 
   // Build the reordered head. We keep ONLY indices the reranker returned
   // (so a top_n response with fewer items than head.length naturally

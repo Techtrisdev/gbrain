@@ -309,4 +309,20 @@ describe('reranker fail-open marker (reranker_failed)', () => {
       (engine as any).searchVector = orig;
     }
   });
+
+  test('a MALFORMED/empty reranker response (no throw) also marks reranker_failed', async () => {
+    // The other fail-open: the reranker returns [] without throwing. Same silent
+    // wrong-order serve → must be marked (types contract: flag absent ⇒ reranked).
+    const rerankEmpty = { enabled: true, topNIn: 30, topNOut: null, rerankerFn: async (): Promise<RerankResult[]> => [] };
+    const orig = (engine as any).searchVector.bind(engine);
+    (engine as any).searchVector = async () => ([
+      { slug: 'clients/acme', page_id: 1, title: 'Acme Corp', type: 'client', score: 0.9, chunk_text: 'acme loyalty', chunk_source: 'compiled_truth', source_id: 'default' },
+    ] as any);
+    try {
+      const { meta } = await metaFor('loyalty', { reranker: rerankEmpty });
+      expect(meta?.reranker_failed).toBe(true);
+    } finally {
+      (engine as any).searchVector = orig;
+    }
+  });
 });

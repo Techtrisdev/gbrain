@@ -1397,11 +1397,16 @@ export async function hybridSearchCached(
 
   // Best-effort writeback (skip when search returned empty so we don't
   // cache zero-result queries forever — they often indicate a typo).
+  // v0.42 — also skip a reranker fail-open: those results are in un-reranked
+  // (wrong) order, and caching them would replay the wrong order for TTL even
+  // after the reranker recovers seconds later, inflating the flake counter on
+  // every hit. A degraded serve should not be memoized.
   if (
     cacheStatus === 'miss' &&
     queryEmbedding &&
     results.length > 0 &&
-    (innerMeta?.vector_enabled ?? false)
+    (innerMeta?.vector_enabled ?? false) &&
+    !innerMeta?.reranker_failed
   ) {
     trackCacheWrite(
       cache
