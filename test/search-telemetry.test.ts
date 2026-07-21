@@ -120,6 +120,28 @@ describe('recordSearchTelemetry — in-memory bucket', () => {
     expect(s.total_calls).toBe(3);
   });
 
+  test('abstained_not_answerable is a subset of abstained + survives a flush→DB round-trip (v0.44)', async () => {
+    const w = getTelemetryWriter();
+    w.setEngine(engine);
+    // 2 answerability-guard (enforce) abstentions carry both flags; 1 confidence-floor
+    // abstention carries only `abstained`. The split lets the operator isolate the
+    // guard's reject rate — the prerequisite for promoting it from shadow to enforce.
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 0, abstained: true, abstained_not_answerable: true });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 0, abstained: true, abstained_not_answerable: true });
+    recordSearchTelemetry(engine, makeMeta(), { results_count: 0, abstained: true }); // floor abstention, NOT not_answerable
+    const today = new Date().toISOString().slice(0, 10);
+    const b = w.bucketForTest(today, 'balanced', 'general')!;
+    expect(b.abstained).toBe(3);                 // every abstention counts as abstained
+    expect(b.abstained_not_answerable).toBe(2);  // only the enforce-guard subset
+    // Flush + read back: catches an INSERT column/placeholder mismatch (which silently
+    // swallows the write → 0 rows), invisible to _meta tests — the v103 INSERT bug class.
+    await w.flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.abstained).toBe(3);
+    expect(s.abstained_not_answerable).toBe(2);
+    expect(s.total_calls).toBe(3);
+  });
+
   test('sum_budget_dropped accumulates from meta.token_budget.dropped', () => {
     const w = getTelemetryWriter();
     w.setEngine(engine);

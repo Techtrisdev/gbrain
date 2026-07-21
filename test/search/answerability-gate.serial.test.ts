@@ -9,7 +9,8 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { hybridSearch } from '../../src/core/search/hybrid.ts';
+import { hybridSearch, hybridSearchCached } from '../../src/core/search/hybrid.ts';
+import { getTelemetryWriter, readSearchStats, _resetTelemetryWriterForTest } from '../../src/core/search/telemetry.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
 import { _resetAnswerabilityCacheForTest } from '../../src/core/search/answerability.ts';
 import type { PageInput, HybridSearchMeta } from '../../src/core/types.ts';
@@ -85,6 +86,30 @@ describe('answerability guard gate', () => {
     expect(meta?.abstained).toBe(true);
     expect(meta?.abstain_reason).toBe('not_answerable');
     expect(results.length).toBe(0);
+    await engine.unsetConfig('search.answerability_guard');
+  });
+
+  test('enforce + NO through hybridSearchCached increments abstained_not_answerable telemetry (wrapper path)', async () => {
+    // The query MCP op routes through hybridSearchCached, which SUPPRESSES the
+    // inner telemetry and writes ONE row from the wrapper leg — so the not_answerable
+    // split must be derived at THAT call site, not only the bare-hybridSearch one.
+    // A bare-hybridSearch test cannot catch a wrapper-site miss (the query op never
+    // calls bare hybridSearch), which is exactly how the wrapper sites shipped
+    // recording `abstained` but 0 `abstained_not_answerable`. Route the enforce
+    // NO abstention through the wrapper and read it back from the DB.
+    _resetAnswerabilityCacheForTest();
+    _resetTelemetryWriterForTest();
+    getTelemetryWriter().setEngine(engine);
+    await engine.executeRaw('DELETE FROM search_telemetry');
+    await engine.setConfig('search.answerability_guard', 'enforce');
+    let meta: HybridSearchMeta | null = null;
+    await hybridSearchCached(engine, 'governance process', { reranker: rerankAt(0.7), answerabilityJudgeFn: no, onMeta: (m) => { meta = m; } });
+    expect((meta as HybridSearchMeta | null)?.abstained).toBe(true);
+    expect((meta as HybridSearchMeta | null)?.abstain_reason).toBe('not_answerable');
+    await getTelemetryWriter().flush();
+    const s = await readSearchStats(engine, { days: 7 });
+    expect(s.abstained).toBe(1);
+    expect(s.abstained_not_answerable).toBe(1); // 0 before the wrapper-site fix
     await engine.unsetConfig('search.answerability_guard');
   });
 

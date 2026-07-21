@@ -600,7 +600,7 @@ export async function hybridSearch(
       // v0.40.x — hybridSearchCached suppresses this so it can record ONE row
       // per request with the correct cache.status (hit/miss/disabled).
       if (!opts?._suppressTelemetry) {
-        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount, abstained: meta.abstained === true, reranker_failed: meta.reranker_failed === true }, opts?.caller);
+        recordSearchTelemetry(engine, meta, { results_count: lastResultsCount, abstained: meta.abstained === true, abstained_not_answerable: meta.abstain_reason === 'not_answerable', reranker_failed: meta.reranker_failed === true }, opts?.caller);
       }
     } catch {
       // swallow — telemetry must never break the search hot path.
@@ -1476,7 +1476,7 @@ export async function hybridSearchCached(
       // no double-count; recordSearchTelemetry is non-blocking (in-memory bucket),
       // so no hot-path latency. Caller threaded for attribution parity with query/think.
       if (!opts?._suppressTelemetry) {
-        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length, abstained: cachedMeta.abstained === true, reranker_failed: cachedMeta.reranker_failed === true }, opts?.caller);
+        recordSearchTelemetry(engine, cachedMeta, { results_count: budgeted.length, abstained: cachedMeta.abstained === true, abstained_not_answerable: cachedMeta.abstain_reason === 'not_answerable', reranker_failed: cachedMeta.reranker_failed === true }, opts?.caller);
       }
       return budgeted;
     }
@@ -1565,7 +1565,7 @@ export async function hybridSearchCached(
   // cache_miss-always-0 gap that pinned cache_hit_rate at a false ~100%. The hit
   // leg is recorded separately above (cachedMeta, cache.status='hit').
   if (!opts?._suppressTelemetry) {
-    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length, abstained: finalMeta.abstained === true, reranker_failed: finalMeta.reranker_failed === true }, opts?.caller);
+    recordSearchTelemetry(engine, finalMeta, { results_count: budgeted.length, abstained: finalMeta.abstained === true, abstained_not_answerable: finalMeta.abstain_reason === 'not_answerable', reranker_failed: finalMeta.reranker_failed === true }, opts?.caller);
   }
 
   // Best-effort writeback (skip when search returned empty so we don't

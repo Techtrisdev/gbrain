@@ -1529,13 +1529,16 @@ const search: Operation = {
     // client path's degraded-mode surface; count + surface it here or it's inert
     // for most real traffic (same reasoning as abstained above).
     const rescueRerankerFailed = (rescueMeta as HybridSearchMeta | null)?.reranker_failed === true;
+    // v0.44 — split the enforce-answerability abstentions out of the rescue bucket
+    // too, so the guard's reject rate is measurable on the dominant client path.
+    const rescueNotAnswerable = (rescueMeta as HybridSearchMeta | null)?.abstain_reason === 'not_answerable';
     recordSearchTelemetry(ctx.engine, {
       vector_enabled: false,
       detail_resolved: null,
       expansion_applied: false,
       intent,
       mode: 'keyword',
-    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained, reranker_failed: rescueRerankerFailed }, {
+    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained, abstained_not_answerable: rescueNotAnswerable, reranker_failed: rescueRerankerFailed }, {
       client: ctx.auth?.clientName,
       sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
     });
@@ -1563,9 +1566,15 @@ const search: Operation = {
             abstained: true,
             abstain_reason: rescueMetaFinal?.abstain_reason ?? 'below_confidence_threshold',
             candidate_count: rescueMetaFinal?.candidate_count,
-            vector_result_count: rescueMetaFinal?.vector_result_count,
-            vector_requested_k: rescueMetaFinal?.vector_requested_k,
           }
+        : {}),
+      // v0.43 — recall-health rides independently of abstention (served rescue
+      // responses carry the baseline too), matching the query op.
+      ...(rescueMetaFinal?.vector_result_count !== undefined
+        ? { vector_result_count: rescueMetaFinal.vector_result_count }
+        : {}),
+      ...(rescueMetaFinal?.vector_requested_k !== undefined
+        ? { vector_requested_k: rescueMetaFinal.vector_requested_k }
         : {}),
       ...(rescueRerankerFailed ? { reranker_failed: true } : {}),
     });
@@ -1802,19 +1811,25 @@ const query: Operation = {
     // _meta stays byte-identical to pre-abstention behavior. Attaches to the
     // (possibly empty) results object — the WeakMap keys on identity, and an
     // empty array is still a distinct object dispatch.ts spreads meta off of.
-    // v0.42 — reranker_failed rides back independently of abstention (a fail-open
-    // NEVER abstains), so it must be attached on the non-abstain branch too, or no
-    // real client ever sees the degradation.
+    // v0.42/v0.43 — reranker_failed AND the recall-health pair
+    // (vector_result_count / vector_requested_k) ride back independently of
+    // abstention. Per #68's contract they are emitted on EVERY vector-path query,
+    // not only abstentions: a consumer needs them on a SERVED response to compute
+    // `count < requested_k` = a degraded/partial recall (retry, don't conclude the
+    // Brain lacks the answer). Previously they were attached only on the abstain
+    // branch, so served responses carried no recall-health baseline (TARS-found,
+    // 2026-07-20). abstain-specific fields (abstain_reason, candidate_count) stay
+    // abstain-only.
     const responseMeta: import('./search/retrieval-events.ts').RetrievalResponseMeta = retrievalMeta?.abstained
       ? {
           query_id: queryId,
           abstained: true,
           abstain_reason: retrievalMeta.abstain_reason ?? 'below_confidence_threshold',
           candidate_count: retrievalMeta.candidate_count,
-          vector_result_count: retrievalMeta.vector_result_count,
-          vector_requested_k: retrievalMeta.vector_requested_k,
         }
       : { query_id: queryId };
+    if (retrievalMeta?.vector_result_count !== undefined) responseMeta.vector_result_count = retrievalMeta.vector_result_count;
+    if (retrievalMeta?.vector_requested_k !== undefined) responseMeta.vector_requested_k = retrievalMeta.vector_requested_k;
     if (retrievalMeta?.reranker_failed) responseMeta.reranker_failed = true;
     attachRetrievalResponseMeta(results, responseMeta);
 
