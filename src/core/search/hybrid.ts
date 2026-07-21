@@ -46,6 +46,43 @@ function trackCacheWrite(promise: Promise<unknown>): void {
   pendingCacheWrites.add(promise);
   promise.finally(() => pendingCacheWrites.delete(promise)).catch(() => { /* swallow */ });
 }
+
+/**
+ * v0.44 — recall-floor decoupling. Resolve the recall/rerank candidate pool size
+ * (`innerLimit`) handed to the keyword + vector engine legs from the caller's
+ * DISPLAY `limit`.
+ *
+ * INVARIANT: the pool must never be shallower than the reranker will score
+ * (`reranker_top_n_in`). The legacy `limit * 2` tied recall depth to the display
+ * limit, so a small-limit call (limit=3 → pool=6) handed the cross-encoder FEWER
+ * candidates than its topNIn budget (30) — the reranker was starved. A weak
+ * vector-match answer page (an entity page buried under query-space hubs at
+ * cosine rank ~21) then became structurally unreachable via the vector leg for
+ * small-limit callers; it reached the reranker ONLY if the keyword AND-match
+ * happened to surface it, so a natural-language phrasing that missed on keyword
+ * FALSELY ABSTAINED — even though the reranker scores such a page ~0.9 whenever
+ * it actually sees it. Flooring the pool at `reranker_top_n_in` (only when the
+ * reranker runs) guarantees recall always hands the reranker its full candidate
+ * budget, independent of the display `limit`.
+ *
+ * Cost: for default-and-larger display limits (limit >= topNIn/2) the pool
+ * already met or exceeded the floor, so nothing changes. For the small-limit
+ * queries this fixes, the reranker payload rises from `2*limit` to `topNIn`
+ * (e.g. 6 -> 30) — that IS the intended un-starving: the cross-encoder finally
+ * scores its full candidate budget instead of a starved handful. `topNIn` still
+ * caps that budget, and MAX_SEARCH_LIMIT caps the pool, so the cost is bounded
+ * (and the recall/fusion/dedup widening it rides on is cheap).
+ */
+export function resolveInnerLimit(
+  displayLimit: number,
+  mode: { rerankerEnabled: boolean; rerankerTopNIn: number },
+): number {
+  const recallFloor = mode.rerankerEnabled
+    ? Math.min(mode.rerankerTopNIn, MAX_SEARCH_LIMIT)
+    : 0;
+  return Math.min(Math.max(displayLimit * 2, recallFloor), MAX_SEARCH_LIMIT);
+}
+
 /**
  * Backlink boost coefficient. Score is multiplied by (1 + BACKLINK_BOOST_COEF * log(1 + count)).
  * - 0 backlinks: factor = 1.0 (no boost).
@@ -476,7 +513,22 @@ export async function hybridSearch(
 
   const limit = opts?.limit || resolvedMode.searchLimit;
   const offset = opts?.offset || 0;
-  const innerLimit = Math.min(limit * 2, MAX_SEARCH_LIMIT);
+  // Key the recall floor on whether the reranker WILL run (per-call override wins
+  // over the mode default, mirroring rerankerOpts below) and its effective topNIn.
+  const innerLimit = resolveInnerLimit(limit, {
+    rerankerEnabled: opts?.reranker?.enabled ?? resolvedMode.reranker_enabled,
+    rerankerTopNIn: opts?.reranker?.topNIn ?? resolvedMode.reranker_top_n_in,
+  });
+  // v0.44 — recall-HEALTH denominator (the `vector_requested_k` telemetry), kept
+  // as the display-intent target `min(limit*2, MAX)`, DECOUPLED from the floored
+  // `innerLimit` that drives the actual engine recall. The degraded-recall signal
+  // is `vector_result_count < vector_requested_k`; if this denominator rode the
+  // floor (e.g. 30 for a limit=3 query), a small/narrowly-scoped corpus that only
+  // holds ~15 text chunks would report count=15 < 30 and FALSELY read as a partial
+  // HNSW miss — and a legitimate small-corpus abstention would be mislabeled
+  // degraded_recall. Keeping the denominator at limit*2 preserves that signal's
+  // meaning (count >= this ⇒ healthy) regardless of how wide recall over-fetches.
+  const recallHealthDenominator = Math.min(limit * 2, MAX_SEARCH_LIMIT);
 
   // v0.32.x search-lite: classify intent once up front. Drives BOTH the
   // legacy auto-detail / salience / recency suggestions AND the new
@@ -841,7 +893,8 @@ export async function hybridSearch(
   // keyword-only path below, but a NON-throwing incomplete recall (e.g. an HNSW
   // cold/under-load miss that drops a thin page) leaves a short list that proceeds
   // to the abstain gate and can silently withhold a real answer. Emitted alongside
-  // `vector_requested_k` (innerLimit) so a consumer can flag `count < requested_k`
+  // `vector_requested_k` (the display-intent target min(limit*2, MAX), NOT the
+  // floored recall innerLimit) so a consumer can flag `count < requested_k`
   // as a degraded abstention per-request — no baseline needed. NOT auto-classified
   // into a reason code here: the discrimination lives in the count/k comparison.
   const vectorResultCount = vectorLists.reduce((n, l) => n + l.length, 0);
@@ -1160,7 +1213,7 @@ export async function hybridSearch(
     // query. `count < requested_k` (corpus >= k) flags a degraded/partial recall
     // per-request; `count === 0` is total vector failure.
     vector_result_count: vectorResultCount,
-    vector_requested_k: innerLimit,
+    vector_requested_k: recallHealthDenominator,
     // v0.42 — reranker fail-open marker. True iff the reranker errored and the
     // results are served in un-reranked RRF order (wrong ordering, no rerank
     // signal). Only emitted when true, so happy-path meta is unchanged.
