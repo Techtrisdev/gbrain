@@ -1331,6 +1331,13 @@ export interface HybridSearchMeta {
    */
   reranker_failed?: boolean;
   /**
+   * v0.45 — keyword-leg graceful relaxation fired. The strict `websearch_to_tsquery`
+   * AND returned zero rows (a query word was absent corpus-wide), so the keyword leg
+   * was retried with the query's distinctive tokens. Only present when true; a signal
+   * that this query would have run vector-only (into hub space) before the fix.
+   */
+  keyword_relaxed?: boolean;
+  /**
    * v0.43 — answerability guard outcome, emitted whenever the LLM judge RAN
    * (shadow or enforce mode). answered|not_answered = a live verdict;
    * error|timeout|unavailable = fail-open (served regardless). A high

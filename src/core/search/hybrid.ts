@@ -31,6 +31,7 @@ import {
 import {
   SemanticQueryCache,
   loadCacheConfig,
+  distinctiveTokens,
 } from './query-cache.ts';
 
 export const RRF_K = 60;
@@ -625,8 +626,34 @@ export async function hybridSearch(
   const earlyModality = (opts?.crossModal && opts.crossModal !== 'auto')
     ? opts.crossModal
     : (suggestions.suggestedModality ?? 'text');
-  const keywordResults: SearchResult[] =
+  let keywordResults: SearchResult[] =
     earlyModality === 'image' ? [] : await engine.searchKeyword(query, searchOpts);
+
+  // v0.45 — graceful keyword relaxation. `websearch_to_tsquery` is all-or-nothing
+  // AND, so a SINGLE query word absent from the WHOLE corpus (e.g. "production")
+  // zeros the entire keyword leg — collapsing the hybrid query to vector-only and
+  // into query-space hub noise, where a weak-vector-match canonical page never
+  // reaches the reranker (verified: "current Context Mirror production capture
+  // status" → keyword 0 rows → the canonical page lands at vector rank 32, below
+  // the reranker cut, and a stale handoff wins). On a zero-row keyword leg, retry
+  // ANDing just the query's DISTINCTIVE (entity/proper-noun) tokens so the canonical
+  // page still surfaces lexically and fuses into the reranker head. The reranker +
+  // abstain floor stay the quality gate — relaxed hub-noise still gets floored, so
+  // this never manufactures a confident wrong answer. Skips image modality and
+  // queries with no distinctive tokens (nothing to relax to → correctly stays
+  // vector-only). Only fires when the strict leg already returned nothing, so it can
+  // only ADD recall, never change a query that already matched.
+  let keywordRelaxed = false;
+  if (keywordResults.length === 0 && earlyModality !== 'image') {
+    const relaxedQuery = [...distinctiveTokens(query)].join(' ');
+    if (relaxedQuery && relaxedQuery.toLowerCase() !== query.toLowerCase()) {
+      const relaxed = await engine.searchKeyword(relaxedQuery, searchOpts);
+      if (relaxed.length > 0) {
+        keywordResults = relaxed;
+        keywordRelaxed = true;
+      }
+    }
+  }
 
   // v0.29.1: resolve salience/recency from caller (back-compat aliases for
   // PR #618's `recencyBoost` numeric scale) or fall back to the heuristic.
@@ -1218,6 +1245,7 @@ export async function hybridSearch(
     // results are served in un-reranked RRF order (wrong ordering, no rerank
     // signal). Only emitted when true, so happy-path meta is unchanged.
     ...(rerankerFailed ? { reranker_failed: true } : {}),
+    ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
     ...(abstained
       ? {
           // v0.42/v0.43 — reason is below_confidence_threshold for a floor abstain,
