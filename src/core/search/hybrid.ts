@@ -31,6 +31,7 @@ import {
 import {
   SemanticQueryCache,
   loadCacheConfig,
+  distinctiveTokens,
 } from './query-cache.ts';
 
 export const RRF_K = 60;
@@ -625,8 +626,46 @@ export async function hybridSearch(
   const earlyModality = (opts?.crossModal && opts.crossModal !== 'auto')
     ? opts.crossModal
     : (suggestions.suggestedModality ?? 'text');
-  const keywordResults: SearchResult[] =
+  let keywordResults: SearchResult[] =
     earlyModality === 'image' ? [] : await engine.searchKeyword(query, searchOpts);
+
+  // v0.45 — graceful keyword relaxation. `websearch_to_tsquery` is all-or-nothing
+  // AND, so a SINGLE query word absent from the WHOLE corpus (e.g. "production")
+  // zeros the entire keyword leg — collapsing the hybrid query to vector-only and
+  // into query-space hub noise, where a weak-vector-match canonical page never
+  // reaches the reranker (verified: "current Context Mirror production capture
+  // status" → keyword 0 rows → the canonical page lands at vector rank 32, below
+  // the reranker cut, and a stale handoff wins). On a zero-row keyword leg, retry
+  // ANDing just the query's DISTINCTIVE (entity/proper-noun) tokens so the canonical
+  // page still surfaces lexically and fuses into the reranker head.
+  //
+  // SAFETY (honest scope — do NOT over-claim): relaxation ADDS on-topic candidates
+  // to the reranker pool, which can include stale/wrong-but-topical entity pages, so
+  // the reranker's answer-relevance ordering + the `rerank_abstain_floor` are the
+  // quality gate. That gate is only as strong as its config: the floor is
+  // undefined-by-default (must be set, e.g. our prod's 0.5), and a topical floor
+  // cannot by itself reject a topically-relevant-but-wrong page — the answerability
+  // guard (default-off, and currently entity-exempt) is the eventual catcher for
+  // that high-confidence-WRONG class. Net: relaxation is a recall improvement gated
+  // by the reranker+floor, NOT an unconditional "never wrong" guarantee. The
+  // `keyword_relaxed` _meta bit (threaded through every return path incl. the cache
+  // wrappers) lets us MEASURE the firing rate + abstain rate on relaxed traffic.
+  // Only fires when the strict leg returned nothing, so it can only add keyword
+  // recall — but note when keyword==0 yet the vector leg already had the answer, the
+  // injected lexical competitors could reorder RRF, so "already matched" here means
+  // the KEYWORD leg matched, not that the query was already answered well. Skips
+  // image modality + queries with no distinctive tokens (stays vector-only).
+  let keywordRelaxed = false;
+  if (keywordResults.length === 0 && earlyModality !== 'image') {
+    const relaxedQuery = [...distinctiveTokens(query)].join(' ');
+    if (relaxedQuery && relaxedQuery.toLowerCase() !== query.toLowerCase()) {
+      const relaxed = await engine.searchKeyword(relaxedQuery, searchOpts);
+      if (relaxed.length > 0) {
+        keywordResults = relaxed;
+        keywordRelaxed = true;
+      }
+    }
+  }
 
   // v0.29.1: resolve salience/recency from caller (back-compat aliases for
   // PR #618's `recencyBoost` numeric scale) or fall back to the heuristic.
@@ -696,6 +735,7 @@ export async function hybridSearch(
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
+      ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: noEmbedBudgetMeta }
         : {}),
@@ -919,6 +959,7 @@ export async function hybridSearch(
       intent: suggestions.intent,
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
+      ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: kwBudgetMeta }
         : {}),
@@ -1218,6 +1259,7 @@ export async function hybridSearch(
     // results are served in un-reranked RRF order (wrong ordering, no rerank
     // signal). Only emitted when true, so happy-path meta is unchanged.
     ...(rerankerFailed ? { reranker_failed: true } : {}),
+    ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
     ...(abstained
       ? {
           // v0.42/v0.43 — reason is below_confidence_threshold for a floor abstain,
@@ -1438,6 +1480,7 @@ export async function hybridSearchCached(
           ? { vector_requested_k: hit.meta.vector_requested_k }
           : {}),
         ...(hit.meta?.reranker_failed ? { reranker_failed: true } : {}),
+        ...(hit.meta?.keyword_relaxed ? { keyword_relaxed: true } : {}),
         // v0.43 — carry the answerability verdict through the cache-HIT path so a
         // replayed shadow row keeps its harvest signal (query_cache.meta is the
         // shadow harvest channel: query_text + outcome + would_abstain).
@@ -1533,6 +1576,7 @@ export async function hybridSearchCached(
       ? { vector_requested_k: innerMeta.vector_requested_k }
       : {}),
     ...(innerMeta?.reranker_failed ? { reranker_failed: true } : {}),
+    ...(innerMeta?.keyword_relaxed ? { keyword_relaxed: true } : {}),
     // v0.43 — carry the answerability verdict up from the inner hybridSearch so
     // the cache writeback (query_cache.meta) records the shadow harvest signal.
     ...(innerMeta?.answerability_outcome !== undefined
