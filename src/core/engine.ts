@@ -1664,6 +1664,15 @@ export interface BrainEngine {
    */
   searchKeywordChunks(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
 
+  /**
+   * Rebuild the per-source corpus term-statistics (`corpus_term_stats` +
+   * `corpus_term_stats_meta`) that the `or_idf` keyword-ranking path reads for
+   * IDF weighting. Idempotent (output depends only on current chunk state); safe
+   * to call at every reindex/sync completion. Thin wrapper over the shared
+   * `refreshCorpusTermStats` helper so both engines rebuild identically.
+   */
+  refreshCorpusTermStats(sourceId: string): Promise<void>;
+
   // Eval capture (v0.25.0 — BrainBench-Real substrate).
   // Captured at the op-layer wrapper in src/core/operations.ts; reads via
   // `gbrain eval export` (NDJSON) for sibling gbrain-evals consumption.

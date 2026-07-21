@@ -52,7 +52,8 @@ import { ConnectionManager } from './connection-manager.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildIdfRankedKeyword } from './search/sql-ranking.ts';
+import { refreshCorpusTermStats as refreshCorpusTermStatsHelper } from './search/corpus-term-stats.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 
 function escapeSqlStringLiteral(value: string): string {
@@ -1436,7 +1437,65 @@ export class PostgresEngine implements BrainEngine {
     // not a temporal preference.
     const visibilityClause = buildVisibilityClause('p', 's');
 
-    const rawQuery = `
+    // v0.45 — keyword-leg ranking. Default 'and' = legacy boolean-AND ts_rank
+    // (bit-for-bit prior behavior, the rollback path). 'or_idf' = ranked-OR +
+    // corpus-IDF via the shared buildIdfRankedKeyword builder (SAME fragments on
+    // pglite-engine → parity). The OR path replaces the `sv @@ websearch_to_tsquery`
+    // match predicate with a JOIN over the query lexemes and sums per-lexeme
+    // idf * ts_rank_cd; it degrades to pure ranked-OR (idf=1.0) when the stats
+    // tables are empty.
+    let rawQuery: string;
+    if (opts?.keyword_ranking === 'or_idf') {
+      const idf = buildIdfRankedKeyword({
+        tsvColumn: 'cc.search_vector',
+        queryParam: '$1',
+        pageAlias: 'p',
+        sourceFactorExpr: sourceFactorCase,
+      });
+      rawQuery = `
+      WITH ${idf.queryLexCte},
+      ranked_chunks AS (
+        SELECT
+          p.slug, p.id as page_id, p.title, p.type, p.source_id,
+          p.effective_date, p.effective_date_source,
+          cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+          ${idf.scoreExpr} AS score
+        FROM content_chunks cc
+        JOIN pages p ON p.id = cc.page_id
+        JOIN sources s ON s.id = p.source_id
+        ${idf.joins}
+        WHERE cc.modality = 'text'
+          ${typeClause}
+          ${typesClause}
+          ${excludeSlugsClause}
+          ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+          ${languageClause}
+          ${symbolKindClause}
+          ${afterDateClause}
+          ${beforeDateClause}
+          ${sourceClause}
+          ${hardExcludeClause}
+          ${visibilityClause}
+        GROUP BY ${idf.groupBy}
+        ORDER BY score DESC
+        LIMIT ${innerLimitParam}
+      ),
+      best_per_page AS (
+        SELECT DISTINCT ON (slug) *
+        FROM ranked_chunks
+        ORDER BY slug, score DESC
+      )
+      SELECT slug, page_id, title, type, source_id,
+        effective_date, effective_date_source,
+        chunk_id, chunk_index, chunk_text, chunk_source, score,
+        false AS stale
+      FROM best_per_page
+      ORDER BY score DESC
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    `;
+    } else {
+      rawQuery = `
       WITH ranked_chunks AS (
         SELECT
           p.slug, p.id as page_id, p.title, p.type, p.source_id,
@@ -1479,6 +1538,7 @@ export class PostgresEngine implements BrainEngine {
       LIMIT ${limitParam}
       OFFSET ${offsetParam}
     `;
+    }
 
     // Search-only timeout. SET LOCAL inside sql.begin() scopes the GUC
     // to the transaction so it can never leak onto a pooled connection.
@@ -1579,7 +1639,52 @@ export class PostgresEngine implements BrainEngine {
     // v0.26.5: visibility filter for searchKeywordChunks (anchor primitive).
     const visibilityClause = buildVisibilityClause('p', 's');
 
-    const rawQuery = `
+    // v0.45 — keyword-leg ranking (chunk-grain; keeps parity with searchKeyword).
+    // 'and' = legacy ts_rank boolean-AND; 'or_idf' = ranked-OR + corpus-IDF via
+    // the shared builder. No page dedup here (this is the anchor primitive).
+    let rawQuery: string;
+    if (opts?.keyword_ranking === 'or_idf') {
+      const idf = buildIdfRankedKeyword({
+        tsvColumn: 'cc.search_vector',
+        queryParam: '$1',
+        pageAlias: 'p',
+        sourceFactorExpr: sourceFactorCase,
+      });
+      rawQuery = `
+      WITH ${idf.queryLexCte}
+      SELECT
+        p.slug, p.id as page_id, p.title, p.type, p.source_id,
+        p.effective_date, p.effective_date_source,
+        cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+        ${idf.scoreExpr} AS score,
+        false AS stale
+      FROM content_chunks cc
+      JOIN pages p ON p.id = cc.page_id
+      JOIN sources s ON s.id = p.source_id
+      ${idf.joins}
+      -- 1=1 anchor: the query_lex JOIN is the match predicate. No modality
+      -- filter here — the legacy chunk-grain path doesn't filter modality
+      -- either (unlike page-grain searchKeyword), so the candidate set stays
+      -- identical; or_idf changes ranking, not which chunks are eligible.
+      WHERE 1=1
+        ${typeClause}
+        ${typesClause}
+        ${excludeSlugsClause}
+        ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+        ${languageClause}
+        ${symbolKindClause}
+        ${afterDateClause}
+        ${beforeDateClause}
+        ${sourceClause}
+        ${hardExcludeClause}
+        ${visibilityClause}
+      GROUP BY ${idf.groupBy}
+      ORDER BY score DESC
+      LIMIT ${limitParam}
+      OFFSET ${offsetParam}
+    `;
+    } else {
+      rawQuery = `
       SELECT
         p.slug, p.id as page_id, p.title, p.type, p.source_id,
         p.effective_date, p.effective_date_source,
@@ -1605,12 +1710,23 @@ export class PostgresEngine implements BrainEngine {
       LIMIT ${limitParam}
       OFFSET ${offsetParam}
     `;
+    }
 
     const rows = await sql.begin(async sql => {
       await sql`SET LOCAL statement_timeout = '8s'`;
       return await sql.unsafe(rawQuery, params as Parameters<typeof sql.unsafe>[1]);
     });
     return rows.map(rowToSearchResult);
+  }
+
+  /**
+   * v0.45 — rebuild the per-source corpus term-statistics tables the `or_idf`
+   * keyword-ranking path reads for IDF weighting. Thin wrapper over the shared
+   * engine-agnostic helper (same call pglite-engine makes) so both engines
+   * rebuild identically — the parity guarantee. Idempotent.
+   */
+  async refreshCorpusTermStats(sourceId: string): Promise<void> {
+    await refreshCorpusTermStatsHelper(this, sourceId);
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {

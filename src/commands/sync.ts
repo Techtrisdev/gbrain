@@ -1185,6 +1185,19 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     slog(`Text imported. Run 'gbrain embed --stale' to generate embeddings.`);
   }
 
+  // v0.45 — refresh the per-source corpus term-statistics the or_idf keyword
+  // leg reads for IDF weighting, once at sync completion (work-class 2). Best-
+  // effort: a stats-refresh failure must never fail a sync (the or_idf query
+  // degrades to idf=1.0 without fresh stats, and the default 'and' knob never
+  // reads the tables). Only when chunks were actually (re)written this sync.
+  if (chunksCreated > 0) {
+    try {
+      await engine.refreshCorpusTermStats(opts.sourceId ?? 'default');
+    } catch (err) {
+      serr(`[sync] corpus term-stats refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   return {
     status: 'synced',
     fromCommit: lastCommit,

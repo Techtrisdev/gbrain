@@ -43,7 +43,8 @@ import { normalizeWeightForStorage } from './takes-fence.ts';
 import { GBrainError, PAGE_SORT_SQL } from './types.ts';
 import { computeAnomaliesFromBuckets } from './cycle/anomaly.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
-import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql } from './search/sql-ranking.ts';
+import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildIdfRankedKeyword } from './search/sql-ranking.ts';
+import { refreshCorpusTermStats as refreshCorpusTermStatsHelper } from './search/corpus-term-stats.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -1352,39 +1353,91 @@ export class PGLiteEngine implements BrainEngine {
       extraFilter += ` AND p.source_id = $${params.length}`;
     }
 
-    const { rows } = await this.db.query(
-      `WITH ranked AS (
-         SELECT
-           p.slug, p.id as page_id, p.title, p.type, p.source_id,
-           p.effective_date, p.effective_date_source,
-           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
-           CASE WHEN p.updated_at < (
-             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
-           ) THEN true ELSE false END AS stale
-         FROM content_chunks cc
-         JOIN pages p ON p.id = cc.page_id
-         JOIN sources s ON s.id = p.source_id
-         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-           -- v0.27.1: hide image rows from default text-keyword search so
-           -- OCR text doesn't drown text-page hits. Image-similarity queries
-           -- run a separate vector path on embedding_image.
-           AND cc.modality = 'text'
+    // v0.45 — keyword-leg ranking. Default 'and' = legacy boolean-AND ts_rank
+    // (bit-for-bit prior behavior). 'or_idf' = ranked-OR + corpus-IDF via the
+    // SAME shared buildIdfRankedKeyword builder postgres-engine splices — the OR
+    // match JOIN replaces the `sv @@ websearch_to_tsquery` predicate and the
+    // score sums per-lexeme idf * ts_rank_cd, degrading to pure ranked-OR
+    // (idf=1.0) when the stats tables are empty. Byte-identical SQL core to the
+    // postgres path is the parity guarantee the frozen eval gate depends on.
+    let rows: Record<string, unknown>[];
+    if (opts?.keyword_ranking === 'or_idf') {
+      const idf = buildIdfRankedKeyword({
+        tsvColumn: 'cc.search_vector',
+        queryParam: '$1',
+        pageAlias: 'p',
+        sourceFactorExpr: sourceFactorCase,
+      });
+      const result = await this.db.query(
+        `WITH ${idf.queryLexCte},
+         ranked AS (
+           SELECT
+             p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             p.effective_date, p.effective_date_source,
+             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+             ${idf.scoreExpr} AS score,
+             CASE WHEN p.updated_at < (
+               SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+             ) THEN true ELSE false END AS stale
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+           JOIN sources s ON s.id = p.source_id
+           ${idf.joins}
+           -- The query_lex JOIN is the match filter (replaces the legacy
+           -- sv @@ websearch_to_tsquery predicate); or_idf changes ranking +
+           -- graceful OR degradation, not which non-image chunks are eligible.
+           WHERE cc.modality = 'text' ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           GROUP BY ${idf.groupBy}
+           ORDER BY score DESC
+           LIMIT $2
+         ),
+         best_per_page AS (
+           SELECT DISTINCT ON (slug) *
+           FROM ranked
+           ORDER BY slug, score DESC
+         )
+         SELECT * FROM best_per_page
          ORDER BY score DESC
-         LIMIT $2
-       ),
-       best_per_page AS (
-         SELECT DISTINCT ON (slug) *
-         FROM ranked
-         ORDER BY slug, score DESC
-       )
-       SELECT * FROM best_per_page
-       ORDER BY score DESC
-       LIMIT $3 OFFSET $4`,
-      params
-    );
+         LIMIT $3 OFFSET $4`,
+        params
+      );
+      rows = result.rows as Record<string, unknown>[];
+    } else {
+      const result = await this.db.query(
+        `WITH ranked AS (
+           SELECT
+             p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             p.effective_date, p.effective_date_source,
+             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+             ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
+             CASE WHEN p.updated_at < (
+               SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+             ) THEN true ELSE false END AS stale
+           FROM content_chunks cc
+           JOIN pages p ON p.id = cc.page_id
+           JOIN sources s ON s.id = p.source_id
+           WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+             -- v0.27.1: hide image rows from default text-keyword search so
+             -- OCR text doesn't drown text-page hits. Image-similarity queries
+             -- run a separate vector path on embedding_image.
+             AND cc.modality = 'text'
+           ORDER BY score DESC
+           LIMIT $2
+         ),
+         best_per_page AS (
+           SELECT DISTINCT ON (slug) *
+           FROM ranked
+           ORDER BY slug, score DESC
+         )
+         SELECT * FROM best_per_page
+         ORDER BY score DESC
+         LIMIT $3 OFFSET $4`,
+        params
+      );
+      rows = result.rows as Record<string, unknown>[];
+    }
 
-    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
+    return rows.map(rowToSearchResult);
   }
 
   /**
@@ -1593,25 +1646,71 @@ export class PGLiteEngine implements BrainEngine {
 
     // visibilityClause already declared above (v0.32.7: hoisted so CJK branch can reuse).
 
-    const { rows } = await this.db.query(
-      `SELECT
-         p.slug, p.id as page_id, p.title, p.type, p.source_id,
-         p.effective_date, p.effective_date_source,
-         cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
-         ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
-         CASE WHEN p.updated_at < (
-           SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
-         ) THEN true ELSE false END AS stale
-       FROM content_chunks cc
-       JOIN pages p ON p.id = cc.page_id
-       JOIN sources s ON s.id = p.source_id
-       WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
-       ORDER BY score DESC
-       LIMIT $2 OFFSET $3`,
-      params
-    );
+    // v0.45 — keyword-leg ranking (chunk-grain; keeps parity with searchKeyword
+    // and the postgres searchKeywordChunks or_idf path). No page dedup, no
+    // modality filter (the legacy chunk-grain path filters neither), so the
+    // candidate set stays identical; or_idf changes ranking + OR degradation.
+    let rows: Record<string, unknown>[];
+    if (opts?.keyword_ranking === 'or_idf') {
+      const idf = buildIdfRankedKeyword({
+        tsvColumn: 'cc.search_vector',
+        queryParam: '$1',
+        pageAlias: 'p',
+        sourceFactorExpr: sourceFactorCase,
+      });
+      const result = await this.db.query(
+        `WITH ${idf.queryLexCte}
+         SELECT
+           p.slug, p.id as page_id, p.title, p.type, p.source_id,
+           p.effective_date, p.effective_date_source,
+           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+           ${idf.scoreExpr} AS score,
+           CASE WHEN p.updated_at < (
+             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+           ) THEN true ELSE false END AS stale
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+         JOIN sources s ON s.id = p.source_id
+         ${idf.joins}
+         WHERE 1=1 ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+         GROUP BY ${idf.groupBy}
+         ORDER BY score DESC
+         LIMIT $2 OFFSET $3`,
+        params
+      );
+      rows = result.rows as Record<string, unknown>[];
+    } else {
+      const result = await this.db.query(
+        `SELECT
+           p.slug, p.id as page_id, p.title, p.type, p.source_id,
+           p.effective_date, p.effective_date_source,
+           cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source,
+           ts_rank(cc.search_vector, websearch_to_tsquery('english', $1)) * ${sourceFactorCase} AS score,
+           CASE WHEN p.updated_at < (
+             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+           ) THEN true ELSE false END AS stale
+         FROM content_chunks cc
+         JOIN pages p ON p.id = cc.page_id
+         JOIN sources s ON s.id = p.source_id
+         WHERE cc.search_vector @@ websearch_to_tsquery('english', $1) ${detailFilter}${extraFilter} ${hardExcludeClause} ${visibilityClause}
+         ORDER BY score DESC
+         LIMIT $2 OFFSET $3`,
+        params
+      );
+      rows = result.rows as Record<string, unknown>[];
+    }
 
-    return (rows as Record<string, unknown>[]).map(rowToSearchResult);
+    return rows.map(rowToSearchResult);
+  }
+
+  /**
+   * v0.45 — rebuild the per-source corpus term-statistics tables the `or_idf`
+   * keyword-ranking path reads for IDF weighting. Thin wrapper over the shared
+   * engine-agnostic helper (same call postgres-engine makes) so both engines
+   * rebuild identically — the parity guarantee. Idempotent.
+   */
+  async refreshCorpusTermStats(sourceId: string): Promise<void> {
+    await refreshCorpusTermStatsHelper(this, sourceId);
   }
 
   async searchVector(embedding: Float32Array, opts?: SearchOpts): Promise<SearchResult[]> {

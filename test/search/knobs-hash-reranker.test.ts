@@ -56,7 +56,8 @@ describe('KNOBS_HASH_VERSION + version invariants', () => {
     // keyword_semantic_fallback, v=8 rerank_abstain_floor — abstain-on/off
     // return different result sets). See search-mode.test.ts.
     // v=9 (v0.43): answerability_guard (aq=) — enforce mode changes the result set.
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    // v=10 (v0.45): keyword_ranking (kwr=) — or_idf changes the result set.
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('hash is 16 hex chars regardless of reranker config', () => {

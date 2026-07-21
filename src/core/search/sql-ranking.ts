@@ -75,6 +75,86 @@ export function buildSourceFactorCase(
 }
 
 /**
+ * Ranked-OR + corpus-grounded IDF keyword-leg SQL fragments.
+ *
+ * The legacy keyword leg scores with `ts_rank(sv, websearch_to_tsquery('english',
+ * q))` whose multi-word semantics are boolean AND — one corpus-absent query word
+ * zeros the whole leg (the "zero-row cliff"). This builder instead:
+ *
+ *   - stems the query ONCE via `to_tsvector('english', q)` and expands it to its
+ *     lexemes with `tsvector_to_array` (the `query_lex` CTE);
+ *   - matches a chunk if ANY lexeme is present (OR, via a JOIN over the lexemes),
+ *     so a single absent word can no longer empty the leg;
+ *   - weights each matched lexeme by `idf = ln(1 + n_docs / GREATEST(df, 0.5))`
+ *     from the per-source `corpus_term_stats` tables (LEFT-JOINed; a miss or an
+ *     empty stats table COALESCEs the whole idf to 1.0 → pure ranked-OR, never a
+ *     crash), so a 50%-DF hub token like `techtris` is automatically ~5× quieter
+ *     than a df≈2 entity token — the hub-downweight a blind AND-retry can't do.
+ *
+ * Both `postgres-engine` and `pglite-engine` splice the SAME fragments (called
+ * with the same inputs) into their `searchKeyword` / `searchKeywordChunks`
+ * skeletons, so the IDF ranking CORE is byte-identical across engines — the
+ * parity guarantee the frozen eval gate depends on.
+ *
+ * Returns RAW SQL FRAGMENTS. Column/param references (tsvColumn, queryParam,
+ * pageAlias) are engine-supplied at the call site and never user-controllable;
+ * `sourceFactorExpr` is itself a builder output (buildSourceFactorCase). Nothing
+ * here inlines user input.
+ *
+ * @param tsvColumn        — qualified search_vector column, e.g. `'cc.search_vector'`.
+ * @param queryParam       — bind-param placeholder holding the raw query, e.g. `'$1'`.
+ * @param pageAlias        — page-table alias whose `.source_id` scopes per-source
+ *                           stats, e.g. `'p'`.
+ * @param sourceFactorExpr — the source-boost CASE fragment (buildSourceFactorCase output).
+ *
+ * @returns `{ queryLexCte, scoreExpr, joins, groupBy }`:
+ *   - `queryLexCte` — a single `WITH`-item body (`query_lex AS (...)`); the
+ *      engine prepends it to its rawQuery's WITH clause.
+ *   - `scoreExpr`  — the per-chunk `SUM(idf * ts_rank_cd(...)) * sourceFactor`
+ *      score; replaces the legacy `ts_rank(...) * sourceFactor`.
+ *   - `joins`      — the lexeme OR-match JOIN + the two LEFT JOINs onto the stats
+ *      tables; appended after the engine's existing FROM/JOINs. The INNER
+ *      `JOIN query_lex` IS the match filter, replacing the legacy
+ *      `WHERE sv @@ websearch_to_tsquery(...)`.
+ *   - `groupBy`    — the `GROUP BY p.id, cc.id` key (PK functional dependency
+ *      covers every selected page/chunk column, so it works for both engines'
+ *      column lists incl. pglite's `stale` subquery on `p.updated_at`).
+ */
+export function buildIdfRankedKeyword(opts: {
+  tsvColumn: string;
+  queryParam: string;
+  pageAlias: string;
+  sourceFactorExpr: string;
+}): { queryLexCte: string; scoreExpr: string; joins: string; groupBy: string } {
+  const { tsvColumn, queryParam, pageAlias, sourceFactorExpr } = opts;
+
+  const queryLexCte =
+    `query_lex AS (` +
+    `SELECT DISTINCT lex ` +
+    `FROM unnest(tsvector_to_array(to_tsvector('english', ${queryParam}))) AS lex` +
+    `)`;
+
+  // idf per (chunk, matched lexeme). n_docs (m.n_docs) missing → whole ln() is
+  // NULL → COALESCE to 1.0 (empty/absent stats ⇒ pure ranked-OR). df missing on
+  // a populated table → GREATEST(NULL,0.5)=0.5 ⇒ a very-rare (high-idf) token.
+  // ts_rank_cd normalization flag 32 (rank/(rank+1)) bounds each lexeme's
+  // contribution so one very long chunk can't dominate.
+  const idfExpr =
+    `COALESCE(ln(1 + m.n_docs::numeric / GREATEST(cts.df, 0.5)), 1.0)`;
+  const scoreExpr =
+    `SUM(${idfExpr} * ts_rank_cd(${tsvColumn}, plainto_tsquery('simple', ql.lex), 32)) * ${sourceFactorExpr}`;
+
+  const joins =
+    `JOIN query_lex ql ON ${tsvColumn} @@ plainto_tsquery('simple', ql.lex) ` +
+    `LEFT JOIN corpus_term_stats cts ON cts.source_id = ${pageAlias}.source_id AND cts.lexeme = ql.lex ` +
+    `LEFT JOIN corpus_term_stats_meta m ON m.source_id = ${pageAlias}.source_id`;
+
+  const groupBy = `${pageAlias}.id, cc.id`;
+
+  return { queryLexCte, scoreExpr, joins, groupBy };
+}
+
+/**
  * Build a `NOT (col LIKE 'p1%' OR col LIKE 'p2%' OR ...)` exclusion clause.
  *
  * Why OR-chain wrapped in NOT, not `NOT LIKE ALL/ANY(array)`:

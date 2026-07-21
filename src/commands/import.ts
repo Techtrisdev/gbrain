@@ -412,6 +412,20 @@ export async function runImport(
     await engine.setConfig('sync.repo_path', dir);
   }
 
+  // v0.45 — refresh the per-source corpus term-statistics the or_idf keyword
+  // leg reads for IDF weighting, once at import completion (work-class 2).
+  // Best-effort: a stats-refresh failure must never fail an import (the or_idf
+  // query degrades to idf=1.0 without fresh stats, and the default 'and' knob
+  // never reads the tables). Only when chunks were actually (re)written.
+  if (chunksCreated > 0) {
+    try {
+      await engine.refreshCorpusTermStats(sourceId ?? 'default');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[import] corpus term-stats refresh failed: ${msg}`);
+    }
+  }
+
   return { imported, skipped, errors, chunksCreated, failures };
 }
 
