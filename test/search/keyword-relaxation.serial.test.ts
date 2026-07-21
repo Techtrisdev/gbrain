@@ -13,9 +13,10 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
-import { hybridSearch } from '../../src/core/search/hybrid.ts';
+import { hybridSearch, hybridSearchCached } from '../../src/core/search/hybrid.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
 import type { PageInput, HybridSearchMeta } from '../../src/core/types.ts';
+import type { RerankInput, RerankResult } from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 const DIMS = 1536;
@@ -75,5 +76,40 @@ describe('keyword-leg graceful relaxation', () => {
     // stays vector-only (correctly); no spurious relaxation.
     const { meta } = await run('production status of the pipeline');
     expect((meta as HybridSearchMeta | null)?.keyword_relaxed).toBeUndefined();
+  });
+
+  test('keyword_relaxed survives the hybridSearchCached wrapper (the production query path)', async () => {
+    // The query/search ops route through hybridSearchCached, whose meta is
+    // RECONSTRUCTED field-by-field — a bare-emit-only flag is silently dropped
+    // there (the PR #76 wrapper-meta gap). Assert the flag survives the miss-path
+    // reconstruction so relaxation firing-rate is observable on real traffic.
+    let meta: HybridSearchMeta | null = null;
+    await hybridSearchCached(engine, 'current Widget Mirror production capture status', {
+      reranker: { enabled: false, topNIn: 30, topNOut: null },
+      onMeta: (m) => { meta = m; },
+    });
+    expect((meta as HybridSearchMeta | null)?.keyword_relaxed).toBe(true);
+  });
+
+  test('relaxed on-topic-but-unhelpful candidates are FLOORED, not served as a confident answer (the safety claim)', async () => {
+    // adv-1 guard: relaxation ADDS on-topic candidates to the reranker pool. When
+    // NONE of them actually answers (reranker scores all below the floor), the
+    // abstain floor must reject them — relaxation must not manufacture a confident
+    // wrong answer. Reranker stub scores every candidate 0.1; floor 0.5.
+    const rerankAllLow = {
+      enabled: true, topNIn: 30, topNOut: null,
+      rerankerFn: async (input: RerankInput): Promise<RerankResult[]> =>
+        input.documents.map((_, i) => ({ index: i, relevanceScore: 0.1 })),
+    };
+    await engine.setConfig('search.rerank_abstain_floor', '0.5');
+    let meta: HybridSearchMeta | null = null;
+    const results = await hybridSearch(engine, 'current Widget Mirror production capture status', {
+      reranker: rerankAllLow, onMeta: (m) => { meta = m; },
+    }) as unknown[];
+    // Relaxation fired (surfaced Widget Mirror candidates) but the floor abstains.
+    expect((meta as HybridSearchMeta | null)?.keyword_relaxed).toBe(true);
+    expect((meta as HybridSearchMeta | null)?.abstained).toBe(true);
+    expect(results.length).toBe(0);
+    await engine.unsetConfig('search.rerank_abstain_floor');
   });
 });
