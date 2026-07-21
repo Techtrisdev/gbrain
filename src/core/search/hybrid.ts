@@ -575,6 +575,13 @@ export async function hybridSearch(
     // it never has to read config. Engines normalize string-or-descriptor
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
+    // v0.45 (BM25 PR1): thread the resolved keyword-leg ranking knob so the
+    // inner engine.searchKeyword honors search.keyword_ranking. Without this the
+    // knob folds into knobsHash (cache key) but NEVER reaches the engine — the
+    // rebuild shape above is an explicit allowlist, so flipping the config would
+    // be a silent no-op that only cold-starts the cache (adv-1). Default 'and'
+    // ⇒ the engine's legacy else-branch ⇒ byte-identical to pre-BM25.
+    keyword_ranking: resolvedMode.keyword_ranking,
   };
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never
@@ -655,8 +662,14 @@ export async function hybridSearch(
   // injected lexical competitors could reorder RRF, so "already matched" here means
   // the KEYWORD leg matched, not that the query was already answered well. Skips
   // image modality + queries with no distinctive tokens (stays vector-only).
+  // v0.45 (BM25 PR1) — the distinctiveTokens AND-retry relaxation is a patch for
+  // the boolean-AND zero-row cliff that ONLY the legacy 'and' leg suffers. The
+  // or_idf leg is graceful-OR by construction (one absent word can't zero it), so
+  // firing the relaxation under or_idf would redundantly re-AND the distinctive
+  // (hub-ish) tokens on top of an already-recalled leg (adv-1c / plan line 176).
+  // Gate on the resolved knob; 'and' (default) keeps the exact prior behavior.
   let keywordRelaxed = false;
-  if (keywordResults.length === 0 && earlyModality !== 'image') {
+  if (resolvedMode.keyword_ranking === 'and' && keywordResults.length === 0 && earlyModality !== 'image') {
     const relaxedQuery = [...distinctiveTokens(query)].join(' ');
     if (relaxedQuery && relaxedQuery.toLowerCase() !== query.toLowerCase()) {
       const relaxed = await engine.searchKeyword(relaxedQuery, searchOpts);

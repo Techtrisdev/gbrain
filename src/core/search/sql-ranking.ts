@@ -134,13 +134,20 @@ export function buildIdfRankedKeyword(opts: {
     `FROM unnest(tsvector_to_array(to_tsvector('english', ${queryParam}))) AS lex` +
     `)`;
 
-  // idf per (chunk, matched lexeme). n_docs (m.n_docs) missing → whole ln() is
-  // NULL → COALESCE to 1.0 (empty/absent stats ⇒ pure ranked-OR). df missing on
-  // a populated table → GREATEST(NULL,0.5)=0.5 ⇒ a very-rare (high-idf) token.
-  // ts_rank_cd normalization flag 32 (rank/(rank+1)) bounds each lexeme's
-  // contribution so one very long chunk can't dominate.
+  // idf per (chunk, matched lexeme). n_docs (m.n_docs) missing OR zero →
+  // NULLIF(...,0) → whole ln() is NULL → COALESCE to 1.0 (empty/absent stats ⇒
+  // pure ranked-OR). The NULLIF guard is load-bearing: refreshCorpusTermStats
+  // ALWAYS writes a meta row (even n_docs=0 for an empty/just-truncated source),
+  // and ln(1 + 0/df)=ln(1)=0 is NOT NULL, so without NULLIF a present-but-zero
+  // meta row would drive idf=0 for every lexeme → SUM=0 → the whole source's
+  // or_idf ranking collapses to score-ties (adv-3). df missing on a populated
+  // table → GREATEST(NULL,0.5)=0.5 ⇒ a very-rare (high-idf) token; this over-boost
+  // on stale-cts-df is a KNOWN pre-flip gate (documented in the BM25 plan), left
+  // deliberately so a legitimately-rare term isn't neutralized. ts_rank_cd
+  // normalization flag 32 (rank/(rank+1)) bounds each lexeme's contribution so
+  // one very long chunk can't dominate.
   const idfExpr =
-    `COALESCE(ln(1 + m.n_docs::numeric / GREATEST(cts.df, 0.5)), 1.0)`;
+    `COALESCE(ln(1 + NULLIF(m.n_docs, 0)::numeric / GREATEST(cts.df, 0.5)), 1.0)`;
   const scoreExpr =
     `SUM(${idfExpr} * ts_rank_cd(${tsvColumn}, plainto_tsquery('simple', ql.lex), 32)) * ${sourceFactorExpr}`;
 
