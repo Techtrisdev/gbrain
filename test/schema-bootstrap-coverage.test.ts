@@ -757,6 +757,10 @@ const COLUMN_EXEMPTIONS = new Set<string>([
   // other search_telemetry additions: migration-created table, not in
   // PGLITE_SCHEMA_SQL, additive/defaulted, lone consumer runs post-migration.
   'search_telemetry.reranker_failed',
+  // v0.44 (migration v104 search_telemetry_abstained_not_answerable) — same posture
+  // as the other search_telemetry additions: migration-created table, not in
+  // PGLITE_SCHEMA_SQL, additive/defaulted, lone consumer runs post-migration.
+  'search_telemetry.abstained_not_answerable',
 ]);
 
 test('every ALTER TABLE ADD COLUMN in MIGRATIONS is covered by applyForwardReferenceBootstrap (column-only class)', async () => {

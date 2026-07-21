@@ -1529,13 +1529,16 @@ const search: Operation = {
     // client path's degraded-mode surface; count + surface it here or it's inert
     // for most real traffic (same reasoning as abstained above).
     const rescueRerankerFailed = (rescueMeta as HybridSearchMeta | null)?.reranker_failed === true;
+    // v0.44 — split the enforce-answerability abstentions out of the rescue bucket
+    // too, so the guard's reject rate is measurable on the dominant client path.
+    const rescueNotAnswerable = (rescueMeta as HybridSearchMeta | null)?.abstain_reason === 'not_answerable';
     recordSearchTelemetry(ctx.engine, {
       vector_enabled: false,
       detail_resolved: null,
       expansion_applied: false,
       intent,
       mode: 'keyword',
-    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained, reranker_failed: rescueRerankerFailed }, {
+    }, { results_count: keywordResults.length, fallback_fired, abstained: rescueAbstained, abstained_not_answerable: rescueNotAnswerable, reranker_failed: rescueRerankerFailed }, {
       client: ctx.auth?.clientName,
       sourceId: ctx.auth?.sourceId ?? ctx.sourceId,
     });

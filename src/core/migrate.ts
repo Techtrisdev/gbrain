@@ -4783,6 +4783,33 @@ export const MIGRATIONS: Migration[] = [
       return rows.length === 1;
     },
   },
+  {
+    version: 104,
+    name: 'search_telemetry_abstained_not_answerable',
+    // v0.44 — per-reason abstention split. `abstained_not_answerable` counts, per
+    // rollup bucket, the SUBSET of `abstained` that came from the answerability
+    // guard in ENFORCE mode (abstain_reason 'not_answerable'), as opposed to the
+    // rerank-abstention confidence floor. This is the PREREQUISITE for promoting the
+    // answerability guard from shadow to enforce: it lets the operator measure the
+    // guard's real reject rate (abstained_not_answerable / count) on live traffic
+    // separately from the floor abstentions. Zero until the guard enforces (shadow
+    // never abstains). Additive, defaulted, idempotent — safe on existing rows.
+    idempotent: true,
+    sql: `
+      ALTER TABLE search_telemetry
+        ADD COLUMN IF NOT EXISTS abstained_not_answerable INTEGER NOT NULL DEFAULT 0;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'search_telemetry'
+            AND column_name = 'abstained_not_answerable'`,
+      );
+      return rows.length === 1;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
