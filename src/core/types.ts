@@ -1309,11 +1309,16 @@ export interface HybridSearchMeta {
    */
   vector_result_count?: number;
   /**
-   * v0.42 — the per-list vector recall LIMIT requested (min(limit*2, MAX)). The
-   * denominator for `vector_result_count`: a healthy text query returns exactly
-   * this many rows whenever the scoped corpus has >= this many chunks, so
-   * `vector_result_count < vector_requested_k` (on a single-list text query) flags
-   * a partial recall miss per-request, with no baseline needed.
+   * v0.42 — the recall-HEALTH denominator for `vector_result_count`, kept at the
+   * display-intent target `min(limit*2, MAX)`. v0.44 note: this is DELIBERATELY
+   * decoupled from the actual engine recall `innerLimit`, which is now floored at
+   * `reranker_top_n_in` so the reranker is never starved (see resolveInnerLimit).
+   * A healthy text query returns AT LEAST this many rows whenever the scoped
+   * corpus has >= this many chunks, so `vector_result_count < vector_requested_k`
+   * (on a single-list text query) flags a partial recall miss per-request with no
+   * baseline needed. Reporting the floored innerLimit here instead would make a
+   * small/narrowly-scoped corpus false-flag as degraded (count < floor is normal
+   * when the corpus is smaller than the floor).
    */
   vector_requested_k?: number;
   /**

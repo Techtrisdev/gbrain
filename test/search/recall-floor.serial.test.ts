@@ -63,6 +63,15 @@ describe('resolveInnerLimit — recall-floor invariant (unit)', () => {
     const off = { rerankerEnabled: false, rerankerTopNIn: TOP_N_IN };
     expect(resolveInnerLimit(3, off)).toBe(6); // legacy limit*2, no floor
   });
+
+  test('a raised top_n_in floors recall fleet-wide, bounded by MAX (intended, not a bug)', () => {
+    // top_n_in doubles as the recall floor, so an operator raising it widens the
+    // pool on EVERY reranker-enabled query — deliberate (the reranker still
+    // arbitrates) and hard-capped at MAX_SEARCH_LIMIT. Pinned so the fleet-wide
+    // amplification is a documented contract, not a silent surprise.
+    expect(resolveInnerLimit(3, { rerankerEnabled: true, rerankerTopNIn: 100 })).toBe(MAX);
+    expect(resolveInnerLimit(3, { rerankerEnabled: true, rerankerTopNIn: 500 })).toBe(MAX); // still capped
+  });
 });
 
 // ---- End-to-end reproduction ------------------------------------------------
@@ -72,8 +81,8 @@ const DIMS = 1536;
 // Query points at basis dim 0. A page's distance to the query grows with its
 // dim-1 magnitude (cosine = 1/sqrt(1+a^2)), so `a` is a monotone rank knob.
 const QUERY_EMB = Array.from({ length: DIMS }, (_, j) => (j === 0 ? 1 : 0));
-function pageEmb(a: number): number[] {
-  const v = new Array(DIMS).fill(0);
+function pageEmb(a: number): Float32Array {
+  const v = new Float32Array(DIMS);
   v[0] = 1;
   v[1] = a;
   return v;
@@ -187,5 +196,16 @@ describe('recall-floor — end-to-end false-abstain guard', () => {
       expect(meta?.abstained).toBe(false);
       expect(results.some((r) => r.slug === ANSWER_SLUG)).toBe(true);
     }
+  });
+
+  test('recall-health denominator (vector_requested_k) stays display-intent, decoupled from the floor', async () => {
+    // Guards adv-1: `vector_requested_k` must remain min(limit*2, MAX), NOT the
+    // floored innerLimit. At limit=3 the recall pool is floored to 30, but the
+    // denominator stays 6 — so a widened recall reports vector_result_count >= 6
+    // (healthy), never count < floor (a false degraded-recall flag on a corpus
+    // smaller than the floor). If this rode the floor it would be 30 here.
+    const { meta } = await run(Q, 3);
+    expect(meta?.vector_requested_k).toBe(6);
+    expect(meta?.vector_result_count ?? 0).toBeGreaterThanOrEqual(6);
   });
 });

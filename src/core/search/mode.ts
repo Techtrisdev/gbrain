@@ -84,7 +84,12 @@ export interface ModeBundle {
    */
   reranker_model: string;
   /** Candidates to send upstream (default 30). The full result list always
-   *  reaches the user — topNIn just caps API spend on the rerank call. */
+   *  reaches the user — topNIn caps API spend on the rerank call. v0.44: it ALSO
+   *  floors the recall pool (resolveInnerLimit) so recall never hands the reranker
+   *  fewer candidates than it will score. Raising this therefore widens BOTH the
+   *  rerank payload AND recall depth on every reranker-enabled query (bounded by
+   *  MAX_SEARCH_LIMIT), not just large-limit ones — tune with that fleet-wide
+   *  cost in mind. */
   reranker_top_n_in: number;
   /**
    * Truncate the reranked output to this many. `null` = no truncate; the
