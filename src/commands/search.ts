@@ -75,6 +75,8 @@ const KNOB_DESCRIPTIONS: Record<keyof ModeBundle, string> = {
   process_reorder_enabled: 'Post-rerank reorder: lift process docs above person results for process/how-to queries (entity-guarded)',
   // v0.42 keyword→semantic fallback
   keyword_semantic_fallback: 'Keyword `search` falls back to semantic results when the lexical query returns zero (fallback results labeled match_type:semantic)',
+  // v0.45 keyword-leg ranking
+  keyword_ranking: "Keyword-leg ranking: 'and' (legacy boolean-AND ts_rank) | 'or_idf' (ranked-OR + corpus-grounded IDF; kills the one-absent-word zero-row cliff)",
 };
 
 interface SearchModesReport {

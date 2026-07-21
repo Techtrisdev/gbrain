@@ -1462,6 +1462,14 @@ const search: Operation = {
   handler: async (ctx, p) => {
     const startedAt = Date.now();
     const queryText = p.query as string;
+    // v0.45 (BM25 PR1): honor search.keyword_ranking on the keyword-only 'search'
+    // tool too. This is JARVIS's dominant path and the primary beneficiary of the
+    // or_idf one-absent-word cliff-fix, so it MUST be threaded here — the hybrid
+    // 'query' path resolves the knob via the mode bundle, but this direct handler
+    // builds its own opts. One config read; unset/anything-but-'or_idf' ⇒ 'and' ⇒
+    // engine legacy branch ⇒ byte-identical to pre-BM25 (adv-1b).
+    const kwrRaw = await ctx.engine.getConfig('search.keyword_ranking').catch(() => null);
+    const keyword_ranking: 'and' | 'or_idf' = kwrRaw === 'or_idf' ? 'or_idf' : 'and';
     // v0.34.1 (#861 — P0 leak seal): thread caller's source scope into
     // searchKeyword. Pre-fix this op silently returned cross-source hits
     // for any auth'd OAuth client.
@@ -1469,6 +1477,7 @@ const search: Operation = {
       limit: (p.limit as number) || 20,
       offset: (p.offset as number) || 0,
       ...sourceScopeOpts(ctx),
+      keyword_ranking,
     });
     const keywordResults = dedupResults(raw);
 

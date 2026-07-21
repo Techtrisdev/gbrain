@@ -79,6 +79,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       contextual_retrieval: 'none',
       process_reorder_enabled: false,
       keyword_semantic_fallback: false,
+      keyword_ranking: 'and',
     });
   });
 
@@ -109,6 +110,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       contextual_retrieval: 'title',
       process_reorder_enabled: false,
       keyword_semantic_fallback: false,
+      keyword_ranking: 'and',
     });
   });
 
@@ -137,6 +139,7 @@ describe('SEARCH_MODES + MODE_BUNDLES canonical shape', () => {
       contextual_retrieval: 'per_chunk_synopsis',
       process_reorder_enabled: false,
       keyword_semantic_fallback: false,
+      keyword_ranking: 'and',
     });
   });
 
@@ -338,7 +341,10 @@ describe('knobsHash determinism + cross-mode separation (CDX-4)', () => {
     // returns [] where abstain-off returns the top hits, so it changes the result set and a
     // write under one setting must never be served to the other.
     // v=9 (v0.43): answerability_guard (aq=) — enforce mode changes the result set.
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    // v=10 (v0.45): keyword_ranking (kwr=) — or_idf changes the result set
+    // (ranked-OR admits chunks the boolean-AND leg dropped), so an or_idf write
+    // must never be served to an 'and' lookup.
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('T1 (codex): floor_ratio set vs unset produces DIFFERENT hashes (cache contamination prevention)', () => {

@@ -259,6 +259,22 @@ export interface ModeBundle {
   keyword_semantic_fallback: boolean;
 
   /**
+   * v0.45 — keyword-leg ranking algorithm.
+   *   'and'    — legacy: `ts_rank(sv, websearch_to_tsquery('english', q))` with
+   *              boolean-AND matching (bit-for-bit prior behavior; the rollback
+   *              flip). One corpus-absent query word zeros the whole leg.
+   *   'or_idf' — ranked-OR with corpus-grounded IDF: matches on ANY query lexeme
+   *              (kills the zero-row cliff) and weights each by
+   *              `ln(1 + n_docs/df)` from `corpus_term_stats` (downweights hub
+   *              tokens without a hand-maintained proper-noun list).
+   * DEFAULT 'and' in ALL bundles (default-legacy rollout; the or_idf path is new
+   * code gated behind this knob). Override chain: per-call SearchOpts →
+   * `search.keyword_ranking` config → mode bundle default. Participates in
+   * knobsHash (`kwr=`) — an or_idf write must not be served to an 'and' lookup.
+   */
+  keyword_ranking: 'and' | 'or_idf';
+
+  /**
    * v0.40.3.0 — contextual retrieval tier per mode. Wraps chunks at embed
    * time so the embedder sees document-level orientation alongside the
    * chunk. Wrapper is built JUST IN TIME and never persisted as
@@ -340,6 +356,9 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     process_reorder_enabled: false,
     // v0.42 — keyword→semantic fallback OFF (opt-in rollout).
     keyword_semantic_fallback: false,
+    // v0.45 — keyword ranking DEFAULT-LEGACY ('and'); or_idf is opt-in per the
+    // default-legacy rollout (flip after the frozen gate + probe certify it).
+    keyword_ranking: 'and',
   }),
   balanced: Object.freeze({
     cache_enabled: true,
@@ -396,6 +415,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     process_reorder_enabled: false,
     // v0.42 — keyword→semantic fallback OFF by default in balanced too (opt-in rollout).
     keyword_semantic_fallback: false,
+    // v0.45 — keyword ranking DEFAULT-LEGACY ('and') in balanced too.
+    keyword_ranking: 'and',
   }),
   tokenmax: Object.freeze({
     cache_enabled: true,
@@ -446,6 +467,8 @@ export const MODE_BUNDLES: Readonly<Record<SearchMode, Readonly<ModeBundle>>> = 
     process_reorder_enabled: false,
     // v0.42 — keyword→semantic fallback OFF by default in tokenmax too (opt-in rollout).
     keyword_semantic_fallback: false,
+    // v0.45 — keyword ranking DEFAULT-LEGACY ('and') in tokenmax too.
+    keyword_ranking: 'and',
   }),
 });
 
@@ -499,6 +522,8 @@ export interface SearchKeyOverrides {
   process_reorder_enabled?: boolean;
   // v0.42 — keyword→semantic fallback per-key (config) override.
   keyword_semantic_fallback?: boolean;
+  // v0.45 — keyword-leg ranking per-key (config) override ('and' | 'or_idf').
+  keyword_ranking?: 'and' | 'or_idf';
   // v0.40.3.0 contextual retrieval. CRMode override + soft kill switch.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -547,6 +572,8 @@ export interface SearchPerCallOpts {
   process_reorder_enabled?: boolean;
   // v0.42 — keyword→semantic fallback per-call override.
   keyword_semantic_fallback?: boolean;
+  // v0.45 — keyword-leg ranking per-call override ('and' | 'or_idf').
+  keyword_ranking?: 'and' | 'or_idf';
   // v0.40.3.0 contextual retrieval per-call overrides.
   contextual_retrieval?: CRMode;
   contextual_retrieval_disabled?: boolean;
@@ -629,6 +656,8 @@ export function resolveSearchMode(input: ResolveSearchModeInput): ResolvedSearch
     process_reorder_enabled: pick('process_reorder_enabled'),
     // v0.42 — keyword→semantic fallback resolved via the same pick chain.
     keyword_semantic_fallback: pick('keyword_semantic_fallback'),
+    // v0.45 — keyword-leg ranking resolved via the same pick chain (perCall → config → bundle).
+    keyword_ranking: pick('keyword_ranking'),
     // v0.40.3.0 contextual retrieval — resolved via the same pick chain.
     contextual_retrieval: pick('contextual_retrieval'),
     contextual_retrieval_disabled: pick('contextual_retrieval_disabled'),
@@ -714,7 +743,11 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // v0.42 bump 6→7: keyword_semantic_fallback added under v=7 (append-only). A
 // fallback-on write changes the RESULT SET of a keyword search (empty → semantic
 // neighbors), so it must not be served to a fallback-off lookup.
-export const KNOBS_HASH_VERSION = 9;
+// v0.45 bump 9→10: keyword_ranking (kwr=) folded in — the or_idf leg returns a
+// DIFFERENT keyword result set than the legacy 'and' leg (ranked-OR recall + IDF
+// ordering), so an or_idf write must never be served to an 'and' lookup (and
+// vice-versa on rollback). Append-only (CDX2-F13).
+export const KNOBS_HASH_VERSION = 10;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -830,6 +863,11 @@ export function knobsHash(
     `aq=${knobs.answerability_guard === 'enforce'
         ? `enf:${knobs.answerability_band_lo.toFixed(3)}:${knobs.answerability_band_hi.toFixed(3)}`
         : 'ns'}`,
+    // v=10 (v0.45, append-only): keyword_ranking. The or_idf leg returns a
+    // different keyword result set (ranked-OR recall + IDF ordering) than the
+    // legacy 'and' leg, so an or_idf write must never be served to an 'and'
+    // lookup (and vice-versa on rollback).
+    `kwr=${knobs.keyword_ranking}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -1025,6 +1063,15 @@ export function loadOverridesFromConfig(
     out.keyword_semantic_fallback = ksf === '1' || ksf.toLowerCase() === 'true';
   }
 
+  // v0.45 — keyword_ranking. Only the two known values activate an override;
+  // anything else (incl. malformed) falls through to the mode bundle default
+  // ('and'), so a bad config value can never silently switch ranking algorithms.
+  const kwr = get('search.keyword_ranking');
+  if (kwr !== undefined) {
+    const v = kwr.trim().toLowerCase();
+    if (v === 'and' || v === 'or_idf') out.keyword_ranking = v;
+  }
+
   return out;
 }
 
@@ -1063,6 +1110,8 @@ export const SEARCH_MODE_CONFIG_KEYS: ReadonlyArray<string> = Object.freeze([
   'search.process_reorder_enabled',
   // v0.42 keyword→semantic fallback
   'search.keyword_semantic_fallback',
+  // v0.45 keyword-leg ranking ('and' | 'or_idf')
+  'search.keyword_ranking',
   // v0.40.3.0 contextual retrieval — tier override + soft kill switch.
   // Per-mode default lives in the bundle; this key lets power users
   // override at the per-key level without flipping the global mode.

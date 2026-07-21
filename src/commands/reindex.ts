@@ -170,6 +170,9 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   let failed = 0;
   const BATCH = 100;
   const repoPath = opts.repoPath ? resolve(opts.repoPath) : null;
+  // v0.45 — sources touched this run; their corpus term-stats get refreshed
+  // once each after the batch loop (work-class 2). A re-chunk changes df/n_docs.
+  const touchedSources = new Set<string>();
 
   while (reindexed + skipped + failed < target) {
     const remaining = target - (reindexed + skipped + failed);
@@ -179,6 +182,7 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
 
     for (const row of batch) {
       reporter.tick();
+      touchedSources.add(row.source_id);
       try {
         // Prefer importFromFile when we have a source_path AND the file
         // still exists on disk — re-runs both the path-authoritative slug
@@ -224,6 +228,22 @@ export async function runReindex(engine: BrainEngine, args: string[]): Promise<R
   }
 
   reporter.finish();
+
+  // v0.45 — refresh the per-source corpus term-statistics the or_idf keyword
+  // leg reads for IDF weighting, once per source re-chunked this run. Best-
+  // effort: a stats-refresh failure must never fail a reindex (the or_idf query
+  // degrades to idf=1.0 without fresh stats, and the default 'and' knob doesn't
+  // read the tables at all). No-op when nothing was reindexed.
+  if (reindexed > 0) {
+    for (const sid of touchedSources) {
+      try {
+        await engine.refreshCorpusTermStats(sid);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`[reindex] corpus term-stats refresh failed for source '${sid}': ${msg}\n`);
+      }
+    }
+  }
 
   const result: ReindexResult = {
     pending,

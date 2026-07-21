@@ -4810,6 +4810,68 @@ export const MIGRATIONS: Migration[] = [
       return rows.length === 1;
     },
   },
+  {
+    version: 105,
+    name: 'corpus_term_stats',
+    // Ranked-OR + corpus-grounded IDF keyword leg (PR1, default-legacy). Two
+    // per-source term-statistics tables feed the `or_idf` keyword-ranking knob
+    // (search.keyword_ranking; DEFAULT 'and' → these tables sit UNREAD until an
+    // operator flips the knob). They make the keyword leg a real IDF-weighted
+    // ranked-OR instead of boolean-AND ts_rank:
+    //
+    //   corpus_term_stats(source_id, lexeme, df)  — per (source, english-stemmed
+    //     lexeme) document frequency: the number of text chunks in that source
+    //     whose search_vector contains the lexeme. Refreshed idempotently at
+    //     reindex/sync completion via refreshCorpusTermStats() (ts_stat over
+    //     content_chunks.search_vector). PK (source_id, lexeme).
+    //   corpus_term_stats_meta(source_id, n_docs, refreshed_at) — per-source
+    //     total text-chunk count (the IDF denominator N) + refresh timestamp.
+    //
+    // The or_idf query LEFT-JOINs both and COALESCEs a missing n_docs/df so that
+    // on a brain whose stats are empty (fresh, or mid-deploy before the first
+    // refresh) idf defaults to 1.0 → pure ranked-OR, no cliff, never a crash.
+    // This decouples the migration/refresh timing from the query change.
+    //
+    // Migration-only tables (NOT in PGLITE_SCHEMA_SQL) — same posture as
+    // search_telemetry / query_cache. Both engines run this migration in
+    // initSchema (runMigrations runs after the schema blob), so the tables
+    // exist on fresh Postgres AND fresh PGLite; schema-drift parity holds. No
+    // schema-bootstrap-coverage entry is required: this migration adds TABLES
+    // via CREATE TABLE (not ALTER TABLE ADD COLUMN, which extractAddedColumns-
+    // FromMigrations keys on), and PGLITE_SCHEMA_SQL never forward-references
+    // them, so neither the CREATE-INDEX static check nor the column-only class
+    // check flags them.
+    //
+    // No explicit RLS POLICY — on Postgres the v35 auto-RLS event trigger
+    // ENABLEs row-level security on these public tables like every other one.
+    // No PII: source ids + FTS lexemes + counts only, never query text or
+    // capture bodies.
+    //
+    // Idempotent: CREATE TABLE IF NOT EXISTS.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS corpus_term_stats (
+        source_id TEXT    NOT NULL,
+        lexeme    TEXT    NOT NULL,
+        df        INTEGER NOT NULL,
+        PRIMARY KEY (source_id, lexeme)
+      );
+      CREATE TABLE IF NOT EXISTS corpus_term_stats_meta (
+        source_id    TEXT PRIMARY KEY,
+        n_docs       INTEGER     NOT NULL,
+        refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name
+           FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN ('corpus_term_stats', 'corpus_term_stats_meta')`,
+      );
+      return rows.length === 2;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

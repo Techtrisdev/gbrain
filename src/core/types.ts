@@ -930,6 +930,16 @@ export interface SearchOpts {
    * would resolve to the same mode default and the gate would be a no-op.
    */
   graph_signals?: boolean;
+  /**
+   * v0.45 — keyword-leg ranking algorithm for engine.searchKeyword /
+   * searchKeywordChunks. Undefined → the engine's legacy 'and' path
+   * (`ts_rank` + boolean-AND `websearch_to_tsquery`), bit-for-bit prior
+   * behavior. 'or_idf' selects the ranked-OR + corpus-IDF path
+   * (buildIdfRankedKeyword). hybridSearch threads the resolved
+   * `keyword_ranking` mode knob into this field; direct engine callers that
+   * leave it unset stay on the legacy path.
+   */
+  keyword_ranking?: 'and' | 'or_idf';
 }
 
 /**

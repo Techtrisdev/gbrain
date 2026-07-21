@@ -145,7 +145,8 @@ describe('D2 — knobsHash differs across cross-modal knob values', () => {
     // v=7 keyword_semantic_fallback, v=8 rerank_abstain_floor (all append-only,
     // result-affecting knobs).
     // v=9 (v0.43): answerability_guard (aq=) — enforce mode changes the result set.
-    expect(KNOBS_HASH_VERSION).toBe(9);
+    // v=10 (v0.45): keyword_ranking (kwr=) — or_idf changes the result set.
+    expect(KNOBS_HASH_VERSION).toBe(10);
   });
 
   test('flipping unified_multimodal changes the hash', () => {
