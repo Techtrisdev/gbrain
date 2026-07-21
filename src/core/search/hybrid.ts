@@ -46,6 +46,39 @@ function trackCacheWrite(promise: Promise<unknown>): void {
   pendingCacheWrites.add(promise);
   promise.finally(() => pendingCacheWrites.delete(promise)).catch(() => { /* swallow */ });
 }
+
+/**
+ * v0.44 — recall-floor decoupling. Resolve the recall/rerank candidate pool size
+ * (`innerLimit`) handed to the keyword + vector engine legs from the caller's
+ * DISPLAY `limit`.
+ *
+ * INVARIANT: the pool must never be shallower than the reranker will score
+ * (`reranker_top_n_in`). The legacy `limit * 2` tied recall depth to the display
+ * limit, so a small-limit call (limit=3 → pool=6) handed the cross-encoder FEWER
+ * candidates than its topNIn budget (30) — the reranker was starved. A weak
+ * vector-match answer page (an entity page buried under query-space hubs at
+ * cosine rank ~21) then became structurally unreachable via the vector leg for
+ * small-limit callers; it reached the reranker ONLY if the keyword AND-match
+ * happened to surface it, so a natural-language phrasing that missed on keyword
+ * FALSELY ABSTAINED — even though the reranker scores such a page ~0.9 whenever
+ * it actually sees it. Flooring the pool at `reranker_top_n_in` (only when the
+ * reranker runs) guarantees recall always hands the reranker its full candidate
+ * budget, independent of the display `limit`.
+ *
+ * Cost: this only widens the cheap recall/fusion/dedup stage. The reranker's own
+ * `topNIn` still bounds how many candidates the cross-encoder scores, so the
+ * expensive rerank call is unchanged. Always capped at MAX_SEARCH_LIMIT.
+ */
+export function resolveInnerLimit(
+  displayLimit: number,
+  mode: { rerankerEnabled: boolean; rerankerTopNIn: number },
+): number {
+  const recallFloor = mode.rerankerEnabled
+    ? Math.min(mode.rerankerTopNIn, MAX_SEARCH_LIMIT)
+    : 0;
+  return Math.min(Math.max(displayLimit * 2, recallFloor), MAX_SEARCH_LIMIT);
+}
+
 /**
  * Backlink boost coefficient. Score is multiplied by (1 + BACKLINK_BOOST_COEF * log(1 + count)).
  * - 0 backlinks: factor = 1.0 (no boost).
@@ -476,7 +509,12 @@ export async function hybridSearch(
 
   const limit = opts?.limit || resolvedMode.searchLimit;
   const offset = opts?.offset || 0;
-  const innerLimit = Math.min(limit * 2, MAX_SEARCH_LIMIT);
+  // Key the recall floor on whether the reranker WILL run (per-call override wins
+  // over the mode default, mirroring rerankerOpts below) and its effective topNIn.
+  const innerLimit = resolveInnerLimit(limit, {
+    rerankerEnabled: opts?.reranker?.enabled ?? resolvedMode.reranker_enabled,
+    rerankerTopNIn: opts?.reranker?.topNIn ?? resolvedMode.reranker_top_n_in,
+  });
 
   // v0.32.x search-lite: classify intent once up front. Drives BOTH the
   // legacy auto-detail / salience / recency suggestions AND the new
