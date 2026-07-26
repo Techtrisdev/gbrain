@@ -205,6 +205,20 @@ describe('runEvalLongMemEval — perf gate preserved', () => {
       { client: answerClient, extractorClient, extractorModel: 'stub' },
     );
     const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(10_000);
+    // Budget is deliberately loose. This assertion runs INSIDE a CI shard that
+    // executes ~2.5k tests concurrently in one bun process, so its wall clock
+    // measures shard CONTENTION as much as the code under test. Measured
+    // 2026-07-26: ~3.6s isolated locally (incl. process startup) vs 21.6s /
+    // 29.1s / 31.5s across three CI runs on unchanged code -- which is how this
+    // gate came to fail 100% of the time on main while every local run passed.
+    //
+    // The regression it exists to catch is an ORDER-OF-MAGNITUDE blowup: a real
+    // network call slipping past the stubs, or O(n^2) growth over the haystack.
+    // Either costs minutes, not seconds, so 60s still catches it while leaving
+    // headroom for a contended runner. Do NOT tighten this back toward the
+    // isolated runtime -- that turns a correctness gate into a benchmark of
+    // whatever else happens to share the shard, and trains everyone to merge
+    // through red.
+    expect(elapsed).toBeLessThan(60_000);
   });
 });
