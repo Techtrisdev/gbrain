@@ -49,6 +49,7 @@ import type { Page, PageInput, PageFilters } from '../src/core/types.ts';
 function makeFakeEngine(seededPages: Page[] = []) {
   const store = new Map<string, Page>();
   const puts: { slug: string; page: PageInput; sourceId?: string }[] = [];
+  const chunkWrites: { slug: string; count: number; sourceId?: string }[] = [];
   const listCalls: (PageFilters | undefined)[] = [];
   const allPages = (): Page[] => [...seededPages, ...store.values()];
 
@@ -102,8 +103,28 @@ function makeFakeEngine(seededPages: Page[] = []) {
     return stored;
   };
 
-  const engine = { kind: 'pglite', listPages, listAllSlugs, getPage, putPage } as unknown as BrainEngine;
-  return { engine, puts, listCalls, store };
+  // Distilled memory pages are CHUNKED after the page write, so the embed sweep
+  // (which embeds chunks, never bare pages) can reach them. Recorded so tests can
+  // assert a distilled page is retrievable, not merely written. Chunk CONTENT is
+  // verified against a real engine in capture-distill-chunking.serial.test.ts —
+  // this fake only models the call.
+  const upsertChunks = async (
+    slug: string,
+    chunks: Array<{ chunk_index: number; chunk_text: string }>,
+    opts?: { sourceId?: string },
+  ): Promise<void> => {
+    chunkWrites.push({ slug, count: chunks.length, sourceId: opts?.sourceId });
+  };
+
+  const engine = {
+    kind: 'pglite',
+    listPages,
+    listAllSlugs,
+    getPage,
+    putPage,
+    upsertChunks,
+  } as unknown as BrainEngine;
+  return { engine, puts, listCalls, store, chunkWrites };
 }
 
 /** A bare `distill-state/<slug>` marker page (only the slug is read by the done-set). */
@@ -253,7 +274,7 @@ describe('parseDistillMemories', () => {
 
 describe('distillCaptureSessions — happy path', () => {
   test('one completed session → N distilled pages + a marker; report counts', async () => {
-    const { engine, puts } = makeFakeEngine([
+    const { engine, puts, chunkWrites } = makeFakeEngine([
       mkCapture({ slug: 'capture/sess-1/prompt-1', session_id: 'sess-1', kind: 'prompt', turn: 1, compiled_truth: 'Should we ship X?', updated_at: OLD }),
       mkCapture({ slug: 'capture/sess-1/reply-1', session_id: 'sess-1', kind: 'reply', turn: 2, compiled_truth: 'Yes, ship X behind a flag.', updated_at: OLD }),
     ]);
@@ -273,6 +294,16 @@ describe('distillCaptureSessions — happy path', () => {
     const markerPuts = puts.filter((p) => p.slug.startsWith('distill-state/'));
     expect(memPuts.map((p) => p.slug)).toEqual(['distilled/sess-1/mem-1', 'distilled/sess-1/mem-2']);
     expect(markerPuts.map((p) => p.slug)).toEqual(['distill-state/sess-1']);
+
+    // Each memory page must ALSO be chunked. A page written without chunks is
+    // never embedded (the sweep embeds chunks) and so is never retrievable —
+    // the defect that left 83 production distilled pages invisible. The marker
+    // page is deliberately NOT chunked: it is idempotency state, not content.
+    expect(chunkWrites.map((c) => c.slug)).toEqual([
+      'distilled/sess-1/mem-1',
+      'distilled/sess-1/mem-2',
+    ]);
+    expect(chunkWrites.every((c) => c.count > 0)).toBe(true);
 
     // memory page: compiled_truth IS the statement; bound to the same source; session in frontmatter
     expect(memPuts[0].page.compiled_truth).toBe('Jonathan prefers shipping behind flags.');

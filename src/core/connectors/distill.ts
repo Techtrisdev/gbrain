@@ -65,8 +65,7 @@
 import { chat, isAvailable } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { computeContentHash } from '../ingestion/types.ts';
-import { importFromContent } from '../import-file.ts';
-import { serializeMarkdown } from '../markdown.ts';
+import { chunkText } from '../chunkers/recursive.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page, PageInput } from '../types.ts';
 
@@ -587,25 +586,32 @@ export async function distillCaptureSessions(
       const written: string[] = [];
       for (let i = 0; i < memories.length; i++) {
         const slug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${i + 1}`;
-        // Write through importFromContent, NOT engine.putPage. putPage upserts the
-        // `pages` row ONLY — it creates no `content_chunks`. The embed sweep
-        // (`gbrain embed --stale` / autopilot's embed phase) embeds CHUNKS, so a
-        // chunkless page is never embedded and the memory stays invisible to
-        // semantic search permanently. This is why RAW captures were retrievable
-        // while distilled memories were not: the raw path
-        // (minions/handlers/ingest-capture.ts) already goes through
-        // importFromContent. Measured 2026-07-25: every distilled page written
-        // since 2026-07-01 (83 of 199) had zero chunks and zero embeddings.
-        // noEmbed mirrors ingest-capture — chunking happens here, embedding is
-        // left to the sweep rather than paid inline on the distill path.
         const page = buildMemoryPage(memories[i], sessionId, nowIso);
-        const markdown = serializeMarkdown(
-          (page.frontmatter ?? {}) as Record<string, unknown>,
-          page.compiled_truth ?? '',
-          page.timeline ?? '',
-          { type: page.type, title: page.title, tags: [] },
-        );
-        await importFromContent(engine, slug, markdown, { sourceId, noEmbed: true });
+        await engine.putPage(slug, page, { sourceId });
+        // putPage upserts the `pages` row ONLY — it creates no `content_chunks`.
+        // The embed sweep (`gbrain embed --stale` / autopilot's embed phase)
+        // embeds CHUNKS, so a chunkless page is never embedded and the distilled
+        // memory stays invisible to semantic search permanently. Measured
+        // 2026-07-25: every distilled page written since 2026-07-01 (83 of 199)
+        // had zero chunks and zero embeddings, while RAW captures were fine —
+        // that path (minions/handlers/ingest-capture.ts) goes through
+        // importFromContent, which chunks.
+        //
+        // We chunk explicitly rather than routing through importFromContent so
+        // distill keeps a two-call write surface. importFromContent would pull
+        // the whole import stack (versions, links/tags, code edges, contextual
+        // retrieval — 11 `tx` methods) into a path whose only content is one
+        // short memory sentence. Embedding is deliberately NOT done inline:
+        // chunks land unembedded and the existing sweep picks them up, matching
+        // ingest-capture's `noEmbed` default.
+        const memoryChunks = chunkText(page.compiled_truth ?? '').map((c, idx) => ({
+          chunk_index: idx,
+          chunk_text: c.text,
+          chunk_source: 'compiled_truth' as const,
+        }));
+        if (memoryChunks.length > 0) {
+          await engine.upsertChunks(slug, memoryChunks, { sourceId });
+        }
         written.push(slug);
       }
       // Mark done AFTER the memory pages land — including the 0-memory case, so a
