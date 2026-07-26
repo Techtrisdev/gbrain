@@ -49,6 +49,8 @@ import type { Page, PageInput, PageFilters } from '../src/core/types.ts';
 function makeFakeEngine(seededPages: Page[] = []) {
   const store = new Map<string, Page>();
   const puts: { slug: string; page: PageInput; sourceId?: string }[] = [];
+  const chunkWrites: { slug: string; count: number; sourceId?: string }[] = [];
+  const deletes: { slug: string; sourceId?: string }[] = [];
   const listCalls: (PageFilters | undefined)[] = [];
   const allPages = (): Page[] => [...seededPages, ...store.values()];
 
@@ -102,8 +104,36 @@ function makeFakeEngine(seededPages: Page[] = []) {
     return stored;
   };
 
-  const engine = { kind: 'pglite', listPages, listAllSlugs, getPage, putPage } as unknown as BrainEngine;
-  return { engine, puts, listCalls, store };
+  // Distilled memory pages are CHUNKED after the page write, so the embed sweep
+  // (which embeds chunks, never bare pages) can reach them. Recorded so tests can
+  // assert a distilled page is retrievable, not merely written. Chunk CONTENT is
+  // verified against a real engine in capture-distill-chunking.serial.test.ts —
+  // this fake only models the call.
+  const upsertChunks = async (
+    slug: string,
+    chunks: Array<{ chunk_index: number; chunk_text: string }>,
+    opts?: { sourceId?: string },
+  ): Promise<void> => {
+    chunkWrites.push({ slug, count: chunks.length, sourceId: opts?.sourceId });
+  };
+
+  // Orphaned higher-index `mem-K` pages from a longer previous run are pruned,
+  // so they cannot come back as retrievable stale memories once pages are chunked.
+  const deletePage = async (slug: string, opts?: { sourceId?: string }): Promise<void> => {
+    deletes.push({ slug, sourceId: opts?.sourceId });
+    store.delete(slug);
+  };
+
+  const engine = {
+    kind: 'pglite',
+    listPages,
+    listAllSlugs,
+    getPage,
+    putPage,
+    upsertChunks,
+    deletePage,
+  } as unknown as BrainEngine;
+  return { engine, puts, listCalls, store, chunkWrites, deletes };
 }
 
 /** A bare `distill-state/<slug>` marker page (only the slug is read by the done-set). */
@@ -253,7 +283,7 @@ describe('parseDistillMemories', () => {
 
 describe('distillCaptureSessions — happy path', () => {
   test('one completed session → N distilled pages + a marker; report counts', async () => {
-    const { engine, puts } = makeFakeEngine([
+    const { engine, puts, chunkWrites } = makeFakeEngine([
       mkCapture({ slug: 'capture/sess-1/prompt-1', session_id: 'sess-1', kind: 'prompt', turn: 1, compiled_truth: 'Should we ship X?', updated_at: OLD }),
       mkCapture({ slug: 'capture/sess-1/reply-1', session_id: 'sess-1', kind: 'reply', turn: 2, compiled_truth: 'Yes, ship X behind a flag.', updated_at: OLD }),
     ]);
@@ -273,6 +303,21 @@ describe('distillCaptureSessions — happy path', () => {
     const markerPuts = puts.filter((p) => p.slug.startsWith('distill-state/'));
     expect(memPuts.map((p) => p.slug)).toEqual(['distilled/sess-1/mem-1', 'distilled/sess-1/mem-2']);
     expect(markerPuts.map((p) => p.slug)).toEqual(['distill-state/sess-1']);
+
+    // Each memory page must ALSO be chunked. A page written without chunks is
+    // never embedded (the sweep embeds chunks) and so is never retrievable —
+    // the defect that left 83 production distilled pages invisible. The marker
+    // page is deliberately NOT chunked: it is idempotency state, not content.
+    expect(chunkWrites.map((c) => c.slug)).toEqual([
+      'distilled/sess-1/mem-1',
+      'distilled/sess-1/mem-2',
+    ]);
+    expect(chunkWrites.every((c) => c.count > 0)).toBe(true);
+    // Chunk writes must be SOURCE-SCOPED. upsertChunks resolves the page by
+    // (slug, source_id); without sourceId it defaults to 'default' and either
+    // throws or hits the wrong page on a multi-source brain. The real-engine
+    // test seeds one source, so only this fake can catch a mix-up.
+    expect(chunkWrites.every((c) => c.sourceId === 'capture-events')).toBe(true);
 
     // memory page: compiled_truth IS the statement; bound to the same source; session in frontmatter
     expect(memPuts[0].page.compiled_truth).toBe('Jonathan prefers shipping behind flags.');
@@ -472,5 +517,41 @@ describe('distillCaptureSessions — uncapped enumeration (>100)', () => {
     expect(report.skipped_already).toBe(N);
     expect(report.distilled).toBe(0);
     expect(puts.length).toBe(0); // no new writes at all
+  });
+});
+
+// ── Orphan pruning ───────────────────────────────────────────────────────────
+
+describe('distillCaptureSessions — orphaned mem-K pruning', () => {
+  test('a leftover higher-index memory page from a longer previous run is deleted', async () => {
+    // Simulates: an earlier run wrote mem-1 and mem-2, then crashed/aborted before
+    // the marker landed. The re-run's LLM returns only ONE memory, so mem-2 is an
+    // orphan carrying stale text. Before pages were chunked this was harmless
+    // (chunkless => invisible); now it would be embedded by the sweep and become a
+    // RETRIEVABLE stale memory.
+    const { engine, deletes, chunkWrites, store } = makeFakeEngine([
+      mkCapture({ slug: 'capture/sess-1/prompt-1', session_id: 'sess-1', kind: 'prompt', turn: 1, updated_at: OLD }),
+      mkCapture({ slug: 'distilled/sess-1/mem-2', compiled_truth: 'STALE memory from the longer previous run', updated_at: OLD }),
+    ]);
+    stubChat(() => JSON.stringify(['The one memory this run produced.']));
+
+    await distillCaptureSessions(engine, { now: NOW });
+
+    expect(deletes.map((d) => d.slug)).toEqual(['distilled/sess-1/mem-2']);
+    expect(deletes.every((d) => d.sourceId === 'capture-events')).toBe(true);
+    // and it is not left chunked/retrievable
+    expect(chunkWrites.map((c) => c.slug)).toEqual(['distilled/sess-1/mem-1']);
+    expect(store.has('distilled/sess-1/mem-2')).toBe(false);
+  });
+
+  test('no deletes when the run produces the same number of memories', async () => {
+    const { engine, deletes } = makeFakeEngine([
+      mkCapture({ slug: 'capture/sess-2/prompt-1', session_id: 'sess-2', kind: 'prompt', turn: 1, updated_at: OLD }),
+    ]);
+    stubChat(() => JSON.stringify(['a', 'b']));
+
+    await distillCaptureSessions(engine, { now: NOW });
+
+    expect(deletes).toEqual([]);
   });
 });

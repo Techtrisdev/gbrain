@@ -65,6 +65,7 @@
 import { chat, isAvailable } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { computeContentHash } from '../ingestion/types.ts';
+import { chunkText } from '../chunkers/recursive.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page, PageInput } from '../types.ts';
 
@@ -76,6 +77,14 @@ export const DEFAULT_DISTILL_SOURCE = 'capture-events';
 export const CAPTURE_PREFIX = 'capture/';
 /** Slug prefix of the distilled durable-memory pages (what the connector consolidates). */
 export const DISTILLED_PREFIX = 'distilled/';
+
+/**
+ * How far past the current memory count to probe for orphaned `mem-K` pages left
+ * by a previous, longer run. Bounded so a getPage anomaly can't spin: the probe
+ * stops at the first miss, and indices are contiguous, so this only caps the
+ * pathological case.
+ */
+const ORPHAN_PROBE_LIMIT = 50;
 /**
  * Slug prefix of the idempotency markers. INTENTIONALLY not under `distilled/`
  * (the connector reads `distilled/`; a marker there would be consolidated). One
@@ -585,13 +594,66 @@ export async function distillCaptureSessions(
       const written: string[] = [];
       for (let i = 0; i < memories.length; i++) {
         const slug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${i + 1}`;
-        await engine.putPage(slug, buildMemoryPage(memories[i], sessionId, nowIso), { sourceId });
+        const page = buildMemoryPage(memories[i], sessionId, nowIso);
+        await engine.putPage(slug, page, { sourceId });
+        // putPage upserts the `pages` row ONLY — it creates no `content_chunks`.
+        // The embed sweep (`gbrain embed --stale` / autopilot's embed phase)
+        // embeds CHUNKS, so a chunkless page is never embedded and the distilled
+        // memory stays invisible to semantic search permanently. Measured
+        // 2026-07-25: every distilled page written since 2026-07-01 (83 of 199)
+        // had zero chunks and zero embeddings, while RAW captures were fine.
+        // Raw `capture/…` pages are written by the MCP `put_page` op
+        // (`core/operations.ts:678`), which threads `sourceId` and sets
+        // `noEmbed = !isAvailable('embedding')` — i.e. with a provider
+        // configured it chunks AND embeds INLINE. (Not `ingest-capture.ts`: that
+        // handler omits `sourceId`, so its pages land in `default` and it cannot
+        // be what populates `capture-events`.)
+        //
+        // We chunk explicitly rather than routing through importFromContent so
+        // distill keeps a two-call write surface. importFromContent would pull
+        // the whole import stack (versions, links/tags, code edges, contextual
+        // retrieval — 11 `tx` methods) into a path whose only content is one
+        // short memory sentence.
+        //
+        // Embedding is DELIBERATELY deferred to the sweep rather than done
+        // inline — a considered divergence from `put_page`, not parity with it.
+        // Distill runs inside the connector poll, so the trade is a one-cycle
+        // retrieval delay in exchange for keeping an external embedding call off
+        // this loop. `listStaleChunks` selects purely on `cc.embedding IS NULL`
+        // (pglite-engine.ts:2036, postgres-engine.ts:2083) with no filter on
+        // model/chunk_source/token_count, and the cycle's embed phase is global
+        // (cycle.ts:165,923), so these chunks are picked up wherever distill runs.
+        const memoryChunks = chunkText(page.compiled_truth ?? '').map((c, idx) => ({
+          chunk_index: idx,
+          chunk_text: c.text,
+          chunk_source: 'compiled_truth' as const,
+        }));
+        if (memoryChunks.length > 0) {
+          await engine.upsertChunks(slug, memoryChunks, { sourceId });
+        }
         written.push(slug);
       }
+
+      // Prune orphaned HIGHER-index memory pages left by a previous run that
+      // produced more memories. upsertChunks replaces chunks per slug, but
+      // nothing prunes whole pages, so `mem-K` for K > memories.length survives
+      // with its stale body. Before this file chunked its writes that orphan was
+      // harmless — chunkless, therefore invisible to both search legs. Now it
+      // would be chunked, embedded by the sweep, and retrievable as a STALE
+      // memory, so it has to go. Reachable when a crash/abort lands between the
+      // memory writes and the marker write below, and the re-run's LLM returns
+      // fewer memories.
+      for (let k = memories.length + 1; k <= memories.length + ORPHAN_PROBE_LIMIT; k++) {
+        const orphanSlug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${k}`;
+        if ((await engine.getPage(orphanSlug)) === null) break;
+        await engine.deletePage(orphanSlug, { sourceId });
+      }
+
       // Mark done AFTER the memory pages land — including the 0-memory case, so a
       // no-signal session isn't re-distilled (re-paid) every run. A crash before
-      // this marker leaves the (deterministic) mem-K pages to be overwritten,
-      // never duplicated, on the next run.
+      // this marker leaves the (deterministic) mem-K pages to be overwritten on
+      // the next run — never duplicated — and any leftover higher-index pages are
+      // pruned by the loop above.
       await engine.putPage(
         `${DISTILL_STATE_PREFIX}${sessionSlug}`,
         buildMarkerPage(sessionId, memories.length, nowIso),
