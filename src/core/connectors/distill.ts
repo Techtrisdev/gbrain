@@ -65,6 +65,8 @@
 import { chat, isAvailable } from '../ai/gateway.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { computeContentHash } from '../ingestion/types.ts';
+import { importFromContent } from '../import-file.ts';
+import { serializeMarkdown } from '../markdown.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page, PageInput } from '../types.ts';
 
@@ -585,7 +587,25 @@ export async function distillCaptureSessions(
       const written: string[] = [];
       for (let i = 0; i < memories.length; i++) {
         const slug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${i + 1}`;
-        await engine.putPage(slug, buildMemoryPage(memories[i], sessionId, nowIso), { sourceId });
+        // Write through importFromContent, NOT engine.putPage. putPage upserts the
+        // `pages` row ONLY — it creates no `content_chunks`. The embed sweep
+        // (`gbrain embed --stale` / autopilot's embed phase) embeds CHUNKS, so a
+        // chunkless page is never embedded and the memory stays invisible to
+        // semantic search permanently. This is why RAW captures were retrievable
+        // while distilled memories were not: the raw path
+        // (minions/handlers/ingest-capture.ts) already goes through
+        // importFromContent. Measured 2026-07-25: every distilled page written
+        // since 2026-07-01 (83 of 199) had zero chunks and zero embeddings.
+        // noEmbed mirrors ingest-capture — chunking happens here, embedding is
+        // left to the sweep rather than paid inline on the distill path.
+        const page = buildMemoryPage(memories[i], sessionId, nowIso);
+        const markdown = serializeMarkdown(
+          (page.frontmatter ?? {}) as Record<string, unknown>,
+          page.compiled_truth ?? '',
+          page.timeline ?? '',
+          { type: page.type, title: page.title, tags: [] },
+        );
+        await importFromContent(engine, slug, markdown, { sourceId, noEmbed: true });
         written.push(slug);
       }
       // Mark done AFTER the memory pages land — including the 0-memory case, so a
