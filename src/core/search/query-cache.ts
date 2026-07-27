@@ -171,6 +171,39 @@ export function cacheRowId(queryText: string, sourceId: string, knobsHash = ''):
 }
 
 /**
+ * Collapse a caller's read scope into ONE stable cache-namespace string.
+ *
+ * The cache is keyed by a scalar `source_id`, but a federated caller's scope is
+ * a SET (`ctx.auth.allowedSources`). `sourceScopeOpts` (operations.ts) returns
+ * `{sourceIds}` and `{sourceId}` as mutually exclusive shapes, so before this
+ * helper every federated caller arrived with `sourceId === undefined` and fell
+ * through to the literal `'default'` — one shared namespace for every distinct
+ * grant. Measured on the live brain 2026-07-26: 517 of 525 rows keyed
+ * `'default'`, 30 of them carrying capture-events content and 59 carrying
+ * jarvis-openclaw content, all mutually servable.
+ *
+ * `knobs_hash` cannot rescue this — it is composed purely of global search
+ * knobs and carries no caller identity — and the lookup is a vector-similarity
+ * search rather than an exact query-text match, so a near-enough question was
+ * enough to cross the boundary.
+ *
+ * Sorting is load-bearing: the same grant arriving in a different order must
+ * produce the same key, or the cache fragments into duplicate namespaces and
+ * quietly loses its hit rate. The `__set__:` prefix keeps federated keys
+ * disjoint from a scalar source that happens to share the name.
+ *
+ * Empty `sourceIds` deliberately falls through to the scalar id, mirroring
+ * `sourceScopeOpts`'s treatment of `allowedSources: []` as "no federated
+ * scope" rather than "no filter".
+ */
+export function cacheScopeKey(opts?: { sourceId?: string; sourceIds?: string[] }): string {
+  if (opts?.sourceIds && opts.sourceIds.length > 0) {
+    return '__set__:' + [...opts.sourceIds].sort().join(',');
+  }
+  return opts?.sourceId ?? 'default';
+}
+
+/**
  * Convert a Float32Array embedding into the pgvector text literal
  * format: `[v0,v1,v2,...]`. PGLite and Postgres both accept this when
  * the parameter is cast to `vector` or `halfvec` on the server side.
