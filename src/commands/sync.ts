@@ -56,6 +56,14 @@ export interface SyncResult {
   embedded: number;
   pagesAffected: string[];
   failedFiles?: number; // count of parse failures (Bug 9)
+  /**
+   * CORR-001: pages that imported successfully but whose embedding call failed.
+   * Distinct from `failedFiles` — the page and chunks landed and are
+   * keyword-searchable; only the vector is missing, and it is recoverable with
+   * `gbrain embed --stale`. Counted so a sync run cannot report clean while
+   * leaving pages semantically invisible.
+   */
+  embedDegraded?: number;
 }
 
 /**
@@ -818,6 +826,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   const pagesAffected: string[] = [];
   let chunksCreated = 0;
+  // CORR-001: an embed-provider failure returns status:'imported' + embedFailed.
+  // Chunks land with NULL embedding (recoverable via `gbrain embed --stale`),
+  // so this is NOT a parse failure and must NOT enter failedFiles — that would
+  // block the sync bookmark over a transient 429. But it must not be silent
+  // either: pre-fix the run reported clean while the pages went semantically
+  // blind. Count separately and surface it.
+  let embedDegraded = 0;
   const start = Date.now();
 
   // Per-file progress on stderr so agents see each step of a big sync.
@@ -863,7 +878,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       const filePath = join(repoPath, to);
       if (existsSync(filePath)) {
         const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
-        if (result.status === 'imported') chunksCreated += result.chunks;
+        if (result.status === 'imported') {
+          chunksCreated += result.chunks;
+          if ((result as any).embedFailed) embedDegraded++;
+        }
       }
       pagesAffected.push(newSlug);
       progress.tick(1, newSlug);
@@ -930,6 +948,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);
+          if ((result as any).embedFailed) embedDegraded++;
         } else if (result.status === 'skipped' && (result as any).error) {
           failedFiles.push({ path, error: String((result as any).error) });
         }
@@ -1198,6 +1217,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
   }
 
+  if (embedDegraded > 0) {
+    serr(
+      `  WARNING: ${embedDegraded} page(s) synced WITHOUT embeddings (provider error).\n` +
+      `  They are keyword-searchable but semantically invisible until you run:\n` +
+      `    gbrain embed --stale`,
+    );
+  }
+
   return {
     status: 'synced',
     fromCommit: lastCommit,
@@ -1209,6 +1236,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     chunksCreated,
     embedded,
     pagesAffected,
+    ...(embedDegraded > 0 ? { embedDegraded } : {}),
   };
 }
 
