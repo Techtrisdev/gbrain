@@ -35,6 +35,7 @@ mock.module('../src/core/embedding.ts', () => ({
 }));
 
 const { importCodeFile } = await import('../src/core/import-file.ts');
+const { runReindexCode } = await import('../src/commands/reindex-code.ts');
 
 let engine: PGLiteEngine;
 
@@ -115,6 +116,30 @@ describe('importCodeFile — embed failure is reported, not swallowed', () => {
     expect(results.every((r) => r.status === 'imported')).toBe(true);
     expect(results.every((r) => r.embedFailed === true)).toBe(true);
   });
+
+  test('reindex-code COUNTS the degradation instead of reporting a clean run', async () => {
+    // The point of the flag is that something READS it. Without this,
+    // `reindex-code` — the command operators run specifically to fix
+    // embeddings — reports `failed: 0` and 100% success through a total embed
+    // outage, which is the silent degradation this change exists to remove.
+    await engine.putPage('src-zeta-ts', {
+      type: 'code',
+      page_kind: 'code',
+      title: 'src/zeta.ts (typescript)',
+      compiled_truth: CODE,
+      timeline: '',
+      frontmatter: { language: 'typescript', file: 'src/zeta.ts' },
+    });
+
+    const result = await runReindexCode(engine, { yes: true, force: true });
+
+    expect(result.embedDegraded).toBeGreaterThan(0);
+    expect(result.degraded?.[0]?.error).toContain('forced embed failure');
+    // Degraded is NOT failed — the page genuinely landed. Conflating them
+    // would corrupt the reindexed/skipped/failed accounting.
+    expect(result.failed).toBe(0);
+    expect(result.reindexed).toBeGreaterThan(0);
+  }, 60_000);
 
   test('noEmbed callers report no failure — the flag means "tried and failed"', async () => {
     // A caller that deliberately skipped embedding has not been degraded, and
