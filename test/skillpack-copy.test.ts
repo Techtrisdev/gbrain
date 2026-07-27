@@ -41,7 +41,14 @@ describe('walkSourceDir', () => {
 
     const items = walkSourceDir(src, '/some/dst');
     expect(items).toHaveLength(2);
-    expect(items.map(i => i.target).sort()).toEqual(['/some/dst/a.txt', '/some/dst/b.txt']);
+    // CopyItem.target is an ABSOLUTE LOCAL path, consumed by existsSync /
+    // mkdirSync(dirname) / writeFileSync in copy.ts. Native separators are
+    // correct there, so build the expectation with join() rather than
+    // hardcoding POSIX — the contract under test is the mirroring, not the
+    // separator. Hardcoded '/' made these assertions fail on Windows.
+    expect(items.map(i => i.target).sort()).toEqual(
+      [join('/some/dst', 'a.txt'), join('/some/dst', 'b.txt')].sort(),
+    );
   });
 
   it('walks nested directories recursively, mirroring structure', () => {
@@ -54,7 +61,13 @@ describe('walkSourceDir', () => {
     const items = walkSourceDir(src, '/dst');
     expect(items).toHaveLength(3);
     const targets = items.map(i => i.target).sort();
-    expect(targets).toEqual(['/dst/sub/deeper/low.txt', '/dst/sub/mid.txt', '/dst/top.txt']);
+    expect(targets).toEqual(
+      [
+        join('/dst', 'sub', 'deeper', 'low.txt'),
+        join('/dst', 'sub', 'mid.txt'),
+        join('/dst', 'top.txt'),
+      ].sort(),
+    );
   });
 
   it('returns empty array for a non-existent source directory', () => {
