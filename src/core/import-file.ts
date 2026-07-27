@@ -178,6 +178,27 @@ export interface ImportResult {
    * Absent only on status='error' (early payload-size rejection).
    */
   parsedPage?: ParsedPage;
+  /**
+   * v0.45 — the code-import path wrote its chunks but could NOT embed them, so
+   * the page is keyword-searchable and semantically invisible until an embed
+   * sweep picks it up.
+   *
+   * Why this is a field and not a thrown error: `importCodeFile` computes
+   * embeddings BEFORE opening its transaction, so propagating the failure the
+   * way the markdown path does (see the invariant above `embedBatch` in
+   * `importFromContent`) would abandon the page write entirely — trading a
+   * semantic-search loss for a KEYWORD-search loss as well. The write is kept
+   * deliberately; what was missing is that the degradation was invisible,
+   * announced only by a `console.warn` on a long-lived server process.
+   *
+   * Chunks land with `embedding` NULL, which is exactly what
+   * `gbrain embed --stale` selects, so they self-heal on the maintenance loop
+   * PROVIDED their source is in `GBRAIN_EMBED_SOURCES`. That allowlist does not
+   * cover every source, so this must stay reportable rather than assumed-healed.
+   */
+  embedFailed?: boolean;
+  /** Message from the failed embed call. Set only when `embedFailed` is true. */
+  embedError?: string;
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
@@ -751,6 +772,11 @@ export async function importCodeFile(
     }
   }
 
+  // Set when the embed call below fails; surfaced on the returned ImportResult
+  // so a caller (and the reconciliation probe) can see a degraded import that
+  // still succeeded as a page write.
+  let embedError: string | undefined;
+
   // Embed only the new/changed chunks.
   if (!opts.noEmbed && needsEmbedIndexes.length > 0) {
     try {
@@ -762,7 +788,19 @@ export async function importCodeFile(
         chunks[i]!.token_count = Math.ceil(chunks[i]!.chunk_text.length / 4);
       }
     } catch (e: unknown) {
-      console.warn(`[gbrain] embedding failed for code file ${slug}: ${e instanceof Error ? e.message : String(e)}`);
+      // DELIBERATELY not rethrown — see ImportResult.embedFailed. Embedding runs
+      // before the transaction below, so propagating here would abandon the page
+      // write and cost keyword searchability too, which is a strictly larger
+      // loss than the semantic gap it would be fixing.
+      //
+      // What IS fixed: the failure used to be announced only by this warn on a
+      // long-lived process, so a run could report success while quietly leaving
+      // pages semantically invisible. It now rides back on the result.
+      embedError = e instanceof Error ? e.message : String(e);
+      console.warn(
+        `[gbrain] embedding FAILED for code file ${slug} (${needsEmbedIndexes.length} chunk(s) left unembedded; ` +
+          `page still written and keyword-searchable; recover with \`gbrain embed --stale\`): ${embedError}`,
+      );
     }
   }
 
@@ -851,7 +889,16 @@ export async function importCodeFile(
     }
   }
 
-  return { slug, status: 'imported', chunks: chunks.length };
+  // status stays 'imported': the page and its chunks genuinely landed and are
+  // keyword-searchable. `embedFailed` marks the degradation so a caller can
+  // count it, report it, and requeue an embed sweep — without treating a
+  // partially-successful import as a hard failure.
+  return {
+    slug,
+    status: 'imported',
+    chunks: chunks.length,
+    ...(embedError ? { embedFailed: true, embedError } : {}),
+  };
 }
 
 // Backward compat

@@ -60,10 +60,26 @@ export interface ReindexCodeResult {
   reindexed: number;
   skipped: number;
   failed: number;
+  /**
+   * Pages that imported successfully but whose chunks could NOT be embedded —
+   * keyword-searchable, semantically invisible until an embed sweep runs.
+   *
+   * Deliberately NOT folded into `failed`: the page and its chunks genuinely
+   * landed, and counting a degraded write as a failure would corrupt the
+   * reindexed/skipped/failed accounting and could drive retries over a
+   * provider outage the sweep already recovers from.
+   *
+   * It has to be counted SOMEWHERE, though. Without this, a reindex that hit a
+   * mid-run embed outage reports `failed: 0` and 100% success — which is the
+   * exact silent-degradation shape this whole change exists to remove.
+   */
+  embedDegraded: number;
   totalTokens: number;
   costUsd: number;
   model: string;
   failures?: Array<{ slug: string; error: string }>;
+  /** Slugs that imported but landed unembedded, with the provider error. */
+  degraded?: Array<{ slug: string; error: string }>;
 }
 
 /**
@@ -210,6 +226,7 @@ export async function runReindexCode(
       reindexed: 0,
       skipped: 0,
       failed: 0,
+      embedDegraded: 0,
       totalTokens,
       costUsd,
       model: getEmbeddingModelName(),
@@ -223,6 +240,7 @@ export async function runReindexCode(
       reindexed: 0,
       skipped: 0,
       failed: 0,
+      embedDegraded: 0,
       totalTokens: 0,
       costUsd: 0,
       model: getEmbeddingModelName(),
@@ -238,7 +256,9 @@ export async function runReindexCode(
   let reindexed = 0;
   let skipped = 0;
   let failed = 0;
+  let embedDegraded = 0;
   const failures: Array<{ slug: string; error: string }> = [];
+  const degraded: Array<{ slug: string; error: string }> = [];
   let offset = 0;
   let budgetExhausted: BudgetExhausted | null = null;
 
@@ -275,8 +295,17 @@ export async function runReindexCode(
               force: opts.force,
               sourceId: opts.sourceId,
             });
-            if (result.status === 'imported') reindexed++;
-            else if (result.status === 'skipped') skipped++;
+            if (result.status === 'imported') {
+              reindexed++;
+              // The page landed, but unembedded. `reindex-code` is the command
+              // operators run specifically to FIX embeddings, so reporting a
+              // clean run here while the embeddings silently did not happen is
+              // the worst possible place to lose this signal.
+              if (result.embedFailed) {
+                embedDegraded++;
+                degraded.push({ slug: row.slug, error: result.embedError ?? 'embedding failed' });
+              }
+            } else if (result.status === 'skipped') skipped++;
             else {
               failed++;
               failures.push({ slug: row.slug, error: result.error ?? result.status });
@@ -325,6 +354,7 @@ export async function runReindexCode(
       reindexed,
       skipped,
       failed,
+      embedDegraded,
       totalTokens,
       costUsd: budgetExhausted.spent,
       model: getEmbeddingModelName(),
@@ -341,10 +371,12 @@ export async function runReindexCode(
     reindexed,
     skipped,
     failed,
+    embedDegraded,
     totalTokens,
     costUsd,
     model: getEmbeddingModelName(),
     failures: failures.length > 0 ? failures : undefined,
+    degraded: degraded.length > 0 ? degraded : undefined,
   };
 }
 
@@ -404,7 +436,7 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
 
     if (preview.totalPages === 0) {
       if (json) {
-        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, totalTokens: 0, costUsd: 0, model: getEmbeddingModelName() }));
+        console.log(JSON.stringify({ status: 'ok', codePages: 0, reindexed: 0, skipped: 0, failed: 0, embedDegraded: 0, totalTokens: 0, costUsd: 0, model: getEmbeddingModelName() }));
       } else {
         console.log('No code pages to reindex.');
       }
@@ -438,6 +470,13 @@ export async function runReindexCodeCli(engine: BrainEngine, args: string[]): Pr
   } else {
     console.log(
       `reindex-code: ${result.reindexed} reindexed, ${result.skipped} skipped, ${result.failed} failed ` +
+        // Degraded pages imported fine but landed UNEMBEDDED. Omitting this from
+        // the summary is how a reindex run during a provider outage reports
+        // clean — the exact failure this counter exists to prevent. Only shown
+        // when non-zero so the common case stays quiet.
+        (result.embedDegraded > 0
+          ? `, ${result.embedDegraded} DEGRADED (imported but unembedded — run \`gbrain embed --stale\`) `
+          : '') +
         `(${result.codePages} total code pages, ~${result.totalTokens.toLocaleString()} tokens, ` +
         `est. $${result.costUsd.toFixed(2)}).`,
     );
