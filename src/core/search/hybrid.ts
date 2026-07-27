@@ -32,6 +32,7 @@ import {
   SemanticQueryCache,
   loadCacheConfig,
   distinctiveTokens,
+  cacheScopeKey,
 } from './query-cache.ts';
 
 export const RRF_K = 60;
@@ -1444,7 +1445,11 @@ export async function hybridSearchCached(
   }
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
-    const hit = await cache.lookup(queryEmbedding, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash, queryText: query });
+    // Scope the cache namespace to the caller's FULL read grant. Passing the
+    // scalar `opts?.sourceId` alone silently dropped `opts?.sourceIds`, so
+    // every federated caller collapsed onto the literal 'default' namespace
+    // and could be served another grant's cached payload. See cacheScopeKey.
+    const hit = await cache.lookup(queryEmbedding, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash, queryText: query });
     if (hit.hit && hit.results) {
       cacheStatus = 'hit';
       cacheSimilarity = hit.similarity;
@@ -1640,7 +1645,9 @@ export async function hybridSearchCached(
   ) {
     trackCacheWrite(
       cache
-        .store(query, queryEmbedding, results, finalMeta, { sourceId: opts?.sourceId, knobsHash: cacheKnobsHash })
+        // Write under the same grant-scoped namespace the lookup reads from —
+        // the two MUST derive the key identically or writes become unreachable.
+        .store(query, queryEmbedding, results, finalMeta, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash })
         .catch(() => { /* swallow */ }),
     );
   }
