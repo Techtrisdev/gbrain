@@ -165,6 +165,13 @@ export async function runImport(
   let errors = 0;
   let processed = 0;
   let chunksCreated = 0;
+  // CORR-001: importFile returns status:'imported' WITH embedFailed when the
+  // page + chunks landed but the embedding call failed. The chunks persist
+  // with NULL embedding (recoverable via `gbrain embed --stale`), so this is
+  // degradation, not loss — but branching on status alone reported a clean
+  // success and left the operator with a semantically blind brain until they
+  // independently ran `gbrain doctor`. Count it so the run itself says so.
+  let embedDegraded = 0;
   const importedSlugs: string[] = [];
   const errorCounts: Record<string, number> = {};
   const failures: Array<{ path: string; error: string }> = []; // Bug 9
@@ -200,6 +207,7 @@ export async function runImport(
         imported++;
         chunksCreated += result.chunks;
         importedSlugs.push(result.slug);
+        if (result.embedFailed) embedDegraded++;
         // v0.33.2: path-based checkpoint — record only on success.
         completed.add(relativePath);
       } else {
@@ -329,6 +337,7 @@ export async function runImport(
     console.log(JSON.stringify({
       status: 'success', duration_s: parseFloat(totalTime),
       imported, skipped, errors, chunks: chunksCreated,
+      embed_degraded: embedDegraded,
       total_files: allFiles.length,
     }));
   } else {
@@ -336,6 +345,13 @@ export async function runImport(
     console.log(`  ${imported} pages imported`);
     console.log(`  ${skipped} pages skipped (${skipped - errors} unchanged, ${errors} errors)`);
     console.log(`  ${chunksCreated} chunks created`);
+    if (embedDegraded > 0) {
+      console.error(
+        `  WARNING: ${embedDegraded} page(s) imported WITHOUT embeddings (provider error).\n` +
+        `  They are keyword-searchable but semantically invisible until you run:\n` +
+        `    gbrain embed --stale`,
+      );
+    }
   }
 
   // v0.39 T7 — end-of-run schema mismatch warn. Fires ONCE per import,
