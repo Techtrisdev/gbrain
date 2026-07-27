@@ -15,7 +15,7 @@
  * gets a chance to copy, or nothing does.
  */
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'fs';
-import { dirname, join, relative } from 'path';
+import { dirname, join, relative, isAbsolute, sep } from 'path';
 
 export interface CopyItem {
   /** Absolute source path. */
@@ -151,10 +151,20 @@ export function copyArtifacts(items: CopyItem[], opts: CopyArtifactsOpts = {}): 
     }
     if (confineRoot) {
       const real = realpathSync(item.source);
-      // realpathSync returns paths without trailing slash; add path
-      // separator to the prefix check so /a/b doesn't match /a/bb.
-      const prefix = confineRoot.endsWith('/') ? confineRoot : confineRoot + '/';
-      if (real !== confineRoot && !real.startsWith(prefix)) {
+      // Confinement must be SEPARATOR-AGNOSTIC. The previous check appended a
+      // literal '/' to build a prefix, but realpathSync returns NATIVE
+      // separators — on Windows that produced `C:\...\foo/` and startsWith
+      // could never match, so every legitimate source was rejected and
+      // `gbrain skillpack harvest` was wholly non-functional there. It failed
+      // closed (over-restrictive), so this was a availability break, not a
+      // traversal hole. relative() is the codebase's canonical confinement
+      // idiom: an escaping path yields a leading '..' segment, and a path on
+      // another Windows drive yields an absolute result. '' means the source
+      // IS the root, which the prior code also permitted.
+      const rel = relative(confineRoot, real);
+      const escapes =
+        rel === '..' || rel.startsWith(`..${sep}`) || rel.startsWith('../') || isAbsolute(rel);
+      if (rel !== '' && escapes) {
         throw new CopyError(
           `${item.source}: path traversal rejected. Source canonicalizes outside the confinement root (${confineRoot}).`,
           'path_traversal',
