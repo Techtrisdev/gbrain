@@ -31,6 +31,7 @@
  * equivalent cross-MODE contamination fix. This one pins cross-GRANT.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { SemanticQueryCache, cacheRowId, cacheScopeKey } from '../src/core/search/query-cache.ts';
 import type { SearchResult, HybridSearchMeta } from '../src/core/types.ts';
@@ -125,6 +126,51 @@ describe('cacheRowId is bifurcated by scope key', () => {
     const a = cacheRowId('what did we decide', cacheScopeKey({ sourceIds: ['a', 'b'] }), 'k');
     const b = cacheRowId('what did we decide', cacheScopeKey({ sourceIds: ['a', 'c'] }), 'k');
     expect(a).not.toBe(b);
+  });
+});
+
+describe('the production call sites actually use the scoped key', () => {
+  /**
+   * Adversarial review caught a real gap: every other test in this file calls
+   * `cacheScopeKey()` at the test site, so reverting BOTH hybrid.ts call sites
+   * back to the buggy `opts?.sourceId` would leave the entire suite green
+   * while the leak returned. A correct helper wired to nothing is not a fix.
+   *
+   * A full e2e assertion through `hybridSearchCached` is harness-limited here,
+   * and not by my hand: `test/telemetry-cache-miss.serial.test.ts` documents
+   * the same wall — a cache writeback requires the seeded page to be
+   * keyword-searchable, which needs an indexing step the unit harness does not
+   * run. Rather than fake that, this pins the wiring directly. It fails the
+   * moment either call site stops deriving a scoped key, which is precisely
+   * the regression the review was worried about.
+   */
+  const hybridSource = readFileSync(
+    new URL('../src/core/search/hybrid.ts', import.meta.url),
+    'utf-8',
+  );
+
+  test('the cache LOOKUP derives a scoped key, not the bare scalar', () => {
+    expect(hybridSource).toContain('cache.lookup(queryEmbedding, { sourceId: cacheScopeKey(opts)');
+  });
+
+  test('the cache STORE derives a scoped key, not the bare scalar', () => {
+    expect(hybridSource).toMatch(/\.store\([^)]*sourceId: cacheScopeKey\(opts\)/s);
+  });
+
+  test('neither cache site passes the raw opts.sourceId any more', () => {
+    // The exact pre-fix expression. Its return anywhere near a cache call is
+    // the bug coming back.
+    const cacheCalls = hybridSource
+      .split('\n')
+      .filter((line) => line.includes('cache.lookup(') || line.includes('.store(query,'));
+    expect(cacheCalls.length).toBeGreaterThanOrEqual(2);
+    for (const line of cacheCalls) {
+      expect(line).not.toContain('sourceId: opts?.sourceId');
+    }
+  });
+
+  test('cacheScopeKey is imported where it is used', () => {
+    expect(hybridSource).toMatch(/import\s*\{[^}]*cacheScopeKey[^}]*\}\s*from\s*'\.\/query-cache\.ts'/s);
   });
 });
 
