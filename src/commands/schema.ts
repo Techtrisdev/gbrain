@@ -19,6 +19,7 @@
 
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   addAliasToType,
   addLinkTypeToPack,
@@ -360,7 +361,13 @@ function runUse(args: string[]): void {
 function packPathByName(name: string): string | null {
   if (name === 'gbrain-base') {
     // Resolve bundled YAML — try a few locations.
-    const here = dirname(new URL(import.meta.url).pathname);
+    // fileURLToPath, NOT URL.pathname. On Windows `.pathname` yields
+    // "/C:/Users/..." — a leading slash plus forward separators — so both
+    // candidates below missed, packPathByName returned null, and
+    // `gbrain schema show gbrain-base` reported "Unknown pack" for a pack
+    // that `gbrain schema list` was simultaneously advertising as bundled.
+    // Six other src/ files already use fileURLToPath; this was the outlier.
+    const here = dirname(fileURLToPath(import.meta.url));
     const candidates = [
       join(here, '..', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
       join(here, '..', '..', 'src', 'core', 'schema-pack', 'base', 'gbrain-base.yaml'),
