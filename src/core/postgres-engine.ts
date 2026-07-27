@@ -1401,12 +1401,20 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      // v0.29.1 contract (skills/conventions/salience-and-recency.md): since/until
+      // filters on the page's EFFECTIVE date — a meeting is dated by when it
+      // happened, not when it was reimported. Postgres omitted effective_date
+      // entirely, so it diverged from PGLite and from the documented behaviour.
+      // The 2-arg form is deliberate: updated_at is NOT NULL (schema.sql:100),
+      // so a third COALESCE arg is unreachable, and this expression matches
+      // pages_coalesce_date_idx (schema.sql:209) exactly — the index was built
+      // for this filter and the old expression could not use it.
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at) > $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation filter. When the
     // caller's auth scope is set, narrow the inner CTE candidate set so
@@ -1613,12 +1621,20 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      // v0.29.1 contract (skills/conventions/salience-and-recency.md): since/until
+      // filters on the page's EFFECTIVE date — a meeting is dated by when it
+      // happened, not when it was reimported. Postgres omitted effective_date
+      // entirely, so it diverged from PGLite and from the documented behaviour.
+      // The 2-arg form is deliberate: updated_at is NOT NULL (schema.sql:100),
+      // so a third COALESCE arg is unreachable, and this expression matches
+      // pages_coalesce_date_idx (schema.sql:209) exactly — the index was built
+      // for this filter and the old expression could not use it.
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at) > $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Anchor primitive
     // for two-pass retrieval, so cross-source anchors would let the walk
@@ -1791,12 +1807,20 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      // v0.29.1 contract (skills/conventions/salience-and-recency.md): since/until
+      // filters on the page's EFFECTIVE date — a meeting is dated by when it
+      // happened, not when it was reimported. Postgres omitted effective_date
+      // entirely, so it diverged from PGLite and from the documented behaviour.
+      // The 2-arg form is deliberate: updated_at is NOT NULL (schema.sql:100),
+      // so a third COALESCE arg is unreachable, and this expression matches
+      // pages_coalesce_date_idx (schema.sql:209) exactly — the index was built
+      // for this filter and the old expression could not use it.
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at) > $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at) < $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // specifically. Pushing the filter inside narrows the HNSW candidate set
