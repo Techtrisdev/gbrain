@@ -31,6 +31,16 @@ export interface ToolResult {
 export interface DispatchOpts {
   /** Defaults to true (remote/untrusted). Local CLI callers (`gbrain call`) pass false. */
   remote?: boolean;
+  /**
+   * SEC-001 escape hatch. Permits `localOnly` operations for a remote caller.
+   *
+   * Default DENY. This exists only for an operator who deliberately wants
+   * CLI-only operations reachable over their own stdio MCP session, and it is
+   * surfaced as an explicit `gbrain serve --allow-local-ops` flag so the
+   * decision is visible in the process invocation rather than implied.
+   * Nothing sets it by default, and the HTTP transport never sets it at all.
+   */
+  allowLocalOps?: boolean;
   /** Override the default stderr logger (e.g. CLI uses console.* directly). */
   logger?: OperationContext['logger'];
   /**
@@ -238,6 +248,40 @@ export async function dispatchToolCall(
     // transport bug.
     return {
       content: [{ type: 'text', text: JSON.stringify({ error: 'unknown_tool', message: `Unknown tool: ${name}` }, null, 2) }],
+      isError: true,
+    };
+  }
+
+  // SEC-001 — localOnly enforcement, here rather than in a transport.
+  //
+  // `localOnly: true` means "CLI-only; no agent-facing transport may reach
+  // this". That promise used to be kept in exactly ONE place — serve-http.ts's
+  // `operations.filter(op => !op.localOnly)` — so stdio MCP honoured nothing
+  // and reached the same handlers. Enforcing at dispatch makes the guarantee
+  // transport-agnostic: any current or future caller routing through
+  // dispatchToolCall inherits it, instead of each transport re-implementing
+  // (or forgetting) the check. serve-http keeps its filter too — that one also
+  // hides these ops from tools/list, which this cannot do.
+  //
+  // ORDERED BEFORE validateParams DELIBERATELY. Authorize, then validate.
+  // With validation first, an unauthorized caller distinguishes a real op from
+  // an unknown one, and probes its parameter schema, purely from the
+  // difference between `invalid_params` and `permission_denied`. Denying first
+  // makes the response identical whatever the caller sends.
+  //
+  // FAIL CLOSED per the v0.26.9 convention: anything that is not strictly
+  // `false` counts as remote. A transport that forgets to set the field is
+  // treated as untrusted rather than being handed a free pass — which is the
+  // exact shape of the historical HTTP shell-job escalation.
+  if (op.localOnly && opts.remote !== false && opts.allowLocalOps !== true) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: 'permission_denied',
+          message: `Operation ${name} is local-only (CLI) and cannot be called from a remote or agent transport.`,
+        }, null, 2),
+      }],
       isError: true,
     };
   }

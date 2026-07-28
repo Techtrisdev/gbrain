@@ -33,7 +33,9 @@ export interface ServeOptions {
   // (which unconditionally attaches a 'data' listener to real
   // process.stdin and would pollute the test runner's stdin handle).
   // Defaults to the real implementation when omitted.
-  startMcpServer?: (engine: BrainEngine) => Promise<void>;
+  // Second arg carries the SEC-001 opts (allowLocalOps) so a test stub can
+  // assert the flag is threaded, not just that the server started.
+  startMcpServer?: (engine: BrainEngine, opts?: { allowLocalOps?: boolean }) => Promise<void>;
   // Test seam for the parent-process watchdog. The default
   // (`readLiveParentPid`) reads the live kernel PPID via `ps` because
   // `process.ppid` is captured at process creation and does not refresh
@@ -127,8 +129,24 @@ export async function runServe(
 
   installStdioLifecycle(engine, args, opts);
 
+  // SEC-001 escape hatch. Default DENY: stdio is agent-facing (Claude Desktop,
+  // Cursor, any MCP client), so `localOnly` ops are refused at dispatch unless
+  // the operator opts in explicitly here. Warn loudly when they do — this
+  // widens a trust boundary, and the whole point of requiring a flag is that
+  // the choice is visible in the process invocation rather than implied.
+  const allowLocalOps = args.includes('--allow-local-ops');
+  if (allowLocalOps) {
+    console.error(
+      '[gbrain serve] WARNING: --allow-local-ops is set. CLI-only (localOnly) operations\n' +
+      '  — including purge_deleted_pages, which hard-deletes rows inside their documented\n' +
+      '  72h recovery window — are now reachable from any MCP client attached to this stdio\n' +
+      '  session. A prompt-injected client can invoke them. Only use this if you control\n' +
+      '  every client on this pipe.',
+    );
+  }
+
   const start = opts.startMcpServer ?? startMcpServer;
-  await start(engine);
+  await start(engine, { allowLocalOps });
   // startMcpServer's `await server.connect(transport)` resolves once the
   // SDK has wired up its stdin 'data' listener; that listener keeps the
   // event loop alive. We deliberately do NOT add `await new Promise(() =>

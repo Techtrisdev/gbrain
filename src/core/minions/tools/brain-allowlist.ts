@@ -45,7 +45,7 @@ import type { ToolCtx, ToolDef } from '../types.ts';
  * brain-allowlist test pins this invariant so an upstream rename fails CI
  * instead of silently dropping a tool.
  */
-export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
+const BRAIN_TOOL_CANDIDATES: readonly string[] = [
   'query',
   'search',
   'get_page',
@@ -64,7 +64,35 @@ export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
   // The cycle synthesize phase already calls discoverTranscripts directly.
   'get_recent_salience',
   'find_anomalies',
-]);
+];
+
+/**
+ * SEC-001 — `localOnly` operations are excluded STRUCTURALLY, not by hand.
+ *
+ * The candidate list above is hand-maintained and reflects intent. The filter
+ * below enforces the trust boundary regardless of that intent, because intent
+ * already failed once here: the comment on `get_recent_transcripts` states the
+ * correct rule — subagent calls always carry ctx.remote=true, so a localOnly op
+ * in this list is at best a footgun and at worst a bypass — and then
+ * `file_list` and `file_url` sat in the list anyway. Both are admin + localOnly.
+ * The registry built a remote:true context and invoked their handlers DIRECTLY,
+ * so neither the HTTP transport's filter nor any transport-level check applied,
+ * and prompt-driven subagents could enumerate file metadata and probe storage
+ * paths that the ops' own contract declares CLI-only.
+ *
+ * Deriving the exclusion from `op.localOnly` means a future edit that adds a
+ * localOnly op to the candidate list — by hand, or by an upstream flag change
+ * on an op already listed — cannot reintroduce the leak. Unknown names are
+ * deliberately NOT filtered out here so the existing "every name must resolve
+ * to a real operation" invariant still fails loudly on an upstream rename
+ * instead of silently shrinking the registry.
+ */
+export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set(
+  BRAIN_TOOL_CANDIDATES.filter((name) => {
+    const op = operations.find((o) => o.name === name);
+    return op ? op.localOnly !== true : true;
+  }),
+);
 
 /** Matches Anthropic's tool-name constraint. No dots. */
 const ANTHROPIC_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;

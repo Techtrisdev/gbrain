@@ -106,9 +106,45 @@ if [ -f "$SERVE_HTTP" ]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# SEC-001. The HTTP filter above is necessary but was never sufficient: stdio
+# MCP, the legacy bearer transport, and the subagent registry all reached the
+# same handlers without it. Two structural guards now back the runtime tests.
+# ---------------------------------------------------------------------------
+
+# 1. dispatch.ts is the transport-agnostic gate. Every MCP transport routes
+#    through dispatchToolCall, so losing this check silently re-opens stdio,
+#    http-transport.ts, and anything added later — all at once.
+DISPATCH="src/mcp/dispatch.ts"
+if [ -f "$DISPATCH" ]; then
+  if ! grep -qE 'op\.localOnly && opts\.remote !== false' "$DISPATCH"; then
+    echo "FAIL: $DISPATCH no longer gates localOnly operations."
+    echo "      This is the ONLY transport-agnostic enforcement point; without"
+    echo "      it stdio MCP and the legacy bearer transport reach CLI-only ops"
+    echo "      (incl. purge_deleted_pages) with no check. The comparison must"
+    echo "      stay fail-closed (\`!== false\`), not \`=== true\`: a transport"
+    echo "      that forgets to set remote must be treated as untrusted."
+    FAIL=1
+  fi
+fi
+
+# 2. The subagent registry must exclude localOnly ops STRUCTURALLY. It once
+#    listed file_list and file_url by hand — both admin + localOnly — and
+#    invoked their handlers directly with a remote:true context.
+ALLOWLIST="src/core/minions/tools/brain-allowlist.ts"
+if [ -f "$ALLOWLIST" ]; then
+  if ! grep -qE 'op\.localOnly !== true' "$ALLOWLIST"; then
+    echo "FAIL: $ALLOWLIST no longer filters localOnly ops out of the subagent"
+    echo "      registry. The hand-maintained candidate list is intent; the"
+    echo "      derived filter is enforcement. Intent already failed here once."
+    FAIL=1
+  fi
+fi
+
 if [ "$FAIL" -eq 1 ]; then
   echo ""
-  echo "Hint: see test/operations-trust-boundary.test.ts for the runtime contract."
+  echo "Hint: see test/operations-trust-boundary.test.ts and"
+  echo "      test/stdio-trust-boundary.test.ts for the runtime contracts."
   exit 1
 fi
 
