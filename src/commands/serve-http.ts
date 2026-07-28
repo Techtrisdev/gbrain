@@ -17,6 +17,7 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
+import { rateLimitKey, resolveTrustProxy } from '../core/rate-limit-key.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -688,7 +689,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // Express 5 app
   const app = express();
-  app.set('trust proxy', 'loopback'); // Caddy/Tailscale reverse proxy on localhost
+  // `trust proxy` decides whether Express believes X-Forwarded-For, and thus
+  // whether `req.ip` is the real caller. It is deployment-specific and cannot
+  // be inferred from inside the process, so it is configurable via
+  // GBRAIN_TRUST_PROXY (a hop count is the usual answer: 1 behind a single
+  // reverse proxy, 2 behind a platform edge plus a local proxy).
+  //
+  // The DEFAULT stays 'loopback' on purpose. Silently widening trust would
+  // change IP attribution for every existing deployment, and an over-wide
+  // setting is strictly worse than a conservative one because it lets a
+  // caller spoof X-Forwarded-For and forge someone else's rate-limit bucket.
+  //
+  // Getting this right is the primary lever; the per-principal keyGenerator
+  // on every limiter below is the backstop for when it is still wrong.
+  app.set('trust proxy', resolveTrustProxy(process.env));
 
   // ---------------------------------------------------------------------------
   // Cookie parsing — required for /admin auth (express 5 has no built-in)
@@ -709,6 +723,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // SDK's token handler only supports authorization_code and refresh_token
   // ---------------------------------------------------------------------------
   const ccRateLimiter = rateLimit({
+    // Per-principal keying. See src/core/rate-limit-key.ts: if trust proxy
+    // is wrong for this deployment, req.ip collapses and this limiter would
+    // otherwise become ONE GLOBAL bucket — turning an attacker into a DoS
+    // against every legitimate caller. Degrade per-principal, never global.
+    keyGenerator: rateLimitKey,
     windowMs: 15 * 60 * 1000,
     max: 50,
     standardHeaders: true,
@@ -722,6 +741,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // could DoS the server's CPU on sha256 + the inline HTML response.
   // Defense-in-depth on the highest-privileged URL the server exposes.
   const adminAuthRateLimiter = rateLimit({
+    // Per-principal keying. See src/core/rate-limit-key.ts: if trust proxy
+    // is wrong for this deployment, req.ip collapses and this limiter would
+    // otherwise become ONE GLOBAL bucket — turning an attacker into a DoS
+    // against every legitimate caller. Degrade per-principal, never global.
+    keyGenerator: rateLimitKey,
     windowMs: 60 * 1000,
     max: 10,
     standardHeaders: true,
@@ -1908,6 +1932,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // through the put_page op to skip auto-link.
   // ---------------------------------------------------------------------------
   const ingestRateLimiter = rateLimit({
+    // Per-principal keying. See src/core/rate-limit-key.ts: if trust proxy
+    // is wrong for this deployment, req.ip collapses and this limiter would
+    // otherwise become ONE GLOBAL bucket — turning an attacker into a DoS
+    // against every legitimate caller. Degrade per-principal, never global.
+    keyGenerator: rateLimitKey,
     windowMs: 10_000, // 10 seconds
     limit: 100, // 100 events per IP per window
     standardHeaders: 'draft-7',
@@ -2147,6 +2176,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   //     (above autopilot's 0).
   // ---------------------------------------------------------------------------
   const githubWebhookLimiter = rateLimit({
+    // Per-principal keying. See src/core/rate-limit-key.ts: if trust proxy
+    // is wrong for this deployment, req.ip collapses and this limiter would
+    // otherwise become ONE GLOBAL bucket — turning an attacker into a DoS
+    // against every legitimate caller. Degrade per-principal, never global.
+    keyGenerator: rateLimitKey,
     windowMs: 60_000,
     limit: 60,
     standardHeaders: 'draft-7',
@@ -2315,6 +2349,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // the source by repo before the HMAC compare). The rate limiter is the probe backstop.
   // ---------------------------------------------------------------------------
   const calendarWebhookLimiter = rateLimit({
+    // Per-principal keying. See src/core/rate-limit-key.ts: if trust proxy
+    // is wrong for this deployment, req.ip collapses and this limiter would
+    // otherwise become ONE GLOBAL bucket — turning an attacker into a DoS
+    // against every legitimate caller. Degrade per-principal, never global.
+    keyGenerator: rateLimitKey,
     windowMs: 60_000,
     limit: 60,
     standardHeaders: 'draft-7',
@@ -2431,6 +2470,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // test/connector-base.test.ts.
   // ---------------------------------------------------------------------------
   const connectorWebhookLimiter = rateLimit({
+    // Per-principal keying. See src/core/rate-limit-key.ts: if trust proxy
+    // is wrong for this deployment, req.ip collapses and this limiter would
+    // otherwise become ONE GLOBAL bucket — turning an attacker into a DoS
+    // against every legitimate caller. Degrade per-principal, never global.
+    keyGenerator: rateLimitKey,
     windowMs: 60_000,
     limit: 60,
     standardHeaders: 'draft-7',

@@ -14,6 +14,7 @@
  */
 
 import type { Response } from 'express';
+import { safeHexEqual } from './timing-safe.ts';
 import type {
   OAuthClientInformationFull,
   OAuthTokens,
@@ -652,8 +653,17 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const presentedHash = hashToken(presentedSecret);
     // client.client_secret is the stored SHA-256 hash (getClient returns
     // it as the `client_secret` field per the v0.34.1.0 normalization).
-    // Compare via SHA-256-then-equals; constant-time compare a follow-up.
-    if (client.client_secret !== presentedHash) {
+    // Constant-time compare: `!==` short-circuits on the first differing
+    // byte, which is a timing side channel on a token-issuing endpoint that
+    // is reachable from the public HTTPS MCP surface. safeHexEqual was
+    // already used for bootstrap tokens and webhook HMACs in serve-http.ts;
+    // these two sites were the stragglers.
+    //
+    // The null-guard comes FIRST and is deliberately not constant-time: a
+    // public PKCE client stores NULL (v0.34.1.0), and safeHexEqual would
+    // throw on it. What that branch leaks — whether a client is public or
+    // confidential — is not secret; it is part of the client's registration.
+    if (!client.client_secret || !safeHexEqual(client.client_secret, presentedHash)) {
       throw new Error('Invalid client');
     }
     // Soft-delete probe — same shape as exchangeClientCredentials.
@@ -698,7 +708,11 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
 
     // Verify secret
     const secretHash = hashToken(clientSecret);
-    if (client.client_secret !== secretHash) throw new Error('Invalid client secret');
+    // Constant-time; same rationale and same null-guard ordering as the
+    // confidential-client path above.
+    if (!client.client_secret || !safeHexEqual(client.client_secret, secretHash)) {
+      throw new Error('Invalid client secret');
+    }
 
     // Determine scopes. v0.28 swaps exact-string-match for hasScope so a
     // client whose grant is `admin` can mint tokens that include implied
