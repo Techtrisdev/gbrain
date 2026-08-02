@@ -25,6 +25,12 @@
 
 import type { BrainEngine } from '../core/engine.ts';
 import { loadAllSources } from '../core/sources-load.ts';
+// Side-effect import: populate the connector REGISTRY (each connector module
+// calls registerConnector at load). Without this, a standalone `gbrain connector
+// poll` process never registers any connector and every target is skipped as
+// `connector_not_registered` — the long-running serve/autopilot process only
+// works because its own startup imports the registry. The CLI must import it too.
+import '../core/connectors/registry.ts';
 import {
   selectEnabledConnectorSources,
   runConnectorPoll,
