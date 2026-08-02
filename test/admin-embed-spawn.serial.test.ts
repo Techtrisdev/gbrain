@@ -24,12 +24,13 @@
  * a TCP port and reads/writes a tmpdir.
  */
 import { describe, test, expect } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import type { Subprocess } from 'bun';
 
-const REPO = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
+const REPO = fileURLToPath(new URL('..', import.meta.url)).replace(/[\\/]$/, '');
 
 interface ServeProc {
   proc: Subprocess;

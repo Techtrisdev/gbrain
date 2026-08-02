@@ -22,10 +22,11 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-const REPO_ROOT = new URL('..', import.meta.url).pathname;
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 async function runCli(args: string[]): Promise<{
   stdout: string;

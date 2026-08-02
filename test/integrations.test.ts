@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll } from 'bun:test';
+import { fileURLToPath } from 'node:url';
 import {
   parseRecipe,
   isUnsafeHealthCheck,
@@ -255,7 +256,7 @@ describe('twilio-voice-brain recipe', () => {
     );
     const recipe = parseRecipe(content, 'twilio-voice-brain.md');
     expect(recipe).not.toBeNull();
-    const recipesDir = new URL('../recipes/', import.meta.url).pathname;
+    const recipesDir = fileURLToPath(new URL('../recipes/', import.meta.url));
     for (const dep of recipe!.frontmatter.requires) {
       const depPath = resolve(recipesDir, `${dep}.md`);
       expect(existsSync(depPath)).toBe(true);
@@ -269,7 +270,7 @@ describe('all recipes', () => {
   test('every recipe file in recipes/ parses correctly', () => {
     const { readFileSync, readdirSync } = require('fs');
     const { resolve } = require('path');
-    const recipesDir = new URL('../recipes/', import.meta.url).pathname;
+    const recipesDir = fileURLToPath(new URL('../recipes/', import.meta.url));
     const files = readdirSync(recipesDir).filter((f: string) => f.endsWith('.md'));
     expect(files.length).toBeGreaterThan(0);
     for (const file of files) {
@@ -283,7 +284,7 @@ describe('all recipes', () => {
   test('no recipe contains personal references', () => {
     const { readFileSync, readdirSync } = require('fs');
     const { resolve } = require('path');
-    const recipesDir = new URL('../recipes/', import.meta.url).pathname;
+    const recipesDir = fileURLToPath(new URL('../recipes/', import.meta.url));
     const files = readdirSync(recipesDir).filter((f: string) => f.endsWith('.md'));
     const personalPatterns = /wintermute|mercury|16507969501|\+1650796/i;
     for (const file of files) {
@@ -295,7 +296,7 @@ describe('all recipes', () => {
   test('typed health_checks parse correctly in all recipes', () => {
     const { readFileSync, readdirSync } = require('fs');
     const { resolve } = require('path');
-    const recipesDir = new URL('../recipes/', import.meta.url).pathname;
+    const recipesDir = fileURLToPath(new URL('../recipes/', import.meta.url));
     const files = readdirSync(recipesDir).filter((f: string) => f.endsWith('.md'));
     for (const file of files) {
       const content = readFileSync(resolve(recipesDir, file), 'utf-8');
