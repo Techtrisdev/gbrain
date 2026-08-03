@@ -677,30 +677,44 @@ describe('dropInvalidIndexConcurrently — the shared CONCURRENTLY cleanup', () 
   test('no migration reintroduces an inline DO-block CONCURRENTLY drop', async () => {
     const { readFileSync } = await import('fs');
     const src = readFileSync('src/core/migrate.ts', 'utf-8');
-    // Count only executable occurrences. The helper's doc comment quotes the
-    // broken form on purpose, so comment lines are excluded — by shape, not by
-    // slicing around an anchor string that would silently match nothing.
-    const offenders = src
-      .split('\n')
-      .map((line, i) => ({ line, n: i + 1 }))
-      .filter(({ line }) => {
-        const t = line.trim();
-        return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
-      })
-      .filter(({ line }) => /EXECUTE\s+'DROP INDEX CONCURRENTLY/.test(line));
-    expect(offenders.map(o => `line ${o.n}`)).toEqual([]);
+    // Zero occurrences anywhere in the file, including comments. The helper's
+    // doc comment deliberately avoids spelling the broken form out, so this
+    // needs no comment-filtering — and therefore has no filter to defeat.
+    //
+    // Case-insensitive because Postgres keywords are, and \s+ spans newlines so
+    // splitting the statement across lines does not slip past.
+    const offenders = [...src.matchAll(/EXECUTE\s+'\s*DROP\s+INDEX\s+CONCURRENTLY/gi)]
+      .map(m => `line ${src.slice(0, m.index).split('\n').length}`);
+    expect(offenders).toEqual([]);
   });
 
-  test('every CONCURRENTLY index build is preceded by the shared cleanup', async () => {
+  test('every CONCURRENTLY index build is preceded by cleanup for THAT index', async () => {
     const { readFileSync } = await import('fs');
     const src = readFileSync('src/core/migrate.ts', 'utf-8');
-    const creates = [...src.matchAll(/CREATE INDEX CONCURRENTLY IF NOT EXISTS\s+([a-z0-9_]+)/g)]
-      .map(m => m[1]);
+
+    const creates = [...src.matchAll(/CREATE INDEX CONCURRENTLY IF NOT EXISTS\s+([a-z0-9_]+)/g)];
     expect(creates.length).toBeGreaterThan(0);
-    for (const idx of creates) {
-      expect(src).toContain(`dropInvalidIndexConcurrently(engine, `);
-      expect(src).toContain(`'${idx}')`);
+
+    // Scoped per build site, not whole-file. A whole-file `toContain` only
+    // proves the two substrings exist somewhere — it cannot catch a cleanup
+    // bound to the wrong index, or one placed AFTER the create it is meant to
+    // precede. Six of the eight migrations have no other test touching them,
+    // so this is their only coverage and it has to be real.
+    const problems: string[] = [];
+    for (const m of creates) {
+      const idx = m[1];
+      const createAt = m.index!;
+      // Look back a bounded window — comfortably larger than any single
+      // handler body, far smaller than the distance between migrations.
+      const window = src.slice(Math.max(0, createAt - 1200), createAt);
+      const line = src.slice(0, createAt).split('\n').length;
+      if (!window.includes(`dropInvalidIndexConcurrently(engine, `)) {
+        problems.push(`line ${line}: create of ${idx} has no preceding cleanup call`);
+      } else if (!window.includes(`'${idx}')`)) {
+        problems.push(`line ${line}: cleanup before create of ${idx} names a different index`);
+      }
     }
+    expect(problems).toEqual([]);
   });
 });
 

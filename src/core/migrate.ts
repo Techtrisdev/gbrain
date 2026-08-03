@@ -112,10 +112,15 @@ export class MigrationRetryExhausted extends Error {
  * Drop a leftover INVALID index from a previously-aborted
  * `CREATE INDEX CONCURRENTLY`, so the retry can rebuild it.
  *
- * This MUST NOT be wrapped in a `DO $$ ... END $$` block. PL/pgSQL always
+ * This MUST NOT be wrapped in a PL/pgSQL anonymous block. Such a block always
  * executes inside a transaction, and DROP/CREATE INDEX CONCURRENTLY refuse to
- * run in one — so `EXECUTE 'DROP INDEX CONCURRENTLY ...'` inside a DO block
- * always raises "cannot run inside a transaction block".
+ * run in one — so issuing the drop from inside one always raises "cannot run
+ * inside a transaction block".
+ *
+ * (The broken form is deliberately not spelled out literally here. A test
+ * asserts the source contains zero occurrences of it, and a doc comment
+ * quoting it would either defeat that test or force it to special-case
+ * comments — which is its own bug surface.)
  *
  * Seven migrations (v14, v34, v41, v66, v72, v91, and the two added alongside
  * this helper) carried exactly that shape, each copied from the last — v91's
