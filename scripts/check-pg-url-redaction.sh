@@ -10,7 +10,13 @@
 #   - new logging APIs that may show up later (the regex matches the URL,
 #     not the consumer; any leak will trip)
 #
-# Wired into bun run check:all and bun run verify.
+# Wired into `bun run verify` as check:pg-url-redaction. It is NOT in
+# check:all, which is a separate and deliberately narrower list.
+#
+# This comment previously claimed the script was wired into both. It was wired
+# into neither, and had never run. scripts/check-checks-wired.sh now fails the
+# build if any check script is referenced by no entrypoint, so that specific
+# gap cannot silently reopen.
 #
 # Exit codes: 0 = clean, 1 = found at least one suspect line.
 set -euo pipefail
