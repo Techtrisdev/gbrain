@@ -1,0 +1,128 @@
+name: Alert on red
+
+# Route a failed scheduled run to a human.
+#
+# WHY THIS EXISTS
+# ---------------
+# Scheduled workflows here fail into a void. `Heavy Tests` has failed on every
+# scheduled run observed (2026-08-01, 08-02, 08-03) with no triage, because a
+# 09:00 UTC cron failure is visible to nobody — unlike a push or PR failure,
+# where someone is already looking at the PR.
+#
+# This is the second independent instance of the shape. The sibling corpus repo
+# had `Reconcile` correctly detect real production pin drift and fail on all 8
+# of its scheduled runs across 8 days, while production ran without a
+# cross-tenant query-cache scoping fix the entire time. The instrument worked
+# perfectly; it was the only part that did.
+#
+# Two instances is a class, so this fixes the class rather than the instances:
+# any scheduled workflow that fails opens an issue, and the issue closes itself
+# when that workflow next succeeds.
+#
+# DESIGN NOTES
+# ------------
+#   * One open issue per workflow, not one per failed run. A daily cron stuck
+#     red would otherwise file ~30 issues a month and train the reader to ignore
+#     them. Repeat failures add a comment to the existing issue.
+#   * Auto-closes on recovery, so an open issue always means "currently red". An
+#     alert that lies about current state gets muted, and muted is the state
+#     these workflows were already in.
+#   * Scheduled runs only. Push and PR failures already have a reader; adding
+#     them would move the pileup rather than clear it.
+#   * Uses the preinstalled `gh` CLI rather than a third-party action, so there
+#     is no floating action tag to pin and no new supply-chain surface.
+#
+# The workflow names below MUST match each workflow's `name:` field exactly — a
+# workflow_run trigger naming a workflow that does not exist never fires,
+# silently. An alerting workflow that never alerts is the failure this exists to
+# end, so the list is verified against the actual name: fields: `Heavy Tests`
+# (heavy-tests.yml) and `E2E Tests` (e2e.yml) are the only two carrying a
+# schedule: trigger. `Test` and `Release` are deliberately absent — neither is
+# scheduled.
+
+on:
+  workflow_run:
+    workflows:
+      - Heavy Tests
+      - E2E Tests
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+
+# Serialise per target workflow. The dedup is a check-then-act (list, then
+# create), so two completions for the SAME workflow landing together could both
+# see no open issue and both file one.
+concurrency:
+  group: alert-on-red-${{ github.event.workflow_run.name }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    if: github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open, update, or close the alert issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WF_NAME: ${{ github.event.workflow_run.name }}
+          WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WF_URL: ${{ github.event.workflow_run.html_url }}
+          WF_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          TITLE="[red] scheduled workflow failing: ${WF_NAME}"
+
+          EXISTING="$(gh issue list -R "$REPO" --state open --limit 100 \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -1)"
+
+          if [ "$WF_CONCLUSION" = "success" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" -R "$REPO" \
+                --body "Recovered: [\`${WF_SHA:0:8}\`](${WF_URL}) succeeded. Closing."
+              gh issue close "$EXISTING" -R "$REPO"
+              echo "closed #${EXISTING} — ${WF_NAME} recovered"
+            else
+              echo "${WF_NAME} green, no open alert — nothing to do"
+            fi
+            exit 0
+          fi
+
+          if [ "$WF_CONCLUSION" != "failure" ]; then
+            echo "conclusion=${WF_CONCLUSION} — not routing"
+            exit 0
+          fi
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" -R "$REPO" \
+              --body "Still failing: [\`${WF_SHA:0:8}\`](${WF_URL})"
+            echo "commented on #${EXISTING} — ${WF_NAME} still red"
+            exit 0
+          fi
+
+          gh issue create -R "$REPO" \
+            --title "$TITLE" \
+            --assignee jlfetter1 \
+            --body "$(cat <<EOF
+\`${WF_NAME}\` failed on its scheduled run.
+
+**Run:** ${WF_URL}
+**Commit:** \`${WF_SHA}\`
+
+Opened automatically because a scheduled workflow failed and scheduled failures
+reach nobody otherwise. It will close itself when \`${WF_NAME}\` next succeeds,
+so an open issue here always means *currently red*.
+
+Repeat failures add a comment rather than a new issue.
+
+If this workflow is not worth reading, that is a real answer — delete the
+workflow or remove it from the trigger list in
+\`.github/workflows/alert-on-red.yml\`. Leaving it red and unread is the state
+this alerting exists to end.
+EOF
+)"
+          echo "opened alert issue for ${WF_NAME}"
