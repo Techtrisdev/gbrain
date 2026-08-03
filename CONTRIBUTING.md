@@ -82,8 +82,11 @@ patterns (`scripts/check-jsonb-pattern.sh`), `\r` progress bleed to stdout
 (`scripts/check-test-isolation.sh` — see "Writing tests that survive the parallel
 loop" below), silent fallback to recursive chunking in the compiled binary
 (`scripts/check-wasm-embedded.sh`), and stale admin-dashboard build artifacts
-(`scripts/check-admin-build.sh`). `bun run check:all` runs the full historical
-sweep including the trailing-newline and exports-count checks.
+(`scripts/check-admin-build.sh`). `bun run verify` is the full set — including
+the trailing-newline and exports-count checks, which used to sit behind an
+opt-in `bun run check:all` sweep that nothing invoked. `check:all` is retired;
+`scripts/check-checks-wired.sh` now fails the build if any check script is not
+reachable from a CI entrypoint.
 
 ### Writing tests that survive the parallel loop
 
