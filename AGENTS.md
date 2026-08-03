@@ -32,8 +32,13 @@ start here.
 ## Read this order
 
 1. `./AGENTS.md` (this file) — install + operating protocol.
-2. [`./CLAUDE.md`](./CLAUDE.md) — architecture reference, key files, trust boundaries,
-   test layout.
+2. [`./CLAUDE.md`](./CLAUDE.md) — purpose, tech stack, layout, and the command set.
+   The detail it used to carry now lives alongside it and applies to every agent,
+   not just Claude: [`./.claude/docs/architecture.md`](./.claude/docs/architecture.md)
+   (engine interface, migrations, operations contract, trust boundary, search staging),
+   [`./.claude/docs/testing.md`](./.claude/docs/testing.md) (test taxonomy, isolation
+   rules, E2E lifecycle), and
+   [`./.claude/docs/related-repos.md`](./.claude/docs/related-repos.md).
 3. [`./docs/architecture/brains-and-sources.md`](./docs/architecture/brains-and-sources.md)
    — the two-axis mental model (brain = which DB, source = which repo in the DB). Every
    query routes on both axes. Read before writing anything that touches brain ops.
@@ -105,16 +110,19 @@ fresh pgvector container) and tears down. Use `bun run ci:local:diff` for the
 diff-aware subset during fast iteration on a focused branch. Requires Docker
 (Docker Desktop / OrbStack / Colima) and `gitleaks` (`brew install gitleaks`).
 
-Manual path: `bun test` plus the E2E lifecycle described in `./CLAUDE.md` (spin
-up the test Postgres container, run `bun run test:e2e`, tear it down).
+Manual path: `bun test` plus the E2E lifecycle described in
+[`./.claude/docs/testing.md`](./.claude/docs/testing.md) (spin up the test Postgres
+container, bootstrap its schema, run `bun run test:e2e`, tear it down).
 
 Ship via the `/ship` skill, not by hand.
 
 ## Privacy
 
-Never commit real names of people, companies, or funds into public artifacts. See the
-Privacy rule in `./CLAUDE.md`. GBrain pages reference real contacts; public docs must
-use generic placeholders (`alice-example`, `acme-example`, `fund-a`).
+Never commit real names of people, companies, or funds into public artifacts. GBrain
+pages reference real contacts; public docs, fixtures, and test data must use generic
+placeholders (`alice-example`, `acme-example`, `fund-a`). Enforced by
+`scripts/check-privacy.sh` and `scripts/check-test-real-names.sh`, both wired into
+`bun run verify`.
 
 ## Forks
 
