@@ -108,6 +108,44 @@ export class MigrationRetryExhausted extends Error {
   }
 }
 
+/**
+ * Drop a leftover INVALID index from a previously-aborted
+ * `CREATE INDEX CONCURRENTLY`, so the retry can rebuild it.
+ *
+ * This MUST NOT be wrapped in a `DO $$ ... END $$` block. PL/pgSQL always
+ * executes inside a transaction, and DROP/CREATE INDEX CONCURRENTLY refuse to
+ * run in one — so `EXECUTE 'DROP INDEX CONCURRENTLY ...'` inside a DO block
+ * always raises "cannot run inside a transaction block".
+ *
+ * Seven migrations (v14, v34, v41, v66, v72, v91, and the two added alongside
+ * this helper) carried exactly that shape, each copied from the last — v91's
+ * comment says "matches v14 pattern" in as many words. None of their
+ * self-healing paths could ever have run. The bug stayed invisible because the
+ * branch only fires on a retry after an aborted build, which had not happened.
+ * A repair path nobody has needed yet is still a repair path that does not work.
+ *
+ * The probe is a plain SELECT; the DROP is issued as its own top-level
+ * statement via runMigration, outside any transaction.
+ *
+ * `indexName` is always an internal literal from this file, never caller input.
+ */
+async function dropInvalidIndexConcurrently(
+  engine: BrainEngine,
+  version: number,
+  indexName: string,
+): Promise<void> {
+  const invalid = await engine.executeRaw<{ ok: number }>(
+    `SELECT 1 AS ok
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname = $1 AND NOT i.indisvalid`,
+    [indexName],
+  );
+  if (invalid.length > 0) {
+    await engine.runMigration(version, `DROP INDEX CONCURRENTLY IF EXISTS ${indexName};`);
+  }
+}
+
 // Migrations are embedded here, not loaded from files.
 // Add new migrations at the end. Never modify existing ones.
 // Exported for tests that structurally assert migration contents (e.g., "v9 must
@@ -497,18 +535,7 @@ export const MIGRATIONS: Migration[] = [
     sql: '',
     handler: async (engine) => {
       if (engine.kind === 'postgres') {
-        await engine.runMigration(
-          14,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'idx_pages_updated_at_desc' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_pages_updated_at_desc';
-             END IF;
-           END $$;`
-        );
+        await dropInvalidIndexConcurrently(engine, 14, 'idx_pages_updated_at_desc');
         await engine.runMigration(
           14,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_updated_at_desc
@@ -1615,17 +1642,7 @@ export const MIGRATIONS: Migration[] = [
       //    avoids the SHARE lock on `pages`; PGLite has no concurrent writers.
       if (engine.kind === 'postgres') {
         // Pre-drop any invalid index from a prior CONCURRENTLY failure (matches v14 pattern).
-        await engine.runMigration(34, `
-          DO $$ BEGIN
-            IF EXISTS (
-              SELECT 1 FROM pg_index i
-              JOIN pg_class c ON c.oid = i.indexrelid
-              WHERE c.relname = 'pages_deleted_at_purge_idx' AND NOT i.indisvalid
-            ) THEN
-              EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pages_deleted_at_purge_idx';
-            END IF;
-          END $$;
-        `);
+        await dropInvalidIndexConcurrently(engine, 34, 'pages_deleted_at_purge_idx');
         await engine.runMigration(34, `
           CREATE INDEX CONCURRENTLY IF NOT EXISTS pages_deleted_at_purge_idx
             ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -1963,17 +1980,7 @@ export const MIGRATIONS: Migration[] = [
       // 2. Expression index for since/until date-range filters.
       if (engine.kind === 'postgres') {
         // Pre-drop any invalid index from a prior CONCURRENTLY failure.
-        await engine.runMigration(38, `
-          DO $$ BEGIN
-            IF EXISTS (
-              SELECT 1 FROM pg_index i
-              JOIN pg_class c ON c.oid = i.indexrelid
-              WHERE c.relname = 'pages_coalesce_date_idx' AND NOT i.indisvalid
-            ) THEN
-              EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pages_coalesce_date_idx';
-            END IF;
-          END $$;
-        `);
+        await dropInvalidIndexConcurrently(engine, 38, 'pages_coalesce_date_idx');
         await engine.runMigration(38, `
           CREATE INDEX CONCURRENTLY IF NOT EXISTS pages_coalesce_date_idx
             ON pages ((COALESCE(effective_date, updated_at)));
@@ -3269,18 +3276,7 @@ export const MIGRATIONS: Migration[] = [
     sql: '',
     handler: async (engine) => {
       if (engine.kind === 'postgres') {
-        await engine.runMigration(
-          66,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'idx_chunks_embedding_null' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_null';
-             END IF;
-           END $$;`
-        );
+        await dropInvalidIndexConcurrently(engine, 66, 'idx_chunks_embedding_null');
         await engine.runMigration(
           66,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_null
@@ -3541,18 +3537,7 @@ export const MIGRATIONS: Migration[] = [
     handler: async (engine) => {
       if (engine.kind === 'postgres') {
         // Pre-drop invalid remnant from a failed CONCURRENTLY attempt.
-        await engine.runMigration(
-          71,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'takes_resolved_at_idx' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS takes_resolved_at_idx';
-             END IF;
-           END $$;`
-        );
+        await dropInvalidIndexConcurrently(engine, 71, 'takes_resolved_at_idx');
         await engine.runMigration(
           71,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS takes_resolved_at_idx
@@ -4214,18 +4199,7 @@ export const MIGRATIONS: Migration[] = [
       if (engine.kind === 'postgres') {
         // Pre-drop any invalid index from a prior CONCURRENTLY failure
         // (matches v14 pattern).
-        await engine.runMigration(
-          91,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'pages_generation_idx' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS pages_generation_idx';
-             END IF;
-           END $$;`
-        );
+        await dropInvalidIndexConcurrently(engine, 91, 'pages_generation_idx');
         await engine.runMigration(
           91,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS pages_generation_idx ON pages (generation);`
@@ -4911,18 +4885,7 @@ export const MIGRATIONS: Migration[] = [
     sql: '',
     handler: async (engine) => {
       if (engine.kind === 'postgres') {
-        await engine.runMigration(
-          106,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'idx_chunks_embedding_multimodal' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_multimodal';
-             END IF;
-           END $$;`
-        );
+        await dropInvalidIndexConcurrently(engine, 106, 'idx_chunks_embedding_multimodal');
         await engine.runMigration(
           106,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_multimodal
@@ -4967,18 +4930,7 @@ export const MIGRATIONS: Migration[] = [
     sql: '',
     handler: async (engine) => {
       if (engine.kind === 'postgres') {
-        await engine.runMigration(
-          107,
-          `DO $$ BEGIN
-             IF EXISTS (
-               SELECT 1 FROM pg_index i
-               JOIN pg_class c ON c.oid = i.indexrelid
-               WHERE c.relname = 'idx_pages_slug' AND NOT i.indisvalid
-             ) THEN
-               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_pages_slug';
-             END IF;
-           END $$;`
-        );
+        await dropInvalidIndexConcurrently(engine, 107, 'idx_pages_slug');
         await engine.runMigration(
           107,
           `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_slug ON pages(slug);`

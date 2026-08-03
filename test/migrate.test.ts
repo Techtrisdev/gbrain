@@ -630,18 +630,77 @@ describe('migrate v14 — pages_updated_at_index (handler-based, engine-aware)',
     const v14Start = src.indexOf("name: 'pages_updated_at_index'");
     expect(v14Start).toBeGreaterThan(-1);
     const v14Block = src.slice(v14Start, v14Start + 3000);
-    expect(v14Block).toContain('pg_index');
-    expect(v14Block).toContain('indisvalid');
-    expect(v14Block).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_pages_updated_at_desc');
+    // The invalid-index cleanup moved into the shared
+    // dropInvalidIndexConcurrently() helper — the inline DO $$ block it
+    // replaced could never execute (see the helper's own doc comment and the
+    // dedicated test below). What this migration must still do is invoke that
+    // cleanup for ITS index, before re-creating it.
+    expect(v14Block).toContain("dropInvalidIndexConcurrently(engine, 14, 'idx_pages_updated_at_desc')");
     expect(v14Block).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_updated_at_desc');
-    // Order within the handler body: DROP IF EXISTS must precede CREATE IF NOT EXISTS,
-    // so a failed prior CONCURRENTLY build is cleaned before re-create. Anchor on the
-    // explicit "IF EXISTS" / "IF NOT EXISTS" phrases so the header doc-comment
-    // (which mentions both unqualified) doesn't fool the ordering assertion.
-    const dropIdx = v14Block.indexOf('DROP INDEX CONCURRENTLY IF EXISTS');
+    // Cleanup must precede re-create, so a failed prior CONCURRENTLY build is
+    // dropped before the rebuild.
+    const dropIdx = v14Block.indexOf('dropInvalidIndexConcurrently');
     const createIdx = v14Block.indexOf('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
     expect(dropIdx).toBeLessThan(createIdx);
     expect(v14Block).toContain('engine.kind');
+  });
+});
+
+describe('dropInvalidIndexConcurrently — the shared CONCURRENTLY cleanup', () => {
+  // Seven migrations (v14, v34, v38, v66, v71, v91, plus 106/107) each carried
+  // their own copy of this cleanup as an inline `DO $$ ... EXECUTE 'DROP INDEX
+  // CONCURRENTLY ...' ... END $$` block. That shape can NEVER work: PL/pgSQL
+  // always runs inside a transaction and DROP INDEX CONCURRENTLY refuses to,
+  // so the EXECUTE always raises "cannot run inside a transaction block".
+  //
+  // It stayed invisible because the branch only fires on a retry after an
+  // aborted index build, which had not happened. Every one of those migrations
+  // had a self-healing path that could not heal.
+
+  test('the helper issues the DROP outside any DO block', async () => {
+    const { readFileSync } = await import('fs');
+    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const start = src.indexOf('async function dropInvalidIndexConcurrently');
+    expect(start).toBeGreaterThan(-1);
+    const body = src.slice(start, src.indexOf('\n}', start));
+
+    // Still probes for the invalid index...
+    expect(body).toContain('pg_index');
+    expect(body).toContain('indisvalid');
+    // ...and still drops it.
+    expect(body).toContain('DROP INDEX CONCURRENTLY IF EXISTS');
+    // The regression guard: the DROP must not be wrapped in PL/pgSQL.
+    expect(body).not.toContain('DO $$');
+    expect(body).not.toContain('EXECUTE ');
+  });
+
+  test('no migration reintroduces an inline DO-block CONCURRENTLY drop', async () => {
+    const { readFileSync } = await import('fs');
+    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    // Count only executable occurrences. The helper's doc comment quotes the
+    // broken form on purpose, so comment lines are excluded — by shape, not by
+    // slicing around an anchor string that would silently match nothing.
+    const offenders = src
+      .split('\n')
+      .map((line, i) => ({ line, n: i + 1 }))
+      .filter(({ line }) => {
+        const t = line.trim();
+        return !t.startsWith('*') && !t.startsWith('//') && !t.startsWith('/*');
+      })
+      .filter(({ line }) => /EXECUTE\s+'DROP INDEX CONCURRENTLY/.test(line));
+    expect(offenders.map(o => `line ${o.n}`)).toEqual([]);
+  });
+
+  test('every CONCURRENTLY index build is preceded by the shared cleanup', async () => {
+    const { readFileSync } = await import('fs');
+    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const creates = [...src.matchAll(/CREATE INDEX CONCURRENTLY IF NOT EXISTS\s+([a-z0-9_]+)/g)]
+      .map(m => m[1]);
+    expect(creates.length).toBeGreaterThan(0);
+    for (const idx of creates) {
+      expect(src).toContain(`dropInvalidIndexConcurrently(engine, `);
+      expect(src).toContain(`'${idx}')`);
+    }
   });
 });
 
@@ -742,16 +801,16 @@ describe('migrate v66 — embed_stale_partial_index (D6)', () => {
     const v66Start = src.indexOf("name: 'embed_stale_partial_index'");
     expect(v66Start).toBeGreaterThan(-1);
     const v66Block = src.slice(v66Start, v66Start + 3000);
-    expect(v66Block).toContain('pg_index');
-    expect(v66Block).toContain('indisvalid');
-    expect(v66Block).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_null');
+    // Cleanup moved into the shared dropInvalidIndexConcurrently() helper; see
+    // the dedicated test below for the helper's own contract.
+    expect(v66Block).toContain("dropInvalidIndexConcurrently(engine, 66, 'idx_chunks_embedding_null')");
     expect(v66Block).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_null');
     // Partial index predicate must match the production query in
     // postgres-engine.ts / pglite-engine.ts: `WHERE embedding IS NULL`.
     expect(v66Block).toContain('WHERE embedding IS NULL');
     // DROP IF EXISTS must precede CREATE IF NOT EXISTS so a failed prior
     // CONCURRENTLY build is cleaned before re-create.
-    const dropIdx = v66Block.indexOf('DROP INDEX CONCURRENTLY IF EXISTS');
+    const dropIdx = v66Block.indexOf('dropInvalidIndexConcurrently');
     const createIdx = v66Block.indexOf('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
     expect(dropIdx).toBeLessThan(createIdx);
     // Branches on engine.kind (handler-pattern from v14).
