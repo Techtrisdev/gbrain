@@ -292,6 +292,8 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='content_chunks' AND column_name='embedding_image') AS embedding_image_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='embedding_multimodal') AS embedding_multimodal_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='pages' AND column_name='effective_date') AS effective_date_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='mcp_request_log') AS mcp_log_exists,
@@ -358,6 +360,7 @@ export class PGLiteEngine implements BrainEngine {
       language_exists: boolean;
       search_vector_exists: boolean;
       embedding_image_exists: boolean;
+      embedding_multimodal_exists: boolean;
       effective_date_exists: boolean;
       mcp_log_exists: boolean;
       agent_name_exists: boolean;
@@ -395,6 +398,10 @@ export class PGLiteEngine implements BrainEngine {
     const needsPagesDeletedAt = probe.pages_exists && !probe.deleted_at_exists;
     // v0.27.1 — partial HNSW idx_chunks_embedding_image references this column.
     const needsChunksEmbeddingImage = probe.chunks_exists && !probe.embedding_image_exists;
+    // v78 + migration 106 — partial HNSW idx_chunks_embedding_multimodal
+    // references this column, and PGLITE_SCHEMA_SQL now creates that index on
+    // fresh installs. A pre-v78 brain would crash during blob replay.
+    const needsChunksEmbeddingMultimodal = probe.chunks_exists && !probe.embedding_multimodal_exists;
     // v0.26.3 (v33): idx_mcp_log_agent_time in PGLITE_SCHEMA_SQL needs agent_name col.
     const needsMcpLogBootstrap = probe.mcp_log_exists && !probe.agent_name_exists;
     // v0.27 (v36): idx_subagent_messages_provider in PGLITE_SCHEMA_SQL needs
@@ -456,6 +463,7 @@ export class PGLiteEngine implements BrainEngine {
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsChunksEmbeddingImage
+        && !needsChunksEmbeddingMultimodal
         && !needsMcpLogBootstrap && !needsSubagentProviderId
         && !needsPagesRecency && !needsIngestLogSourceId
         && !needsFilesBootstrap && !needsOauthClientsBootstrap
@@ -541,6 +549,18 @@ export class PGLiteEngine implements BrainEngine {
       await this.db.exec(`
         ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'text';
         ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_image vector(1024);
+      `);
+    }
+
+    if (needsChunksEmbeddingMultimodal) {
+      // v78 (embedding_multimodal_column) adds embedding_multimodal. Migration
+      // 106 adds the partial HNSW index over it, and PGLITE_SCHEMA_SQL now
+      // creates that index on fresh installs — so blob replay against a pre-v78
+      // brain would crash on `CREATE INDEX idx_chunks_embedding_multimodal ...
+      // WHERE embedding_multimodal IS NOT NULL`. v78 runs later via
+      // runMigrations and is idempotent.
+      await this.db.exec(`
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_multimodal vector(1024);
       `);
     }
 

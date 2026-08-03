@@ -4897,14 +4897,47 @@ export const MIGRATIONS: Migration[] = [
     // ORDER BY. A mismatch there silently disables the index, which is the
     // same class of invisible failure this migration exists to end.
     //
-    // Build cost is near zero today because the column is empty wherever the
-    // feature is off. Where it is populated, HNSW maintains incrementally.
+    // Engine-aware via handler, mirroring v66. A plain CREATE INDEX takes a
+    // table-wide ShareLock on content_chunks for the whole build, blocking every
+    // concurrent write (sync, embed, autopilot) — v66's comment records that
+    // cost on a 373K-row table. The index is empty wherever the feature is off,
+    // but the build still scans the full table to evaluate the partial
+    // predicate, so "small index" is not "no lock". CONCURRENTLY refuses to run
+    // inside a transaction, hence handler + per-statement runMigration rather
+    // than the sql field. A failed CONCURRENTLY leaves an invalid index behind,
+    // so pre-drop any remnant via pg_index.indisvalid. PGLite has no concurrent
+    // writers, so a plain CREATE is safe there.
     idempotent: true,
-    sql: `
-      CREATE INDEX IF NOT EXISTS idx_chunks_embedding_multimodal
-        ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
-        WHERE embedding_multimodal IS NOT NULL;
-    `,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(
+          106,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'idx_chunks_embedding_multimodal' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_multimodal';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          106,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_multimodal
+             ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+             WHERE embedding_multimodal IS NOT NULL;`
+        );
+      } else {
+        await engine.runMigration(
+          106,
+          `CREATE INDEX IF NOT EXISTS idx_chunks_embedding_multimodal
+             ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+             WHERE embedding_multimodal IS NOT NULL;`
+        );
+      }
+    },
     verify: async (engine) => {
       const rows = await engine.executeRaw<{ indexname: string }>(
         `SELECT indexname FROM pg_indexes
@@ -4925,10 +4958,38 @@ export const MIGRATIONS: Migration[] = [
     // So the unscoped lookup was a sequential scan on what is plausibly the
     // most-called operation in the system, growing linearly with page count.
     // Cheap at today's corpus size and quietly not cheap later.
+    //
+    // CONCURRENTLY, mirroring v66/v91. Unlike migration 106 this is a full
+    // non-partial btree over every row in pages, so there is no "the column is
+    // empty" mitigation — it indexes whatever that brain already holds, which
+    // is exactly the scenario v91's generation index was written to avoid.
     idempotent: true,
-    sql: `
-      CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);
-    `,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(
+          107,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'idx_pages_slug' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_pages_slug';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          107,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_slug ON pages(slug);`
+        );
+      } else {
+        await engine.runMigration(
+          107,
+          `CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);`
+        );
+      }
+    },
     verify: async (engine) => {
       const rows = await engine.executeRaw<{ indexname: string }>(
         `SELECT indexname FROM pg_indexes

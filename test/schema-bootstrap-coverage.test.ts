@@ -21,13 +21,24 @@
  *   1. Extend `applyForwardReferenceBootstrap` in pglite-engine.ts +
  *      postgres-engine.ts to add the new state.
  *   2. Add an entry to `REQUIRED_BOOTSTRAP_COVERAGE` below.
- *   3. This test will pass.
+ *   3. Add the matching `DROP INDEX` + `ALTER TABLE ... DROP COLUMN` to the
+ *      simulated-old-brain setup in BOTH tests below. This step is easy to
+ *      miss and is what actually makes the test exercise your column —
+ *      `REQUIRED_BOOTSTRAP_COVERAGE` is an assertion list, not a driver.
+ *   4. Verify by temporarily disabling your step-1 branch and confirming this
+ *      test FAILS. A coverage test that cannot be shown to fail is not
+ *      coverage.
+ *
+ * Step 3 used to be absent from these instructions, and its absence had teeth:
+ * migration 106's `embedding_multimodal` index was added with steps 1 and 2
+ * done and step 3 skipped, and this test passed with the bootstrap branch
+ * commented out entirely.
  *
  * If you add a forward reference but skip step 1, this test fails. If you
- * skip step 2, this test passes but the bootstrap silently drifts behind
- * the schema. The eng-review polish notes recommended layered coverage
+ * skip step 2 or 3, this test passes while the bootstrap silently drifts
+ * behind the schema. The eng-review polish notes recommended layered coverage
  * (per-engine integration tests in `test/bootstrap.test.ts` +
- * `test/e2e/postgres-bootstrap.test.ts`) to catch step 2 oversights.
+ * `test/e2e/postgres-bootstrap.test.ts`) to catch those oversights.
  */
 
 import { test, expect } from 'bun:test';
@@ -77,6 +88,12 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // ON content_chunks USING hnsw (embedding_image vector_cosine_ops)
   // WHERE embedding_image IS NOT NULL`.
   { kind: 'column', table: 'content_chunks', column: 'embedding_image' },
+  // v78 + migration 106 — forward-referenced by `CREATE INDEX
+  // idx_chunks_embedding_multimodal ON content_chunks USING hnsw
+  // (embedding_multimodal vector_cosine_ops) WHERE embedding_multimodal IS NOT
+  // NULL`. The column shipped in v78 without an index; migration 106 added one
+  // and put it in the schema blob, which made this a forward reference.
+  { kind: 'column', table: 'content_chunks', column: 'embedding_multimodal' },
   // v0.27.1 — added in the same migration as embedding_image. Sibling column;
   // not directly forward-referenced by an index but the bootstrap adds it
   // alongside embedding_image for the v39 contract.
@@ -203,6 +220,9 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_image;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS modality;
 
+      DROP INDEX IF EXISTS idx_chunks_embedding_multimodal;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_multimodal;
+
       DROP INDEX IF EXISTS idx_mcp_log_agent_time;
       DROP INDEX IF EXISTS idx_mcp_log_time_agent;
       ALTER TABLE mcp_request_log DROP COLUMN IF EXISTS agent_name;
@@ -308,6 +328,9 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       DROP INDEX IF EXISTS idx_chunks_embedding_image;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_image;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS modality;
+
+      DROP INDEX IF EXISTS idx_chunks_embedding_multimodal;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS embedding_multimodal;
 
       DROP INDEX IF EXISTS pages_coalesce_date_idx;
       ALTER TABLE pages DROP COLUMN IF EXISTS effective_date;
