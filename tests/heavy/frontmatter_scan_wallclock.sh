@@ -79,8 +79,13 @@ SEED_ELAPSED=$((SECONDS - SEED_START))
 echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 
 # Step 2: init brain + register the source.
+#
+# --no-embedding is required, not incidental. `init` exits 1 when no embedding
+# provider is configured, and the Heavy Tests workflow holds no provider secret,
+# so without this the run dies here every night. This test measures frontmatter
+# scan wallclock and never embeds, so deferring embedding setup costs it nothing.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
-timeout 120s bun run src/cli.ts init --pglite --yes >> "$LOG" 2>&1 || {
+timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2
   echo "Log tail:" >&2
   tail -30 "$LOG" >&2
@@ -134,6 +139,25 @@ fi
 FM_STATUS=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .status' "$LOG.doctor")
 FM_MSG=$(jq -r '.checks[] | select(.name=="frontmatter_integrity") | .message' "$LOG.doctor")
 echo "[fm_wallclock] frontmatter_integrity: status=$FM_STATUS msg=$FM_MSG" | tee -a "$LOG"
+
+# Precondition, checked BEFORE the status assertion: the scan must actually
+# have had something to scan. `frontmatter_integrity` reports status=ok with
+# "No registered sources to scan" when zero sources are registered
+# (doctor.ts:3730-3737), so a broken registration step in this script produces
+# a PASS that measured an empty walk. That is a worse outcome than a red run:
+# the budget assertion below is meaningless without a corpus behind it.
+case "$FM_MSG" in
+  *"No registered sources to scan"*)
+    echo "[fm_wallclock] FAIL: doctor scanned 0 sources — the registration step did not land." >&2
+    echo "  The wall-clock budget below is therefore vacuous; this run measured an empty walk," >&2
+    echo "  not ${REAL_PAGES:-?} real pages + ${NODE_MODULES_PAGES:-?} node_modules pages." >&2
+    echo "  Check the raw INSERT into 'sources' above and that it targets the same PGLite" >&2
+    echo "  database \$GBRAIN_HOME points the CLI at." >&2
+    echo "  Log tail:" >&2
+    tail -30 "$LOG" >&2
+    exit 1
+    ;;
+esac
 
 if [ "$FM_STATUS" != "ok" ]; then
   # Pre-v0.38.2.0 would either timeout (caught above) or report PARTIAL when
