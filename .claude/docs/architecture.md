@@ -130,11 +130,13 @@ Counter-case: `isThinClient` (`:178`) short-circuits the whole model. A thin cli
 
 ## The CI gates are the coding standard
 
-`bun run verify` chains 21 `scripts/check-*.sh` scripts plus `tsc --noEmit`. They encode conventions no linter would catch — no real names in fixtures, no double-encoded JSONB, no progress on stdout, WASM actually embedded in the compiled binary, `source_id` present in projections that feed `rowToPage`, admin bundle in sync with its source.
+`bun run verify` chains the `scripts/check-*.sh` scripts plus `tsc --noEmit`. They encode conventions no linter would catch — no real names in fixtures, no double-encoded JSONB, no progress on stdout, WASM actually embedded in the compiled binary, `source_id` present in projections that feed `rowToPage`, admin bundle in sync with its source.
 
 Read the header comment of a check before working around it; each one documents the incident that produced it. If a change makes a gate fail, the gate is usually right.
 
-Counter-case: `verify` is not the full set. `bun run check:all` runs seven more, including `check-no-legacy-getconnection.sh`, `check-trailing-newline.sh`, and `check-exports-count.sh`. A green `verify` does not mean every gate in the repo passes.
+`verify` is now the full set, and `check-checks-wired.sh` enforces that: every `scripts/check-*.sh` must be reachable from a CI entrypoint, resolved transitively through package.json's script graph. There is deliberately no allowlist — a check is in CI or it does not exist.
+
+This section previously said the opposite: that `bun run check:all` ran "seven more" and that a green `verify` did not mean every gate passed. That framing made two dead guards look like a deliberate choice. `check:all` was invoked by no workflow, no `ci-local.sh`, and no other script, so `check-no-legacy-getconnection.sh` and `check-exports-count.sh` had simply stopped running. Both are now in `verify` and `check:all` is retired. A green `verify` does now mean every gate in the repo passed.
 
 ## Unconfirmed
 

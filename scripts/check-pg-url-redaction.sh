@@ -11,7 +11,7 @@
 #     not the consumer; any leak will trip)
 #
 # Wired into `bun run verify` as check:pg-url-redaction. It is NOT in
-# check:all, which is a separate and deliberately narrower list.
+# check:all, which has since been retired entirely.
 #
 # This comment previously claimed the script was wired into both. It was wired
 # into neither, and had never run. scripts/check-checks-wired.sh now fails the

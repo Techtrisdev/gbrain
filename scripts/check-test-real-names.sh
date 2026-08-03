@@ -122,6 +122,14 @@ while IFS= read -r line; do
   [ -z "$line" ] && continue
   # Extract filename and content (everything after second :).
   file="${line%%:*}"
+  # Normalise separators before the allowlist lookup. On Windows (Git Bash),
+  # `grep -rn ... test/` emits mixed separators — `test/scripts\foo.test.ts` —
+  # because the root argument keeps its forward slash while directory traversal
+  # uses backslashes. ALLOWLIST entries are keyed with forward slashes, so
+  # without this every allowlisted line reports as a violation and the whole
+  # `bun run verify` gate is unrunnable on Windows. Linux CI is unaffected: the
+  # substitution is a no-op when no backslash is present.
+  file="${file//\\//}"
   rest="${line#*:}"
   # rest is "lineno:content" — strip lineno.
   content="${rest#*:}"
