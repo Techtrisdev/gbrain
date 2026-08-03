@@ -20,15 +20,32 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT_BIN="$(mktemp /tmp/gbrain-wasm-check.XXXXXX)"
-trap 'rm -f "$OUT_BIN"' EXIT
+trap 'rm -f "$OUT_BIN" "$OUT_BIN.exe"' EXIT
 
 # Build a minimal smoketest binary that imports the chunker. We compile this
 # instead of the full gbrain CLI so the failure mode is laser-focused on
 # chunker + WASM path resolution, not unrelated CLI wiring.
-bun build --compile --outfile "$OUT_BIN" scripts/chunker-smoketest.ts >/dev/null 2>&1
+#
+# Build output is captured rather than discarded. Sending it to /dev/null meant
+# a failed build produced an empty $OUTPUT below, which this script then
+# reported as "compiled binary returned no symbol names (fallback chunks)" —
+# a confidently wrong diagnosis pointing at the chunker when the real fault was
+# the build. A check that misreports its own failure cause is worse than one
+# that simply fails.
+if ! BUILD_LOG="$(bun build --compile --outfile "$OUT_BIN" scripts/chunker-smoketest.ts 2>&1)"; then
+  echo "[check-wasm-embedded] FAIL: bun build --compile failed." >&2
+  echo "$BUILD_LOG" >&2
+  exit 1
+fi
+
+# On Windows, bun appends .exe to --outfile. Executing the un-suffixed path
+# runs the zero-byte placeholder mktemp created, yielding empty output and the
+# misdiagnosis described above. Resolve whichever artifact the build produced.
+BIN="$OUT_BIN"
+[ -x "$OUT_BIN.exe" ] && BIN="$OUT_BIN.exe"
 
 # Run it and capture JSON output.
-OUTPUT="$("$OUT_BIN" 2>&1)"
+OUTPUT="$("$BIN" 2>&1)"
 
 # Sanity: JSON parses and has expected shape.
 # - has_symbol_names: at least one chunk carries a concrete symbol name

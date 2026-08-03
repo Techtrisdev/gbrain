@@ -72,13 +72,14 @@ OPT_IN_ONLY=(
 
 # Referenced by nothing at all. Each needs a reason.
 EXPECTED_UNWIRED=(
-  # Runs `bun build --compile` on every invocation, which is too slow for the
-  # pre-test gate, and currently fails outside Linux CI. Its line 23 sends
-  # build output to /dev/null, so a build failure surfaces as "heic-decode
-  # failed in compiled binary" with a confidently wrong likely-cause. Needs a
-  # Linux run to establish whether that is environmental or a real decoder
-  # regression before it can be wired.
-  "check-image-decoders-embedded.sh"
+  # Empty, and that is the goal state. check-image-decoders-embedded.sh was
+  # listed here on the belief that it "fails outside Linux CI". That diagnosis
+  # was wrong: bun appends .exe to --outfile on Windows, the script executed the
+  # un-suffixed path (mktemp's zero-byte placeholder), got empty output, and
+  # blamed the decoder. With the artifact resolved correctly it passes, so it is
+  # now wired into verify rather than excused. Keeping the array declared, since
+  # a genuinely unwireable check should be declared here rather than deleted
+  # silently.
 )
 
 # --- Reachability -----------------------------------------------------------

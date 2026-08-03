@@ -10,12 +10,13 @@
 #
 # Mirrors scripts/check-wasm-embedded.sh from v0.19.0 (tree-sitter pattern).
 #
-# NOT currently wired into any entrypoint. Declared in EXPECTED_UNWIRED in
-# scripts/check-checks-wired.sh with the reason: it compiles a throwaway binary
-# on every run (too slow for the pre-test gate) and currently fails outside
-# Linux CI. Note that line 23 below sends build output to /dev/null, so a build
-# failure surfaces as "heic-decode failed in compiled binary" with a wrong
-# likely-cause. Establish which it is on Linux before wiring this in.
+# Wired into `bun run verify` as check:image-decoders.
+#
+# This comment has been wrong twice. It originally claimed to be wired when it
+# was referenced nowhere at all; it was then marked unwireable on the belief
+# that it fails outside Linux CI. Both were wrong. The real fault was that bun
+# appends .exe to --outfile on Windows while this script executed the
+# un-suffixed path, and the discarded build output hid it.
 
 set -euo pipefail
 
@@ -23,11 +24,24 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 OUT_BIN="$(mktemp /tmp/gbrain-img-decoders-check.XXXXXX)"
-trap 'rm -f "$OUT_BIN"' EXIT
+trap 'rm -f "$OUT_BIN" "$OUT_BIN.exe"' EXIT
 
-bun build --compile --outfile "$OUT_BIN" scripts/image-decoders-smoketest.ts >/dev/null 2>&1
+# Build output is captured, not discarded. Sending it to /dev/null meant a
+# failed build produced empty output, which this script reported as
+# "heic-decode failed in compiled binary" with a likely-cause pointing at
+# libheif versions — a confidently wrong diagnosis of a build failure.
+if ! BUILD_LOG="$(bun build --compile --outfile "$OUT_BIN" scripts/image-decoders-smoketest.ts 2>&1)"; then
+  echo "[check-image-decoders-embedded] FAIL: bun build --compile failed." >&2
+  echo "$BUILD_LOG" >&2
+  exit 1
+fi
 
-OUTPUT="$("$OUT_BIN" 2>&1 || true)"
+# On Windows, bun appends .exe to --outfile; executing the un-suffixed path
+# runs mktemp's zero-byte placeholder and produces the misdiagnosis above.
+BIN="$OUT_BIN"
+[ -x "$OUT_BIN.exe" ] && BIN="$OUT_BIN.exe"
+
+OUTPUT="$("$BIN" 2>&1 || true)"
 
 # The smoketest writes a JSON line on stdout. Look for ok=true on each decoder.
 if ! echo "$OUTPUT" | grep -q '"heic":{"ok":true'; then
