@@ -342,6 +342,7 @@ export class PostgresEngine implements BrainEngine {
       language_exists: boolean;
       search_vector_exists: boolean;
       embedding_image_exists: boolean;
+      embedding_multimodal_exists: boolean;
       mcp_log_exists: boolean;
       agent_name_exists: boolean;
       subagent_messages_exists: boolean;
@@ -384,6 +385,8 @@ export class PostgresEngine implements BrainEngine {
                 WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'search_vector') AS search_vector_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'embedding_image') AS embedding_image_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'content_chunks' AND column_name = 'embedding_multimodal') AS embedding_multimodal_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema = current_schema() AND table_name = 'mcp_request_log') AS mcp_log_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
@@ -456,6 +459,12 @@ export class PostgresEngine implements BrainEngine {
     // references embedding_image. Use embedding_image_exists as the proxy for
     // both v39 columns; modality is added in the same migration.
     const needsChunksEmbeddingImage = probe.chunks_exists && !probe.embedding_image_exists;
+    // v78 (embedding_multimodal_column) adds embedding_multimodal; migration 106
+    // adds idx_chunks_embedding_multimodal, which SCHEMA_SQL now creates on
+    // fresh installs. A brain whose content_chunks predates v78 would hit that
+    // CREATE INDEX during blob replay — before the migration that adds the
+    // column runs — and error on a missing column.
+    const needsChunksEmbeddingMultimodal = probe.chunks_exists && !probe.embedding_multimodal_exists;
     // v0.29.1 (v40 + v41): pages_coalesce_date_idx expression index in SCHEMA_SQL
     // references effective_date. Use effective_date_exists as the proxy for the
     // five v40 + v41 pages columns (emotional_weight, effective_date,
@@ -523,7 +532,8 @@ export class PostgresEngine implements BrainEngine {
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
-        && !needsChunksEmbeddingImage && !needsPagesRecency
+        && !needsChunksEmbeddingImage && !needsChunksEmbeddingMultimodal
+        && !needsPagesRecency
         && !needsIngestLogSourceId && !needsFilesBootstrap
         && !needsOauthClientsBootstrap && !needsSourcesArchive
         && !needsPagesLastRetrievedAt
@@ -633,6 +643,18 @@ export class PostgresEngine implements BrainEngine {
       await conn.unsafe(`
         ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS modality TEXT NOT NULL DEFAULT 'text';
         ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_image vector(1024);
+      `);
+    }
+
+    if (needsChunksEmbeddingMultimodal) {
+      // v78 (embedding_multimodal_column) adds embedding_multimodal. Migration
+      // 106 adds the partial HNSW index over it, and SCHEMA_SQL now creates
+      // that index on fresh installs — so blob replay against a pre-v78 brain
+      // would crash on `CREATE INDEX idx_chunks_embedding_multimodal ...
+      // WHERE embedding_multimodal IS NOT NULL`. v78 runs later via
+      // runMigrations and is idempotent.
+      await conn.unsafe(`
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS embedding_multimodal vector(1024);
       `);
     }
 

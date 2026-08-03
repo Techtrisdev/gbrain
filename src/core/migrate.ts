@@ -3155,14 +3155,20 @@ export const MIGRATIONS: Migration[] = [
     name: 'embedding_multimodal_column',
     // D20 Phase 3: add the unified-multimodal vector column to content_chunks.
     //
-    // Column-only migration — the HNSW partial index is built AFTER the first
-    // bulk reindex completes (via `gbrain reindex --multimodal --build-index`
-    // or auto-built at completion). pgvector docs explicitly note that HNSW
-    // build is faster after data load, and per-row index maintenance during
-    // bulk reindex would slow the operation 2-3x.
+    // Column-only migration. The plan was to build the HNSW partial index
+    // AFTER the first bulk reindex, via `gbrain reindex --multimodal
+    // --build-index` — pgvector docs do note HNSW builds faster after data
+    // load, and per-row maintenance during a bulk reindex is 2-3x slower.
     //
-    // Operator class will be vector_cosine_ops to match the existing
-    // embedding_image index for ranking parity.
+    // THAT FLAG WAS NEVER IMPLEMENTED. It exists in this comment and nowhere
+    // else in the codebase, so the column shipped with no index at all and
+    // every query against it was a sequential scan computing cosine distance
+    // per row. Dormant only because search.unified_multimodal defaults false
+    // in all three mode bundles — flipping that config key was a landmine.
+    //
+    // Migration 106 creates the index. The deferral rationale above is sound
+    // in principle but was never worth the risk of an index that arrives only
+    // if someone remembers to run a command that does not exist.
     //
     // The column ships at 1024 dims to match Voyage multimodal-3 output.
     // Operators wanting a different dim (Cohere multimodal at 1408d, etc.)
@@ -4870,6 +4876,126 @@ export const MIGRATIONS: Migration[] = [
             AND table_name IN ('corpus_term_stats', 'corpus_term_stats_meta')`,
       );
       return rows.length === 2;
+    },
+  },
+  {
+    version: 106,
+    name: 'embedding_multimodal_index',
+    // Migration 78 added content_chunks.embedding_multimodal and deferred its
+    // HNSW index to `gbrain reindex --multimodal --build-index`. That flag was
+    // never implemented — it appears in migration 78's comment and nowhere else
+    // in the codebase — so the column has had no index since it shipped. Every
+    // query against it is a sequential scan computing cosine distance per row.
+    //
+    // Dormant, not live: search.unified_multimodal is false in all three mode
+    // bundles, so nothing queries the column by default. This closes the
+    // landmine before someone flips that key.
+    //
+    // Partial (WHERE NOT NULL) and vector_cosine_ops, mirroring
+    // idx_chunks_embedding_image — footprint stays proportional to populated
+    // rows, and the operator class matches the `<=>` used in the query's
+    // ORDER BY. A mismatch there silently disables the index, which is the
+    // same class of invisible failure this migration exists to end.
+    //
+    // Engine-aware via handler, mirroring v66. A plain CREATE INDEX takes a
+    // table-wide ShareLock on content_chunks for the whole build, blocking every
+    // concurrent write (sync, embed, autopilot) — v66's comment records that
+    // cost on a 373K-row table. The index is empty wherever the feature is off,
+    // but the build still scans the full table to evaluate the partial
+    // predicate, so "small index" is not "no lock". CONCURRENTLY refuses to run
+    // inside a transaction, hence handler + per-statement runMigration rather
+    // than the sql field. A failed CONCURRENTLY leaves an invalid index behind,
+    // so pre-drop any remnant via pg_index.indisvalid. PGLite has no concurrent
+    // writers, so a plain CREATE is safe there.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(
+          106,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'idx_chunks_embedding_multimodal' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_multimodal';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          106,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_multimodal
+             ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+             WHERE embedding_multimodal IS NOT NULL;`
+        );
+      } else {
+        await engine.runMigration(
+          106,
+          `CREATE INDEX IF NOT EXISTS idx_chunks_embedding_multimodal
+             ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+             WHERE embedding_multimodal IS NOT NULL;`
+        );
+      }
+    },
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes
+          WHERE tablename = 'content_chunks'
+            AND indexname = 'idx_chunks_embedding_multimodal'`,
+      );
+      return rows.length === 1;
+    },
+  },
+  {
+    version: 107,
+    name: 'pages_slug_index',
+    // getPage() omits the source filter when called without a sourceId,
+    // leaving `WHERE slug = $1` (postgres-engine.ts, getPage). The only
+    // slug-bearing index is pages_source_slug_key UNIQUE (source_id, slug),
+    // which leads with source_id — a pure-slug equality cannot use it.
+    //
+    // So the unscoped lookup was a sequential scan on what is plausibly the
+    // most-called operation in the system, growing linearly with page count.
+    // Cheap at today's corpus size and quietly not cheap later.
+    //
+    // CONCURRENTLY, mirroring v66/v91. Unlike migration 106 this is a full
+    // non-partial btree over every row in pages, so there is no "the column is
+    // empty" mitigation — it indexes whatever that brain already holds, which
+    // is exactly the scenario v91's generation index was written to avoid.
+    idempotent: true,
+    sql: '',
+    handler: async (engine) => {
+      if (engine.kind === 'postgres') {
+        await engine.runMigration(
+          107,
+          `DO $$ BEGIN
+             IF EXISTS (
+               SELECT 1 FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+               WHERE c.relname = 'idx_pages_slug' AND NOT i.indisvalid
+             ) THEN
+               EXECUTE 'DROP INDEX CONCURRENTLY IF EXISTS idx_pages_slug';
+             END IF;
+           END $$;`
+        );
+        await engine.runMigration(
+          107,
+          `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_pages_slug ON pages(slug);`
+        );
+      } else {
+        await engine.runMigration(
+          107,
+          `CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);`
+        );
+      }
+    },
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes
+          WHERE tablename = 'pages' AND indexname = 'idx_pages_slug'`,
+      );
+      return rows.length === 1;
     },
   },
 ];
