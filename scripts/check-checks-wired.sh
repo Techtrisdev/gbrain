@@ -31,7 +31,11 @@
 # (.github/workflows/*, scripts/ci-local.sh) through package.json's script
 # graph, and every check lands in exactly one bucket:
 #
-#   ci          reachable from an automated entrypoint. Runs without a human.
+#   ci          reachable from a CI entrypoint — a GitHub Actions workflow, or
+#               scripts/ci-local.sh. Note ci-local.sh is operator-run rather
+#               than triggered, so a small number of checks (currently
+#               check-trailing-newline.sh and its siblings) arrive only by that
+#               path and do not run on a push.
 #   opt_in      referenced in package.json but only via a script no automation
 #               calls (today: `check:all`, a deliberate manual sweep — see
 #               .claude/docs/architecture.md:137, CONTRIBUTING.md:85). Must be
@@ -80,12 +84,23 @@ EXPECTED_UNWIRED=(
 # --- Reachability -----------------------------------------------------------
 
 # npm scripts invoked directly by automation, plus check scripts named there.
-SEED_SCRIPTS="$(grep -rhoE '(bun|npm) run [a-z0-9:_-]+' \
-    .github/workflows scripts/ci-local.sh 2>/dev/null \
-  | awk '{print $3}' | sort -u || true)"
+# Comments and echo/printf payloads are stripped before scanning: a help string
+# telling a human what to type is not an invocation. scripts/ci-local.sh:97
+# ("run with: ... bun run ci:local") is a live example — reading it as an
+# invocation would promote a script to CI-reachable with no automated path
+# behind it, which is this guard's own disease one layer down.
+#
+# The stripping is deliberately blunt and errs toward dropping a real
+# invocation rather than inventing one. A missed invocation makes a check look
+# LESS reachable, which fails loudly; a false one would pass silently.
+ENTRYPOINT_TEXT="$(cat .github/workflows/*.yml .github/workflows/*.yaml scripts/ci-local.sh 2>/dev/null \
+  | sed -e 's/#.*//' -e 's/\(echo\|printf\)[[:space:]].*//' || true)"
 
-DIRECT_SH="$(grep -rhoE 'check-[a-z0-9-]+\.sh' \
-    .github/workflows scripts/ci-local.sh 2>/dev/null | sort -u || true)"
+SEED_SCRIPTS="$(printf '%s\n' "$ENTRYPOINT_TEXT" \
+  | grep -oE '(bun|npm) run [a-z0-9:_-]+' | awk '{print $3}' | sort -u || true)"
+
+DIRECT_SH="$(printf '%s\n' "$ENTRYPOINT_TEXT" \
+  | grep -oE 'check-[a-z0-9-]+\.sh' | sort -u || true)"
 
 # Walk package.json's script graph from the seeds and collect every check-*.sh
 # reachable through it. bun is already required to run anything here.
