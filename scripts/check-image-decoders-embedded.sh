@@ -10,7 +10,12 @@
 #
 # Mirrors scripts/check-wasm-embedded.sh from v0.19.0 (tree-sitter pattern).
 #
-# Wired into `bun run verify` (which `/ship` and `bun run test:full` call).
+# NOT currently wired into any entrypoint. Declared in EXPECTED_UNWIRED in
+# scripts/check-checks-wired.sh with the reason: it compiles a throwaway binary
+# on every run (too slow for the pre-test gate) and currently fails outside
+# Linux CI. Note that line 23 below sends build output to /dev/null, so a build
+# failure surfaces as "heic-decode failed in compiled binary" with a wrong
+# likely-cause. Establish which it is on Linux before wiring this in.
 
 set -euo pipefail
 
