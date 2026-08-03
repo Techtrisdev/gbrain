@@ -148,6 +148,10 @@ CREATE INDEX IF NOT EXISTS idx_pages_type ON pages(type);
 CREATE INDEX IF NOT EXISTS idx_pages_frontmatter ON pages USING GIN(frontmatter);
 CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
+-- getPage() without a sourceId leaves a bare slug equality unindexed:
+-- pages_source_slug_key leads with source_id, so a slug-only predicate cannot
+-- use it.
+CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);
 -- v0.26.5: partial index supports the autopilot purge sweep (mirrors src/schema.sql).
 CREATE INDEX IF NOT EXISTS pages_deleted_at_purge_idx
   ON pages (deleted_at) WHERE deleted_at IS NOT NULL;
@@ -198,6 +202,13 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding ON content_chunks USING hnsw (em
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
   ON content_chunks USING hnsw (embedding_image vector_cosine_ops)
   WHERE embedding_image IS NOT NULL;
+-- Partial HNSW for the unified-multimodal column, mirroring the image index.
+-- Migration v78 added the column and deferred this index to a
+-- "reindex --multimodal --build-index" flag that was never implemented, so
+-- the column had no index at all.
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_multimodal
+  ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+  WHERE embedding_multimodal IS NOT NULL;
 -- v0.19.0: partial indexes for code chunk lookups.
 CREATE INDEX IF NOT EXISTS idx_chunks_symbol_name ON content_chunks(symbol_name) WHERE symbol_name IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_chunks_language ON content_chunks(language) WHERE language IS NOT NULL;

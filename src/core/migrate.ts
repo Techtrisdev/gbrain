@@ -3155,14 +3155,20 @@ export const MIGRATIONS: Migration[] = [
     name: 'embedding_multimodal_column',
     // D20 Phase 3: add the unified-multimodal vector column to content_chunks.
     //
-    // Column-only migration — the HNSW partial index is built AFTER the first
-    // bulk reindex completes (via `gbrain reindex --multimodal --build-index`
-    // or auto-built at completion). pgvector docs explicitly note that HNSW
-    // build is faster after data load, and per-row index maintenance during
-    // bulk reindex would slow the operation 2-3x.
+    // Column-only migration. The plan was to build the HNSW partial index
+    // AFTER the first bulk reindex, via `gbrain reindex --multimodal
+    // --build-index` — pgvector docs do note HNSW builds faster after data
+    // load, and per-row maintenance during a bulk reindex is 2-3x slower.
     //
-    // Operator class will be vector_cosine_ops to match the existing
-    // embedding_image index for ranking parity.
+    // THAT FLAG WAS NEVER IMPLEMENTED. It exists in this comment and nowhere
+    // else in the codebase, so the column shipped with no index at all and
+    // every query against it was a sequential scan computing cosine distance
+    // per row. Dormant only because search.unified_multimodal defaults false
+    // in all three mode bundles — flipping that config key was a landmine.
+    //
+    // Migration 106 creates the index. The deferral rationale above is sound
+    // in principle but was never worth the risk of an index that arrives only
+    // if someone remembers to run a command that does not exist.
     //
     // The column ships at 1024 dims to match Voyage multimodal-3 output.
     // Operators wanting a different dim (Cohere multimodal at 1408d, etc.)
@@ -4870,6 +4876,65 @@ export const MIGRATIONS: Migration[] = [
             AND table_name IN ('corpus_term_stats', 'corpus_term_stats_meta')`,
       );
       return rows.length === 2;
+    },
+  },
+  {
+    version: 106,
+    name: 'embedding_multimodal_index',
+    // Migration 78 added content_chunks.embedding_multimodal and deferred its
+    // HNSW index to `gbrain reindex --multimodal --build-index`. That flag was
+    // never implemented — it appears in migration 78's comment and nowhere else
+    // in the codebase — so the column has had no index since it shipped. Every
+    // query against it is a sequential scan computing cosine distance per row.
+    //
+    // Dormant, not live: search.unified_multimodal is false in all three mode
+    // bundles, so nothing queries the column by default. This closes the
+    // landmine before someone flips that key.
+    //
+    // Partial (WHERE NOT NULL) and vector_cosine_ops, mirroring
+    // idx_chunks_embedding_image — footprint stays proportional to populated
+    // rows, and the operator class matches the `<=>` used in the query's
+    // ORDER BY. A mismatch there silently disables the index, which is the
+    // same class of invisible failure this migration exists to end.
+    //
+    // Build cost is near zero today because the column is empty wherever the
+    // feature is off. Where it is populated, HNSW maintains incrementally.
+    idempotent: true,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_chunks_embedding_multimodal
+        ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+        WHERE embedding_multimodal IS NOT NULL;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes
+          WHERE tablename = 'content_chunks'
+            AND indexname = 'idx_chunks_embedding_multimodal'`,
+      );
+      return rows.length === 1;
+    },
+  },
+  {
+    version: 107,
+    name: 'pages_slug_index',
+    // getPage() omits the source filter when called without a sourceId,
+    // leaving `WHERE slug = $1` (postgres-engine.ts, getPage). The only
+    // slug-bearing index is pages_source_slug_key UNIQUE (source_id, slug),
+    // which leads with source_id — a pure-slug equality cannot use it.
+    //
+    // So the unscoped lookup was a sequential scan on what is plausibly the
+    // most-called operation in the system, growing linearly with page count.
+    // Cheap at today's corpus size and quietly not cheap later.
+    idempotent: true,
+    sql: `
+      CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes
+          WHERE tablename = 'pages' AND indexname = 'idx_pages_slug'`,
+      );
+      return rows.length === 1;
     },
   },
 ];

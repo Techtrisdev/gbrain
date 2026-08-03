@@ -192,6 +192,12 @@ CREATE INDEX IF NOT EXISTS idx_pages_trgm ON pages USING GIN(title gin_trgm_ops)
 CREATE INDEX IF NOT EXISTS idx_pages_updated_at_desc ON pages (updated_at DESC);
 -- v0.18.0: source-scoped scans (per /plan-eng-review Section 4).
 CREATE INDEX IF NOT EXISTS idx_pages_source_id ON pages(source_id);
+-- getPage() omits the source filter when called without a sourceId, leaving
+-- \`WHERE slug = \$1\` with nothing to scan. pages_source_slug_key leads with
+-- source_id, so a pure-slug equality cannot use it — the lookup was a
+-- sequential scan on what is likely the most-called operation, growing
+-- linearly with page count.
+CREATE INDEX IF NOT EXISTS idx_pages_slug ON pages(slug);
 -- v0.26.5: partial index supports the autopilot purge sweep
 -- (\`WHERE deleted_at IS NOT NULL AND deleted_at < now() - INTERVAL '72 hours'\`).
 -- Search filters (\`WHERE deleted_at IS NULL\`) do not benefit from this index
@@ -262,6 +268,16 @@ CREATE INDEX IF NOT EXISTS idx_chunks_language ON content_chunks(language) WHERE
 CREATE INDEX IF NOT EXISTS idx_chunks_embedding_image
   ON content_chunks USING hnsw (embedding_image vector_cosine_ops)
   WHERE embedding_image IS NOT NULL;
+-- Partial HNSW for the unified-multimodal column, mirroring the image index
+-- above. The column shipped in migration v78 WITHOUT this index: that migration
+-- deferred it to \`gbrain reindex --multimodal --build-index\`, a flag that was
+-- never implemented. Any query against embedding_multimodal was therefore a
+-- sequential scan computing cosine distance per row. Dormant in practice —
+-- search.unified_multimodal defaults false in all three mode bundles — but
+-- flipping that config key was a landmine.
+CREATE INDEX IF NOT EXISTS idx_chunks_embedding_multimodal
+  ON content_chunks USING hnsw (embedding_multimodal vector_cosine_ops)
+  WHERE embedding_multimodal IS NOT NULL;
 -- v0.20.0 Cathedral II: GIN index on the new chunk-grain FTS vector.
 CREATE INDEX IF NOT EXISTS idx_chunks_search_vector ON content_chunks USING GIN(search_vector);
 CREATE INDEX IF NOT EXISTS idx_chunks_symbol_qualified
