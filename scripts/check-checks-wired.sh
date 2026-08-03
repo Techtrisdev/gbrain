@@ -48,16 +48,24 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Comments and echo/printf payloads are stripped before scanning: a help string
-# telling a human what to type is not an invocation. scripts/ci-local.sh has a
-# live example ("run with: ... bun run ci:local"), and reading it as an
-# invocation would promote a script to CI-reachable with no automated path
-# behind it — this guard's own disease, one layer down.
+# ONLY .github/workflows/* counts as an entrypoint.
 #
-# The stripping is deliberately blunt and errs toward dropping a real
-# invocation rather than inventing one. A missed invocation makes a check look
-# LESS reachable, which fails loudly; a false one would pass silently.
-ENTRYPOINT_TEXT="$(cat .github/workflows/*.yml .github/workflows/*.yaml scripts/ci-local.sh 2>/dev/null \
+# scripts/ci-local.sh was counted here previously and that was wrong. Nothing
+# triggers it — no workflow references it, there is no git hook, and the
+# docker-compose file it drives is referenced by no workflow. It is a
+# 100%-manual operator script. Counting it meant check-trailing-newline.sh,
+# which appears only inside ci-local.sh, was reported "reachable" while running
+# on no push and no PR. This guard gave a false green for a check that never
+# ran — its own disease, one level down, in the commit that claimed to cure it.
+#
+# If ci-local.sh ever gains a real trigger, add it back here deliberately.
+#
+# Comments and echo/printf payloads are stripped first: a help string telling a
+# human what to type is not an invocation. The stripping is deliberately blunt
+# and errs toward dropping a real invocation rather than inventing one — a
+# missed invocation makes a check look LESS reachable, which fails loudly,
+# whereas a false one passes silently.
+ENTRYPOINT_TEXT="$(cat .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null \
   | sed -e 's/#.*//' -e 's/\(echo\|printf\)[[:space:]].*//' || true)"
 
 SEED_SCRIPTS="$(printf '%s\n' "$ENTRYPOINT_TEXT" \
@@ -67,9 +75,11 @@ DIRECT_SH="$(printf '%s\n' "$ENTRYPOINT_TEXT" \
   | grep -oE 'check-[a-z0-9-]+\.sh' | sort -u || true)"
 
 # Walk package.json's script graph from the seeds and collect every check-*.sh
-# reachable through it. bun is already required to run anything here; if it is
-# missing this yields an empty set, every check reports unreachable, and the
-# build fails loudly rather than passing on no evidence.
+# reachable through it. bun is already required to reach this script at all
+# (verify invokes it via `bun run`), so its absence is not a real path; if it
+# were missing, `set -e` would abort at this command substitution rather than
+# reaching the per-check reporting below. Either way the failure is loud, never
+# a silent pass.
 GRAPH_SH="$(SEEDS="$SEED_SCRIPTS" bun -e '
   const fs = require("fs");
   const scripts = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts || {};
