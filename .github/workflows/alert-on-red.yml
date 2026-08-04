@@ -104,25 +104,36 @@ jobs:
             exit 0
           fi
 
+          # Body built with printf, NOT a heredoc. A heredoc body must sit at
+          # column 0 to avoid leading whitespace in the issue, but every line
+          # inside a `run: |` block scalar must be indented at least to the
+          # block's level -- YAML ends the scalar at the first less-indented
+          # line. The original heredoc therefore terminated the block early and
+          # GitHub rejected the whole file with "workflow file issue", so this
+          # alerting never ran once: 9 consecutive failed invocations in this
+          # repo and 8 in gbrain, zero successes, while the workflow still
+          # showed as `active` in `gh workflow list`. An alerting path that
+          # cannot start is the exact failure it was built to catch.
+          BODY=$(printf '%s\n' \
+            "\`${WF_NAME}\` failed on its scheduled run." \
+            "" \
+            "**Run:** ${WF_URL}" \
+            "**Commit:** \`${WF_SHA}\`" \
+            "" \
+            "This issue was opened automatically because a scheduled workflow" \
+            "failed and scheduled failures reach nobody otherwise. It will" \
+            "close itself when \`${WF_NAME}\` next succeeds, so an open issue" \
+            "here always means *currently red*." \
+            "" \
+            "Repeat failures add a comment rather than a new issue." \
+            "" \
+            "If this workflow is not worth reading, that is a real answer --" \
+            "delete the workflow or remove it from the trigger list in" \
+            "\`.github/workflows/alert-on-red.yml\`. Leaving it red and unread" \
+            "is the state this alerting exists to end.")
+
           gh issue create -R "$REPO" \
             --title "$TITLE" \
             --assignee jlfetter1 \
-            --body "$(cat <<EOF
-\`${WF_NAME}\` failed on its scheduled run.
-
-**Run:** ${WF_URL}
-**Commit:** \`${WF_SHA}\`
-
-Opened automatically because a scheduled workflow failed and scheduled failures
-reach nobody otherwise. It will close itself when \`${WF_NAME}\` next succeeds,
-so an open issue here always means *currently red*.
-
-Repeat failures add a comment rather than a new issue.
-
-If this workflow is not worth reading, that is a real answer — delete the
-workflow or remove it from the trigger list in
-\`.github/workflows/alert-on-red.yml\`. Leaving it red and unread is the state
-this alerting exists to end.
-EOF
-)"
+            --body "$BODY"
           echo "opened alert issue for ${WF_NAME}"
