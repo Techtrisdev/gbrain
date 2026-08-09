@@ -1341,6 +1341,24 @@ export interface HybridSearchMeta {
    */
   reranker_failed?: boolean;
   /**
+   * v0.46 — post-fusion / rescore fail-open markers. Each listed stage errored and
+   * was skipped, so results are served with that stage's contribution MISSING:
+   * `backlink`, `salience`, `recency`, `graph_signals` (a boost never applied) or
+   * `cosine_rescore` (RRF order served un-rescored).
+   *
+   * Every one of these was previously an empty `catch {}` whose comment said
+   * "non-fatal". Fail-open is the correct behaviour — search must still answer —
+   * but fail-open WITHOUT a marker makes a degraded ranking byte-identical to a
+   * healthy one, so nobody ever learns the stage is broken. This is the same
+   * degraded-mode surface `reranker_failed` covers, extended to the stages the
+   * v0.42 wave did not reach.
+   *
+   * Only present when non-empty, so happy-path meta is unchanged. Deliberately one
+   * array rather than five booleans + five telemetry columns: the counting version
+   * needs a production schema migration, which is a separately gated decision.
+   */
+  degraded_stages?: string[];
+  /**
    * v0.45 — keyword-leg graceful relaxation fired. The strict `websearch_to_tsquery`
    * AND returned zero rows (a query word was absent corpus-wide), so the keyword leg
    * was retried with the query's distinctive tokens. Only present when true; a signal

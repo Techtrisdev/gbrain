@@ -51,6 +51,12 @@ export interface RetrievalResponseMeta {
    *  ordering should treat this response as degraded. Present (true) only when it
    *  fired; independent of `abstained` (a fail-open never abstains). */
   reranker_failed?: boolean;
+  /**
+   * v0.46 — post-fusion / rescore stages that errored and were skipped, so this
+   * response is served WITHOUT their contribution. Same degraded-mode contract as
+   * `reranker_failed`; only present when non-empty.
+   */
+  degraded_stages?: string[];
 }
 
 const responseMeta = new WeakMap<object, RetrievalResponseMeta>();

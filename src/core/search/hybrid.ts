@@ -318,6 +318,13 @@ export interface PostFusionOpts {
    * wave via search-stats.
    */
   onScoreDistribution?: (dist: import('./graph-signals.ts').ScoreDistribution) => void;
+  /**
+   * v0.46 — fail-open sink. Called with the stage name whenever a post-fusion
+   * stage throws and is skipped. The stages stay non-fatal (unchanged behaviour);
+   * this only makes the skip observable, so `_meta.degraded_stages` can report a
+   * ranking that is missing a boost instead of presenting it as healthy.
+   */
+  onStageFailure?: (stage: string, err: unknown) => void;
 }
 
 export async function runPostFusionStages(
@@ -350,8 +357,11 @@ export async function runPostFusionStages(
       const slugs = Array.from(new Set(results.map(r => r.slug)));
       const counts = await engine.getBacklinkCounts(slugs);
       applyBacklinkBoost(results, counts, floorThreshold);
-    } catch {
-      // Non-fatal; preserves the existing pre-v0.29.1 contract.
+    } catch (err) {
+      // Still non-fatal; preserves the existing pre-v0.29.1 contract. The only
+      // change is that the skip is now reported — results served without the
+      // backlink boost were previously indistinguishable from boosted ones.
+      opts.onStageFailure?.('backlink', err);
     }
   }
 
@@ -367,8 +377,9 @@ export async function runPostFusionStages(
     try {
       const scores = await engine.getSalienceScores(refs);
       applySalienceBoost(results, scores, opts.salience, floorThreshold);
-    } catch {
-      // Non-fatal.
+    } catch (err) {
+      // Still non-fatal; reported so the missing boost is visible.
+      opts.onStageFailure?.('salience', err);
     }
   }
 
@@ -386,8 +397,9 @@ export async function runPostFusionStages(
         Date.now(),
         floorThreshold,
       );
-    } catch {
-      // Non-fatal.
+    } catch (err) {
+      // Still non-fatal; reported so the missing decay is visible.
+      opts.onStageFailure?.('recency', err);
     }
   }
 
@@ -405,8 +417,10 @@ export async function runPostFusionStages(
         onMeta: opts.onGraphMeta,
         onScoreDistribution: opts.onScoreDistribution,
       });
-    } catch {
-      // Non-fatal; preserves the per-stage contract.
+    } catch (err) {
+      // Still non-fatal; preserves the per-stage contract. Reported so a
+      // silently-absent graph-signals stage is not read as "signals didn't fire".
+      opts.onStageFailure?.('graph_signals', err);
     }
   }
 }
@@ -710,8 +724,32 @@ export async function hybridSearch(
     ?? (suggestions.suggestedRecency !== 'off'
         ? suggestions.suggestedRecency
         : (intentRecency ?? suggestions.suggestedRecency));
+  // v0.46 — fail-open degradation collector. Every post-fusion stage and the
+  // cosine rescore are non-fatal by design; before this they were also SILENT,
+  // so a ranking missing a boost looked exactly like a healthy one. Deduped
+  // because the three early-return paths each run the stages once, and a stage
+  // failing on more than one of them should still be reported a single time.
+  const degradedStages: string[] = [];
+  const noteDegraded = (stage: string, err: unknown): void => {
+    if (!degradedStages.includes(stage)) degradedStages.push(stage);
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(`[search-degraded] ${stage} stage failed; serving without it. reason=${reason}`);
+  };
+
   const postFusionOpts: PostFusionOpts = {
     applyBacklinks: true,
+    onStageFailure: noteDegraded,
+    // v0.46 — graph-signals is the one stage that already handled its own failure
+    // (internal catch -> failureWriter + meta.errored), so it never throws and the
+    // try/catch around it never fires. But `onGraphMeta` was declared and consumed
+    // and never ASSIGNED here, so `meta.errored` reached the failure log and nothing
+    // else: the search response was identical whether the stage worked or died.
+    // Bridging it here puts graph-signals on the same reported surface as the rest.
+    onGraphMeta: (meta) => {
+      if (meta.errored) {
+        noteDegraded('graph_signals', new Error('graph-signals stage errored (see graph-signal failure log)'));
+      }
+    },
     salience: salienceMode,
     recency: recencyMode,
     // v0.35.6.0 — floor-ratio gate threaded from resolved mode. Default
@@ -750,6 +788,7 @@ export async function hybridSearch(
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
       ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
+      ...(degradedStages.length ? { degraded_stages: [...degradedStages] } : {}),
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: noEmbedBudgetMeta }
         : {}),
@@ -974,6 +1013,7 @@ export async function hybridSearch(
       mode: resolvedMode.resolved_mode,
       embedding_column: resolvedCol.name,
       ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
+      ...(degradedStages.length ? { degraded_stages: [...degradedStages] } : {}),
       ...(resolvedMode.tokenBudget && resolvedMode.tokenBudget > 0
         ? { token_budget: kwBudgetMeta }
         : {}),
@@ -1021,7 +1061,9 @@ export async function hybridSearch(
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
   // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
+    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name, err =>
+      noteDegraded('cosine_rescore', err),
+    );
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -1273,6 +1315,9 @@ export async function hybridSearch(
     // results are served in un-reranked RRF order (wrong ordering, no rerank
     // signal). Only emitted when true, so happy-path meta is unchanged.
     ...(rerankerFailed ? { reranker_failed: true } : {}),
+    // v0.46 — post-fusion / rescore fail-open markers. Same degraded-mode surface
+    // as reranker_failed, for the stages the v0.42 wave did not reach.
+    ...(degradedStages.length ? { degraded_stages: [...degradedStages] } : {}),
     ...(keywordRelaxed ? { keyword_relaxed: true } : {}),
     ...(abstained
       ? {
@@ -1498,6 +1543,14 @@ export async function hybridSearchCached(
           ? { vector_requested_k: hit.meta.vector_requested_k }
           : {}),
         ...(hit.meta?.reranker_failed ? { reranker_failed: true } : {}),
+        // v0.46 — carry the fail-open markers through the cache-HIT path. A hit
+        // replays the WRITE-time ranking, so a response built while a stage was
+        // down IS still missing that stage's boost. Dropping the marker here would
+        // relocate the lie rather than remove it: degraded results would be served
+        // as healthy for the life of the cache entry.
+        ...(hit.meta?.degraded_stages?.length
+          ? { degraded_stages: [...hit.meta.degraded_stages] }
+          : {}),
         ...(hit.meta?.keyword_relaxed ? { keyword_relaxed: true } : {}),
         // v0.43 — carry the answerability verdict through the cache-HIT path so a
         // replayed shadow row keeps its harvest signal (query_cache.meta is the
@@ -1752,11 +1805,16 @@ export function rrfFusion(lists: SearchResult[][], k: number, applyBoost = true)
  * Cosine re-scoring: blend RRF score with query-chunk cosine similarity.
  * Runs before dedup so semantically better chunks survive.
  */
-async function cosineReScore(
+// Exported for test: this is the sharpest fail-open site in the file (a DB error
+// serves plain RRF order under the caller's assumption it was rescored), so it
+// gets direct coverage rather than being reached only through a full search.
+// Matches `cosineSimilarity` below, which is likewise exported.
+export async function cosineReScore(
   engine: BrainEngine,
   results: SearchResult[],
   queryEmbedding: Float32Array,
   column: string = 'embedding',
+  onFailure?: (err: unknown) => void,
 ): Promise<SearchResult[]> {
   const chunkIds = results
     .map(r => r.chunk_id)
@@ -1771,8 +1829,12 @@ async function cosineReScore(
     // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
     // rescore against OpenAI vectors → NaN or wrong rankings.
     embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, column);
-  } catch {
-    // DB error is non-fatal, return results without re-scoring
+  } catch (err) {
+    // DB error stays non-fatal — return results without re-scoring, as before.
+    // But an un-rescored return is served in plain RRF order, which is a DIFFERENT
+    // ranking from the one the caller thinks it asked for. Previously that was
+    // invisible; now it is reported so `_meta.degraded_stages` can say so.
+    onFailure?.(err);
     return results;
   }
 

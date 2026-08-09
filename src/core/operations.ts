@@ -1840,6 +1840,13 @@ const query: Operation = {
     if (retrievalMeta?.vector_result_count !== undefined) responseMeta.vector_result_count = retrievalMeta.vector_result_count;
     if (retrievalMeta?.vector_requested_k !== undefined) responseMeta.vector_requested_k = retrievalMeta.vector_requested_k;
     if (retrievalMeta?.reranker_failed) responseMeta.reranker_failed = true;
+    // v0.46 — same rationale as reranker_failed, for the post-fusion stages and the
+    // cosine rescore. A retrieval consumer needs to know the ranking it just got was
+    // served without a boost stage; without this the response is identical to a
+    // healthy one and the caller concludes the Brain simply ranked it that way.
+    if (retrievalMeta?.degraded_stages?.length) {
+      responseMeta.degraded_stages = [...retrievalMeta.degraded_stages];
+    }
     attachRetrievalResponseMeta(results, responseMeta);
 
     // v0.37.0 (D11): op-layer last_retrieved_at write-back. Same shape as the
