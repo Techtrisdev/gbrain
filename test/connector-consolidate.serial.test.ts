@@ -1509,8 +1509,28 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     expect(r!.length).toBe(2);
     expect(r!.map((v) => v.classification)).toEqual(['UPDATE', 'ADD']);
     expect(r![0].target_path).toBe('clients/acme');
-    // ADD carries no resolved UPDATE target (target_path null) — it stays reviewer-driven.
-    expect(r![1].target_path).toBeNull();
+    // ADD carries the classifier's PROPOSED slug so a safe-path ADD can auto-approve.
+    expect(r![1].target_path).toBe('projects/new-thing');
+  });
+
+  test('ADD with a proposed safe slug is auto-approvable (KTD-FIX: predicate was unsatisfiable)', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    // The proposed slug must survive interpretation — trustTierDecision auto-approves
+    // ONLY a non-empty safe target_path, so a null here means ADD can never promote.
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD with no proposed slug stays reviewer-driven (target_path null)', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    expect(r.target_path).toBeNull();
   });
 
   test('partial fan-out: one partition contradicts (NEEDS_REVIEW), the sibling still UPDATEs', async () => {

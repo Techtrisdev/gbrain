@@ -515,9 +515,9 @@ async function persistOneVerdict(
 
   let final = verdict;
   // Resolve the classifier's target SLUG → the receiver repo path (`<slug>.md`),
-  // only for a clean single-target UPDATE.
+  // for a clean single-target UPDATE or a proposed new-page ADD.
   const resolvedPath =
-    verdict.classification === 'UPDATE' && verdict.target_path
+    (verdict.classification === 'UPDATE' || verdict.classification === 'ADD') && verdict.target_path
       ? slugToRepoPath(verdict.target_path)
       : null;
 
@@ -761,6 +761,10 @@ export function buildConsolidatedItem(
         ...base,
         classification: 'ADD',
         confidence: verdict.confidence,
+        // Carry the classifier's proposed NEW-page target so trustTierDecision can
+        // auto-approve a safe-path ADD (KTD-FIX: the ADD predicate was unsatisfiable
+        // because ADD rows never carried target_path — 124 candidates, 0 promoted).
+        target_path: resolvedPath,
         ...(heldBack ? { status: 'rejected' as const, status_reason: 'low_confidence' } : {}),
         expires_at: consolidationExpiry(heldBack),
       };

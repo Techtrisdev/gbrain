@@ -842,7 +842,12 @@ function interpretOneClassification(
     case 'NOOP':
       return result('NOOP', conf, meta);
     case 'ADD':
-      return result('ADD', conf, meta);
+      // Carry the classifier's PROPOSED slug for a NEW page (the prompt asks the
+      // model to set `target` to a proposed slug, or omit it). trustTierDecision
+      // gates auto-approve on a non-empty SAFE target_path, so an ADD verdict that
+      // names no target stays reviewer-driven (null) — this is what makes the
+      // ADD trust-tier predicate satisfiable at all.
+      return result('ADD', conf, { ...meta, target_path: parsed.targets[0] ?? null });
     case 'NEEDS_REVIEW':
       return result('NEEDS_REVIEW', conf, { ...meta, target_path: matched[0] ?? null });
     case 'UPDATE': {
