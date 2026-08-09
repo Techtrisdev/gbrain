@@ -516,10 +516,19 @@ async function persistOneVerdict(
 
   let final = verdict;
   // Resolve the classifier's target SLUG → the receiver repo path (`<slug>.md`),
-  // for a clean single-target UPDATE or a proposed new-page ADD.
+  // for a clean single-target UPDATE or a proposed new-page ADD. An ADD's target
+  // is canonicalized FIRST so `Docs/Glossary.MD` resolves to `docs/glossary.md`
+  // (not `Docs/Glossary.MD.md` — Codex R4 advisory). UPDATE targets are
+  // classifier-matched existing slugs and are NOT canonicalized here (they must
+  // match the store byte-for-byte).
+  const addCanonicalTarget =
+    verdict.classification === 'ADD' && verdict.target_path
+      ? canonicalConsolidationSlug(verdict.target_path)
+      : verdict.target_path;
   const resolvedPath =
-    (verdict.classification === 'UPDATE' || verdict.classification === 'ADD') && verdict.target_path
-      ? slugToRepoPath(verdict.target_path)
+    (verdict.classification === 'UPDATE' || verdict.classification === 'ADD') &&
+    (addCanonicalTarget ?? '') !== ''
+      ? slugToRepoPath(addCanonicalTarget ?? '')
       : null;
 
   // Single-writer-per-page (KTD9 inverse): if another pending-or-accepted
@@ -650,8 +659,9 @@ async function persistOneVerdict(
  *  - Single-verdict capture (`!fanOut`) → today's BARE captureId (byte-identical to
  *    v1; also the `= '<captureId>'` idempotency anchor in {@link captureConsolidated}).
  *  - Fan-out → `<captureId>::<discriminator>`: the page slug for a placed verdict
- *    (UPDATE, or a NEEDS_REVIEW the model placed), else the partition INDEX for a
- *    placeless verdict (ADD / NOOP / unplaced). The `::` separator never occurs in a
+ *    (UPDATE, a target-carrying ADD, or a NEEDS_REVIEW the model placed), else the
+ *    partition INDEX for a placeless verdict (ADD with no proposed target / NOOP /
+ *    unplaced). The `::` separator never occurs in a
  *    real provider captureId (record ids are opaque tokens) or a Brain slug
  *    (path-like `[a-z0-9/_.-]`, no colon) — so the key is unambiguous.
  */

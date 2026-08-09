@@ -524,8 +524,10 @@ export async function resolveConsolidationSearchSource(
   engine: BrainEngine,
   override?: string,
 ): Promise<string> {
+  const explicit = override?.trim();
+  if (explicit) return explicit;
   const configured = (await engine.getConfig(CONSOLIDATION_SEARCH_SOURCE_KEY))?.trim();
-  return override?.trim() || configured || DEFAULT_DURABLE_SOURCE;
+  return configured || DEFAULT_DURABLE_SOURCE;
 }
 
 /**
