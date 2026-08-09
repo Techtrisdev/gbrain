@@ -1513,14 +1513,14 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     expect(r![1].target_path).toBe('projects/new-thing');
   });
 
-  test('ADD with a proposed safe slug is auto-approvable (KTD-FIX: predicate was unsatisfiable)', async () => {
+  test('ADD carries the proposed slug so a reviewer sees where the new page goes', async () => {
     configureEmbedding();
     stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
     const { engine } = makeEngine({ hits: [], pages: {} });
     const r = only(await callClassify(engine));
     expect(r.classification).toBe('ADD');
-    // The proposed slug must survive interpretation — trustTierDecision auto-approves
-    // ONLY a non-empty safe target_path, so a null here means ADD can never promote.
+    // The proposed slug survives interpretation — a human reviewer sees where the
+    // ADD belongs (and a future receiver new_page mode can auto-promote it).
     expect(r.target_path).toBe('docs/glossary');
   });
 
@@ -1531,6 +1531,28 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     const r = only(await callClassify(engine));
     expect(r.classification).toBe('ADD');
     expect(r.target_path).toBeNull();
+  });
+
+  test('ADD naming an EXISTING candidate page is misclassified → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The classifier calls it ADD, but the target matches a page already in the
+    // candidate set — novel means not-yet-existing, so this must NOT auto-add.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'clients/acme', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme is a customer.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+    expect(r.target_path).toBe('clients/acme');
+  });
+
+  test('ADD naming MULTIPLE targets is ambiguous → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', targets: ['docs/a', 'docs/b'], confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
   });
 
   test('partial fan-out: one partition contradicts (NEEDS_REVIEW), the sibling still UPDATEs', async () => {

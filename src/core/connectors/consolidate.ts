@@ -843,11 +843,22 @@ function interpretOneClassification(
       return result('NOOP', conf, meta);
     case 'ADD':
       // Carry the classifier's PROPOSED slug for a NEW page (the prompt asks the
-      // model to set `target` to a proposed slug, or omit it). trustTierDecision
-      // gates auto-approve on a non-empty SAFE target_path, so an ADD verdict that
-      // names no target stays reviewer-driven (null) — this is what makes the
-      // ADD trust-tier predicate satisfiable at all.
-      return result('ADD', conf, { ...meta, target_path: parsed.targets[0] ?? null });
+      // model to set `target` to a proposed slug, or omit it). Hard rules:
+      //  - an ADD that names MORE than one distinct target is ambiguous → review;
+      //  - an ADD whose proposed target MATCHES an existing candidate page was
+      //    misclassified (novel implies not-yet-existing) → review, never auto-add;
+      //  - a blank/omitted target stays reviewer-driven (null).
+      // The single-target rule mirrors the UPDATE fan-out contract (a partition
+      // must concern exactly ONE page); the matched-page rule keeps a classifier
+      // ADD of an EXISTING page from silently auto-approving a duplicate.
+      if (parsed.targets.length > 1) {
+        return result('NEEDS_REVIEW', conf, { ...meta, target_path: parsed.targets[0] ?? null });
+      }
+      const proposed = parsed.targets[0] ?? null;
+      if (proposed != null && bySlug.has(proposed)) {
+        return result('NEEDS_REVIEW', conf, { ...meta, target_path: proposed });
+      }
+      return result('ADD', conf, { ...meta, target_path: proposed });
     case 'NEEDS_REVIEW':
       return result('NEEDS_REVIEW', conf, { ...meta, target_path: matched[0] ?? null });
     case 'UPDATE': {
