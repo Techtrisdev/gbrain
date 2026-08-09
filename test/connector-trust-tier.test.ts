@@ -88,8 +88,14 @@ afterEach(() => {
 });
 
 describe('trustTierDecision', () => {
-  test('high-confidence ADD to docs with rationale and no redactions auto-approves', () => {
-    expect(trustTierDecision(candidateRow())).toBe('auto_approve');
+  test('ADD candidates stay human (receiver has no new-page mode)', () => {
+    // The promotion receiver (techtris-brain promote_candidate.py) only supports
+    // existing_page/inbox/update_page; existing_page requires the file to ALREADY
+    // exist, so an auto-approved ADD (a NEW page) would always fail promotion.
+    // Auto-approve for ADDs is gated until a receiver new_page mode lands.
+    expect(trustTierDecision(candidateRow())).toBe('human');
+    expect(trustTierDecision(candidateRow({ classification: 'ADD', confidence: 0.99 }))).toBe('human');
+    expect(trustTierDecision(candidateRow({ classification: 'ADD', target_path: 'docs/foo.md' }))).toBe('human');
   });
 
   test('non-ADD classifications stay human', () => {
@@ -137,7 +143,17 @@ describe('trustTierDecision', () => {
 });
 
 describe('maybeAutoApprove', () => {
-  test('default-off config leaves an eligible row untouched', async () => {
+  test('never approves an ADD (receiver has no new-page mode), even fully enabled', async () => {
+    const row = candidateRow();
+    const approve = mockApproval(row);
+
+    await expect(
+      maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
+    ).resolves.toBe(false);
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  test('default-off config leaves a row untouched', async () => {
     const row = candidateRow();
     const approve = mockApproval(row);
 
@@ -148,7 +164,7 @@ describe('maybeAutoApprove', () => {
     expect(approve).not.toHaveBeenCalled();
   });
 
-  test('enabled config plus kill-switch leaves an eligible row untouched', async () => {
+  test('enabled config plus kill-switch leaves a row untouched', async () => {
     const row = candidateRow();
     const approve = mockApproval(row);
 
@@ -161,21 +177,17 @@ describe('maybeAutoApprove', () => {
     expect(approve).not.toHaveBeenCalled();
   });
 
-  test('enabled config with kill-switch off approves an eligible row once', async () => {
+  test('enabled config with kill-switch off still never approves an ADD', async () => {
     const row = candidateRow();
     const approve = mockApproval(row);
 
     await expect(
       maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
-    ).resolves.toBe(true);
-    expect(approve).toHaveBeenCalledTimes(1);
-    const call = approve.mock.calls[0] as Parameters<ApproveCandidateFn>;
-    expect(call[1]).toBe(row.id);
-    expect(call[2]).toBe('connector:auto-promote');
-    expect(call[3]).toEqual({ kind: 'existing_page', path: 'docs/foo.md' });
+    ).resolves.toBe(false);
+    expect(approve).not.toHaveBeenCalled();
   });
 
-  test('enabled config with an ineligible row never approves', async () => {
+  test('approveCandidate is unreachable while every classification stays human', async () => {
     const approve = mockApproval(candidateRow());
 
     await expect(
@@ -227,7 +239,9 @@ describe('maybeAutoApprove', () => {
       await expect(
         maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
       ).resolves.toBe(false);
-      expect(approve).toHaveBeenCalledTimes(1);
+      // trustTierDecision returns 'human' for ADD, so approveCandidate is never
+      // reached — the machinery is gated until a receiver new-page mode exists.
+      expect(approve).not.toHaveBeenCalled();
     } finally {
       errSpy.mockRestore();
     }

@@ -25,6 +25,7 @@ import {
 import { maybeAutoApprove } from './trust-tier.ts';
 import { minimize, strip, type RawConnectorItem } from './redact.ts';
 import { recordConsolidationDecision } from './consolidation-decisions.ts';
+import { canonicalConsolidationSlug, resolveConsolidationSearchSource } from './consolidate.ts';
 import type { ConsolidationClassifyResult } from './consolidate.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────────
@@ -515,10 +516,19 @@ async function persistOneVerdict(
 
   let final = verdict;
   // Resolve the classifier's target SLUG → the receiver repo path (`<slug>.md`),
-  // only for a clean single-target UPDATE.
+  // for a clean single-target UPDATE or a proposed new-page ADD. An ADD's target
+  // is canonicalized FIRST so `Docs/Glossary.MD` resolves to `docs/glossary.md`
+  // (not `Docs/Glossary.MD.md` — Codex R4 advisory). UPDATE targets are
+  // classifier-matched existing slugs and are NOT canonicalized here (they must
+  // match the store byte-for-byte).
+  const addCanonicalTarget =
+    verdict.classification === 'ADD' && verdict.target_path
+      ? canonicalConsolidationSlug(verdict.target_path)
+      : verdict.target_path;
   const resolvedPath =
-    verdict.classification === 'UPDATE' && verdict.target_path
-      ? slugToRepoPath(verdict.target_path)
+    (verdict.classification === 'UPDATE' || verdict.classification === 'ADD') &&
+    (addCanonicalTarget ?? '') !== ''
+      ? slugToRepoPath(addCanonicalTarget ?? '')
       : null;
 
   // Single-writer-per-page (KTD9 inverse): if another pending-or-accepted
@@ -538,6 +548,37 @@ async function persistOneVerdict(
     resolvedPath != null && (await hasInflightUpdatePage(engine, resolvedPath));
   if (singleWriterDowngrade) {
     final = { ...verdict, classification: 'NEEDS_REVIEW' };
+  }
+
+  // ADD-novelty guard (KTD-FIX, Codex R1/R2/R3): the classifier's top-K check in
+  // interpretOneClassification can MISS an existing page — a page outside the
+  // search candidate set, or proposed with a trailing `.md`/mixed case. A
+  // misclassified ADD of an EXISTING page must never land as a duplicate, so
+  // re-check novelty against the REAL store here, using the SAME canonicalizer
+  // and the SAME durable source as the classify-time guard (slugs are unique
+  // PER SOURCE — a cross-source lookup would wrongly downgrade a novel ADD).
+  // Fail closed: a lookup error downgrades to NEEDS_REVIEW, never auto-ADD.
+  if (
+    !singleWriterDowngrade &&
+    final.classification === 'ADD' &&
+    verdict.target_path != null
+  ) {
+    const normalizedSlug = canonicalConsolidationSlug(verdict.target_path);
+    const durableSource = await resolveConsolidationSearchSource(engine);
+    let addTargetExists = false;
+    try {
+      addTargetExists = (await engine.getPage(normalizedSlug, { sourceId: durableSource })) != null;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      console.error(
+        `[consolidation] ADD novelty lookup failed for ${normalizedSlug} — downgrading to NEEDS_REVIEW (fail-closed): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      addTargetExists = true;
+    }
+    if (addTargetExists) {
+      final = { ...verdict, classification: 'NEEDS_REVIEW' };
+    }
   }
 
   const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence, singleWriterDowngrade);
@@ -618,8 +659,9 @@ async function persistOneVerdict(
  *  - Single-verdict capture (`!fanOut`) → today's BARE captureId (byte-identical to
  *    v1; also the `= '<captureId>'` idempotency anchor in {@link captureConsolidated}).
  *  - Fan-out → `<captureId>::<discriminator>`: the page slug for a placed verdict
- *    (UPDATE, or a NEEDS_REVIEW the model placed), else the partition INDEX for a
- *    placeless verdict (ADD / NOOP / unplaced). The `::` separator never occurs in a
+ *    (UPDATE, a target-carrying ADD, or a NEEDS_REVIEW the model placed), else the
+ *    partition INDEX for a placeless verdict (ADD with no proposed target / NOOP /
+ *    unplaced). The `::` separator never occurs in a
  *    real provider captureId (record ids are opaque tokens) or a Brain slug
  *    (path-like `[a-z0-9/_.-]`, no colon) — so the key is unambiguous.
  */
@@ -761,6 +803,10 @@ export function buildConsolidatedItem(
         ...base,
         classification: 'ADD',
         confidence: verdict.confidence,
+        // Carry the classifier's proposed NEW-page target so trustTierDecision can
+        // auto-approve a safe-path ADD (KTD-FIX: the ADD predicate was unsatisfiable
+        // because ADD rows never carried target_path — 124 candidates, 0 promoted).
+        target_path: resolvedPath,
         ...(heldBack ? { status: 'rejected' as const, status_reason: 'low_confidence' } : {}),
         expires_at: consolidationExpiry(heldBack),
       };

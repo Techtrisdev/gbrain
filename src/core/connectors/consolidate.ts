@@ -503,6 +503,34 @@ const DEFAULT_DURABLE_SOURCE = 'shared';
 const CONSOLIDATION_SEARCH_SOURCE_KEY = 'connectors.consolidation_search_source';
 
 /**
+ * Canonicalize a proposed page slug for store comparison. The classifier may
+ * emit `Docs/Glossary`, `docs/glossary.md`, or `DOCS/GLOSSARY.MD` — the store
+ * keys lowercase slugs WITHOUT the `.md` suffix. This is the SINGLE
+ * canonicalizer for every novelty/existence guard (Codex R3: the earlier
+ * inline `replace(/\.md$/)` missed mixed case and uppercase `.MD`).
+ */
+export function canonicalConsolidationSlug(slug: string): string {
+  return slug.trim().toLowerCase().replace(/\.md$/, '');
+}
+
+/**
+ * Resolve the durable-corpus source for ADD-novelty checks. Caller override →
+ * `connectors.consolidation_search_source` config → `shared` (the durable,
+ * human-reviewed corpus). MUST be used by BOTH the classify-time guard and the
+ * persist-time backstop — slugs are unique PER SOURCE, so a cross-source lookup
+ * would wrongly downgrade a genuinely novel ADD (Codex R3).
+ */
+export async function resolveConsolidationSearchSource(
+  engine: BrainEngine,
+  override?: string,
+): Promise<string> {
+  const explicit = override?.trim();
+  if (explicit) return explicit;
+  const configured = (await engine.getConfig(CONSOLIDATION_SEARCH_SOURCE_KEY))?.trim();
+  return configured || DEFAULT_DURABLE_SOURCE;
+}
+
+/**
  * `<page>` data-envelope tag matcher (open/close, attribute-tolerant) — the
  * classifier's analogue of {@link CAPTURE_TAG_RX}. `INJECTION_PATTERNS` does not
  * cover `<page>`, so a candidate body containing `</page>` would otherwise break
@@ -577,8 +605,7 @@ export async function classifyConsolidationFacts(
   // durable corpus. A wrong/empty scope is FAIL-SAFE: 0 candidates → escalate to
   // Tier 2 (human-reviewed), never a false dedup. Operators whose durable source
   // id differs set the config key.
-  const configuredSource = (await input.engine.getConfig(CONSOLIDATION_SEARCH_SOURCE_KEY))?.trim();
-  const searchSource = input.searchSourceId?.trim() || configuredSource || DEFAULT_DURABLE_SOURCE;
+  const searchSource = await resolveConsolidationSearchSource(input.engine, input.searchSourceId);
 
   let hits: SearchResult[] = [];
   let topCosine: number | null = null;
@@ -677,7 +704,41 @@ export async function classifyConsolidationFacts(
   if (verdicts.length === 0) {
     return [result('NOOP', clampUnit(input.extractionConfidence), { tier1_cosine: topCosine, model })];
   }
-  return verdicts;
+  // ADD-novelty guard (Codex R2): the top-K `matched` check above can MISS an
+  // existing page — a page outside the search candidate set, or proposed with a
+  // trailing `.md`. A misclassified ADD of an EXISTING page must never be
+  // presented as a novel page (a human could approve a duplicate). Re-check
+  // novelty against the REAL store, source-scoped + normalized. Fail closed: a
+  // lookup error downgrades to NEEDS_REVIEW, never a false ADD.
+  const verified: ConsolidationClassifyResult[] = [];
+  for (const v of verdicts) {
+    if (v.classification === 'ADD' && v.target_path != null) {
+      const normalizedSlug = canonicalConsolidationSlug(v.target_path);
+      let exists = false;
+      try {
+        exists = (await input.engine.getPage(normalizedSlug, { sourceId: searchSource })) != null;
+      } catch (err) {
+        if (isAbort(err)) throw err;
+        console.error(
+          `[consolidation] ADD novelty lookup failed for ${normalizedSlug} — downgrading to NEEDS_REVIEW (fail-closed): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        exists = true;
+      }
+      if (exists) {
+        verified.push(
+          result('NEEDS_REVIEW', v.confidence, {
+            target_path: v.target_path,
+            tier1_cosine: v.tier1_cosine,
+            model: v.model,
+          }),
+        );
+        continue;
+      }
+    }
+    verified.push(v);
+  }
+  return verified;
 }
 
 /** The parsed (pre-validation) Tier-2 output shape. */
@@ -842,7 +903,23 @@ function interpretOneClassification(
     case 'NOOP':
       return result('NOOP', conf, meta);
     case 'ADD':
-      return result('ADD', conf, meta);
+      // Carry the classifier's PROPOSED slug for a NEW page (the prompt asks the
+      // model to set `target` to a proposed slug, or omit it). Hard rules:
+      //  - an ADD that names MORE than one distinct target is ambiguous → review;
+      //  - an ADD whose proposed target MATCHES an existing candidate page was
+      //    misclassified (novel implies not-yet-existing) → review, never auto-add;
+      //  - a blank/omitted target stays reviewer-driven (null).
+      // The single-target rule mirrors the UPDATE fan-out contract (a partition
+      // must concern exactly ONE page); the matched-page rule keeps a classifier
+      // ADD of an EXISTING page from silently auto-approving a duplicate.
+      if (parsed.targets.length > 1) {
+        return result('NEEDS_REVIEW', conf, { ...meta, target_path: parsed.targets[0] ?? null });
+      }
+      const proposed = parsed.targets[0] ?? null;
+      if (proposed != null && bySlug.has(proposed)) {
+        return result('NEEDS_REVIEW', conf, { ...meta, target_path: proposed });
+      }
+      return result('ADD', conf, { ...meta, target_path: proposed });
     case 'NEEDS_REVIEW':
       return result('NEEDS_REVIEW', conf, { ...meta, target_path: matched[0] ?? null });
     case 'UPDATE': {

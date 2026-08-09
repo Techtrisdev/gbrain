@@ -790,6 +790,9 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
   function makeEngine(opts: {
     hits?: SearchResult[];
     pages?: Record<string, Page>;
+    /** Source-scoped pages: `{ sourceId: { slug: Page } }`. When set, getPage
+     *  honors the lookup's sourceId (a page in another source is NOT visible). */
+    pagesBySource?: Record<string, Record<string, Page>>;
     config?: Record<string, string>;
   }) {
     const getPageCalls: Array<{ slug: string; sourceId?: string }> = [];
@@ -810,7 +813,16 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       },
       getPage: async (slug: string, o?: { sourceId?: string }): Promise<Page | null> => {
         getPageCalls.push({ slug, sourceId: o?.sourceId });
-        return opts.pages?.[slug] ?? null;
+        // Respect source scoping: a page registered under a source is only
+        // visible to lookups scoped to that source (or unscoped — pre-existing
+        // semantics). `pages` registers SHARED-source pages (the durable default);
+        // `pagesBySource` keys explicitly and wins for its source.
+        const scope = o?.sourceId;
+        if (scope == null) return opts.pages?.[slug] ?? opts.pagesBySource?.['shared']?.[slug] ?? null;
+        const scoped = scope === 'shared'
+          ? { ...(opts.pages ?? {}), ...(opts.pagesBySource?.['shared'] ?? {}) }
+          : (opts.pagesBySource?.[scope] ?? {});
+        return scoped[slug] ?? null;
       },
       getConfig: async (key: string): Promise<string | null> => opts.config?.[key] ?? null,
     } as unknown as BrainEngine;
@@ -1509,8 +1521,130 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     expect(r!.length).toBe(2);
     expect(r!.map((v) => v.classification)).toEqual(['UPDATE', 'ADD']);
     expect(r![0].target_path).toBe('clients/acme');
-    // ADD carries no resolved UPDATE target (target_path null) — it stays reviewer-driven.
-    expect(r![1].target_path).toBeNull();
+    // ADD carries the classifier's PROPOSED slug so a safe-path ADD can auto-approve.
+    expect(r![1].target_path).toBe('projects/new-thing');
+  });
+
+  test('ADD carries the proposed slug so a reviewer sees where the new page goes', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    // The proposed slug survives interpretation — a human reviewer sees where the
+    // ADD belongs (and a future receiver new_page mode can auto-promote it).
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD with no proposed slug stays reviewer-driven (target_path null)', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    expect(r.target_path).toBeNull();
+  });
+
+  test('ADD naming an EXISTING candidate page is misclassified → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The classifier calls it ADD, but the target matches a page already in the
+    // candidate set — novel means not-yet-existing, so this must NOT auto-add.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'clients/acme', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [fakeHit('clients/acme', 0.5, 'shared')],
+      pages: { 'clients/acme': fakePage('clients/acme', 'Acme is a customer.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+    expect(r.target_path).toBe('clients/acme');
+  });
+
+  test('ADD naming MULTIPLE targets is ambiguous → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', targets: ['docs/a', 'docs/b'], confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+  });
+
+  test('ADD whose target EXISTS in the store (outside top-K) → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The classifier says ADD + names a page, but the search top-K does NOT
+    // include it (hits: []). The real-store lookup must catch it: a misclassified
+    // ADD of an existing page must never be presented as novel.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pages: { 'docs/glossary': fakePage('docs/glossary', 'Existing glossary.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD whose target EXISTS only in .md form (normalized) → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The classifier proposed `docs/glossary.md`; the store keys without `.md`.
+    // Normalization (strip .md) must match the existing page.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary.md', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pages: { 'docs/glossary': fakePage('docs/glossary', 'Existing glossary.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+  });
+
+  test('ADD whose target is genuinely novel stays ADD (real-store miss)', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD whose target exists but in MIXED CASE / .MD form → NEEDS_REVIEW (canonicalized)', async () => {
+    configureEmbedding();
+    // The store keys lowercase slug without .md; the classifier may emit
+    // mixed case or an uppercase .MD suffix. The shared canonicalizer must match.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'Docs/Glossary.MD', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pages: { 'docs/glossary': fakePage('docs/glossary', 'Existing glossary.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+  });
+
+  test('ADD whose target exists ONLY in another source stays ADD (source-scoped novelty)', async () => {
+    configureEmbedding();
+    // Slugs are unique PER SOURCE. A matching slug in an unrelated source must
+    // NOT downgrade a genuinely novel durable-source ADD.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pagesBySource: {
+        'capture-events': { 'docs/glossary': fakePage('docs/glossary', 'Raw capture.', 'capture-events') },
+      },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD whose target exists in the DURABLE source (source-scoped hit) → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The durable source is 'shared' by default — a page there IS the same slug.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pagesBySource: {
+        'shared': { 'docs/glossary': fakePage('docs/glossary', 'Durable glossary.', 'shared') },
+      },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
   });
 
   test('partial fan-out: one partition contradicts (NEEDS_REVIEW), the sibling still UPDATEs', async () => {

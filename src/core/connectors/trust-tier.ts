@@ -71,22 +71,35 @@ export function trustTierDecision(
   >,
 ): TrustDecision {
   try {
-    if (row.classification !== 'ADD') return 'human';
+    // ADD (new-page) candidates ALWAYS go to human review today. The promotion
+    // receiver (techtris-brain scripts/brain_lint/promote_candidate.py) has no
+    // create-new-page mode: existing_page requires the target file to already
+    // exist, and there is no new_page mode, so auto-approving an ADD would
+    // guarantee a failed promotion ("target file not found"). The trust-tier
+    // auto-approve machinery is retained and gated here so a future receiver
+    // new_page mode can enable it by widening this branch.
+    if (row.classification === 'ADD') return 'human';
 
-    if (typeof row.confidence !== 'number') return 'human';
-    if (!Number.isFinite(row.confidence) || row.confidence < AUTO_APPROVE_MIN_CONFIDENCE) {
+    if (row.classification !== 'UPDATE' && row.classification !== 'NEEDS_REVIEW' && row.classification !== 'NOOP') {
       return 'human';
     }
+    // UPDATE / NEEDS_REVIEW / NOOP are never auto-approved either — the tier
+    // exists for a future explicit allowlist. Fail closed.
+    return 'human';
 
-    if (row.target_kind !== null && row.target_kind !== 'existing_page') return 'human';
-
-    if (!isPresentString(row.rationale_ref)) return 'human';
-    if (hasRedactions(row.redactions)) return 'human';
-
-    if (!isPresentString(row.target_path)) return 'human';
-    if (!isSafeAutoApprovePath(row.target_path)) return 'human';
-
-    return 'auto_approve';
+    // The block below is the historical ADD auto-approve predicate, intentionally
+    // unreachable (see the ADD branch above). Retained as documentation of the
+    // shape a receiver-supported new_page mode would re-enable:
+    //   if (typeof row.confidence !== 'number') return 'human';
+    //   if (!Number.isFinite(row.confidence) || row.confidence < AUTO_APPROVE_MIN_CONFIDENCE) {
+    //     return 'human';
+    //   }
+    //   if (row.target_kind !== null && row.target_kind !== 'existing_page') return 'human';
+    //   if (!isPresentString(row.rationale_ref)) return 'human';
+    //   if (hasRedactions(row.redactions)) return 'human';
+    //   if (!isPresentString(row.target_path)) return 'human';
+    //   if (!isSafeAutoApprovePath(row.target_path)) return 'human';
+    //   return 'auto_approve';
   } catch {
     return 'human';
   }
