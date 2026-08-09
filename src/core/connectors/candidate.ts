@@ -62,7 +62,7 @@ export interface ConnectorCandidateItem {
   /** The classifier verdict (ADD | UPDATE | NOOP | NEEDS_REVIEW). */
   classification?: ConsolidationClassification | null;
   /** Pre-computed promotion target kind. 'update_page' is the consolidation UPDATE mode. */
-  target_kind?: 'existing_page' | 'inbox' | 'update_page' | null;
+  target_kind?: 'existing_page' | 'inbox' | 'update_page' | 'new_page' | null;
   /** Pre-computed promotion target path (the resolved `<slug>.md` repo path for update_page). */
   target_path?: string | null;
   /** The UPDATE timeline line. Classifier output → strip()'d at the write boundary. */
@@ -104,7 +104,7 @@ export interface ConnectorCandidateRow {
   superseded_by: number | null;
   // TECH-2109 promotion bridge columns — all nullable; pre-promotion rows read null.
   // 'update_page' (U6) is the consolidation UPDATE receiver mode.
-  target_kind: 'existing_page' | 'inbox' | 'update_page' | null;
+  target_kind: 'existing_page' | 'inbox' | 'update_page' | 'new_page' | null;
   target_path: string | null;
   promotion_status: 'pr_opened' | 'indexed' | 'promoted_to_inbox' | 'needs_fix' | 'failed' | null;
   promotion_pr_url: string | null;
@@ -687,8 +687,8 @@ export class PromotionTargetError extends Error {
  */
 export function validatePromotionTarget(target: PromotionTarget): void {
   const path = target.path ?? '';
-  if (target.kind === 'existing_page' && !path.trim()) {
-    throw new PromotionTargetError('existing_page target requires a non-empty target_path');
+  if ((target.kind === 'existing_page' || target.kind === 'new_page') && !path.trim()) {
+    throw new PromotionTargetError(`${target.kind} target requires a non-empty target_path`);
   }
   if (target.kind === 'update_page') {
     // A machine-pre-computed UPDATE: the receiver's KTD8 staleness guard needs BOTH a concrete
@@ -855,7 +855,7 @@ export async function approveCandidate(
 
   // 3b. Egress substance backstop (fail-closed). The original guard fired only on an EMPTY
   //     consolidation UPDATE body (the receiver rejects an empty update_page body); EXTEND it
-  //     to EVERY target mode (inbox / existing_page / update_page) and to any SUB-THRESHOLD
+  //     to EVERY target mode (inbox / existing_page / update_page / new_page) and to any SUB-THRESHOLD
   //     body, so a manually-accepted title-only candidate (the "Westside Pizza <> Techtris
   //     Intro" incident — an admin accept of a contentless candidate) can never become a
   //     promotion PR. For a consolidation UPDATE the artifact body = row.proposed_markdown

@@ -16,7 +16,7 @@ function candidateRow(overrides: Partial<ConnectorCandidateRow> = {}): Connector
     version: '1',
     source_record_ids: [],
     provider: 'granola',
-    proposed_slug: 'docs/foo',
+    proposed_slug: 'playbooks/foo',
     proposed_markdown: '# Foo\n\nSubstantive connector candidate body.',
     confidence: 0.95,
     redactions: [],
@@ -29,7 +29,7 @@ function candidateRow(overrides: Partial<ConnectorCandidateRow> = {}): Connector
     acted_at: null,
     superseded_by: null,
     target_kind: null,
-    target_path: 'docs/foo.md',
+    target_path: 'playbooks/foo.md',
     promotion_status: null,
     promotion_pr_url: null,
     promotion_branch: null,
@@ -88,14 +88,32 @@ afterEach(() => {
 });
 
 describe('trustTierDecision', () => {
-  test('ADD candidates stay human (receiver has no new-page mode)', () => {
-    // The promotion receiver (techtris-brain promote_candidate.py) only supports
-    // existing_page/inbox/update_page; existing_page requires the file to ALREADY
-    // exist, so an auto-approved ADD (a NEW page) would always fail promotion.
-    // Auto-approve for ADDs is gated until a receiver new_page mode lands.
-    expect(trustTierDecision(candidateRow())).toBe('human');
-    expect(trustTierDecision(candidateRow({ classification: 'ADD', confidence: 0.99 }))).toBe('human');
-    expect(trustTierDecision(candidateRow({ classification: 'ADD', target_path: 'docs/foo.md' }))).toBe('human');
+  test('high-confidence ADD to a safe path auto-approves (new_page receiver mode)', () => {
+    // The receiver's new_page mode now lands ADD proposals (novelty re-check +
+    // PR review gate), so a high-confidence, safe-path, rationale-carrying ADD
+    // with no redactions may auto-approve.
+    expect(trustTierDecision(candidateRow())).toBe('auto_approve');
+    expect(trustTierDecision(candidateRow({ target_path: 'playbooks/foo.md' }))).toBe('auto_approve');
+    expect(trustTierDecision(candidateRow({ classification: 'ADD', confidence: 0.99 }))).toBe('auto_approve');
+  });
+
+  test('docs/ is NOT auto-approvable — receiver new_page rejects docs/', () => {
+    // The path contract is aligned on playbooks/ only: the receiver's new_page
+    // mode accepts CONTENT_DIRS and explicitly rejects docs/ pages.
+    expect(trustTierDecision(candidateRow({ target_path: 'docs/foo.md' }))).toBe('human');
+  });
+
+  test('nested/non-page/README paths stay human — receiver new_page is one-level', () => {
+    // Mirror the receiver's new_page path contract: exactly <dir>/<file>.md.
+    for (const target_path of [
+      'playbooks/nested/foo.md',   // nested — receiver rejects (not one level)
+      'playbooks/README.md',       // README — receiver rejects
+      'playbooks/foo',             // no .md — receiver rejects
+      'playbooks/foo.txt',         // not a page — receiver rejects
+      'playbooks/../people/x.md',  // traversal — receiver rejects
+    ]) {
+      expect(trustTierDecision(candidateRow({ target_path }))).toBe('human');
+    }
   });
 
   test('non-ADD classifications stay human', () => {
@@ -143,14 +161,18 @@ describe('trustTierDecision', () => {
 });
 
 describe('maybeAutoApprove', () => {
-  test('never approves an ADD (receiver has no new-page mode), even fully enabled', async () => {
-    const row = candidateRow();
+  test('safe high-confidence ADD approves via new_page when enabled', async () => {
+    const row = candidateRow(); // ADD, confidence 0.95, playbooks/foo.md, rationale, no redactions
     const approve = mockApproval(row);
 
     await expect(
       maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
-    ).resolves.toBe(false);
-    expect(approve).not.toHaveBeenCalled();
+    ).resolves.toBe(true);
+    expect(approve).toHaveBeenCalledTimes(1);
+    const [engine, id, actor, target] = approve.mock.calls[0];
+    expect(id).toBe(123);
+    expect(target.kind).toBe('new_page');
+    expect(target.path).toBe('playbooks/foo.md');
   });
 
   test('default-off config leaves a row untouched', async () => {
@@ -177,9 +199,9 @@ describe('maybeAutoApprove', () => {
     expect(approve).not.toHaveBeenCalled();
   });
 
-  test('enabled config with kill-switch off still never approves an ADD', async () => {
-    const row = candidateRow();
-    const approve = mockApproval(row);
+  test('sensitive target path stays human even fully enabled', async () => {
+    const approve = mockApproval(candidateRow());
+    const row = candidateRow({ target_path: 'clients/acme.md' });
 
     await expect(
       maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
@@ -187,14 +209,14 @@ describe('maybeAutoApprove', () => {
     expect(approve).not.toHaveBeenCalled();
   });
 
-  test('approveCandidate is unreachable while every classification stays human', async () => {
+  test('non-ADD classifications never approve', async () => {
     const approve = mockApproval(candidateRow());
 
     await expect(
-      maybeAutoApprove(fakeEngine({ autoPromote: 'true' }), candidateRow({ target_path: 'clients/acme.md' })),
+      maybeAutoApprove(fakeEngine({ autoPromote: 'true' }), candidateRow({ classification: 'UPDATE' })),
     ).resolves.toBe(false);
     await expect(
-      maybeAutoApprove(fakeEngine({ autoPromote: 'true' }), candidateRow({ classification: 'UPDATE' })),
+      maybeAutoApprove(fakeEngine({ autoPromote: 'true' }), candidateRow({ classification: 'NEEDS_REVIEW' })),
     ).resolves.toBe(false);
     expect(approve).not.toHaveBeenCalled();
   });
@@ -239,9 +261,7 @@ describe('maybeAutoApprove', () => {
       await expect(
         maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
       ).resolves.toBe(false);
-      // trustTierDecision returns 'human' for ADD, so approveCandidate is never
-      // reached — the machinery is gated until a receiver new-page mode exists.
-      expect(approve).not.toHaveBeenCalled();
+      expect(approve).toHaveBeenCalledTimes(1); // reached, but its throw is absorbed
     } finally {
       errSpy.mockRestore();
     }

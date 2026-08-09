@@ -474,6 +474,16 @@ describe('U4 buildPromotionArtifact: update_page mode-dependent shape', () => {
     expect(inbox.target.timeline_entry).toContain('Promoted from connector candidate');
   });
 
+  test('new_page target builds the 4-key artifact (mode new_page, no base_compiled_hash)', () => {
+    const a = buildPromotionArtifact(ROW, { kind: 'new_page', path: 'playbooks/incident-response.md' });
+    expect(a.target.mode).toBe('new_page');
+    expect(a.target.path).toBe('playbooks/incident-response.md');
+    expect('base_compiled_hash' in a.target).toBe(false);
+    expect(Object.keys(a.target)).toHaveLength(4);
+    // The body is the proposed new-page content, redacted at this boundary.
+    expect(a.target.body).toContain('ACME');
+  });
+
   test('cross-repo key-set match: mirrors the receiver mode-aware TARGET_SCHEMA', () => {
     // promote_candidate.py: expected = TARGET_SCHEMA | {base_compiled_hash} iff update_page,
     // plain TARGET_SCHEMA (4 keys) otherwise. fail-closed on BOTH missing and unknown keys.

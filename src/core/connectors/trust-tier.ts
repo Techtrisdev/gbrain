@@ -20,8 +20,13 @@ export type TrustDecision = 'auto_approve' | 'human';
 export const AUTO_APPROVE_MIN_CONFIDENCE = 0.9;
 
 // Maximally conservative initial allow-list. Operators may tune this in a later
-// policy layer, but the code default intentionally limits auto-approval to docs.
-export const AUTO_APPROVE_ALLOWED_PATH_PREFIXES = ['docs/', 'playbooks/'] as const;
+// policy layer, but the code default intentionally limits auto-approval to
+// playbooks/ — the one path prefix BOTH the sender allowlist and the receiver's
+// new_page mode agree on. docs/ is deliberately excluded: the receiver's
+// new_page mode only accepts CONTENT_DIRS (clients/people/projects/
+// integrations/decisions/playbooks) and explicitly rejects docs/ pages (they
+// are not schema-valid under validate_page).
+export const AUTO_APPROVE_ALLOWED_PATH_PREFIXES = ['playbooks/'] as const;
 
 export const AUTO_PROMOTE_ENABLED_KEY = 'connectors.auto_promote_enabled';
 export const AUTO_PROMOTE_ACTOR = 'connector:auto-promote';
@@ -71,35 +76,33 @@ export function trustTierDecision(
   >,
 ): TrustDecision {
   try {
-    // ADD (new-page) candidates ALWAYS go to human review today. The promotion
-    // receiver (techtris-brain scripts/brain_lint/promote_candidate.py) has no
-    // create-new-page mode: existing_page requires the target file to already
-    // exist, and there is no new_page mode, so auto-approving an ADD would
-    // guarantee a failed promotion ("target file not found"). The trust-tier
-    // auto-approve machinery is retained and gated here so a future receiver
-    // new_page mode can enable it by widening this branch.
-    if (row.classification === 'ADD') return 'human';
+    // The promotion receiver now supports new_page (create a new content page).
+    // A high-confidence ADD with a safe, non-sensitive target path, a rationale,
+    // and no redactions can auto-approve — the receiver re-checks novelty at
+    // promotion time (fails closed if the page already exists) and the PR is
+    // the human review gate (the bridge never auto-merges).
+    if (row.classification === 'ADD') {
+      if (typeof row.confidence !== 'number') return 'human';
+      if (!Number.isFinite(row.confidence) || row.confidence < AUTO_APPROVE_MIN_CONFIDENCE) {
+        return 'human';
+      }
+      // target_kind is null for ADD rows (the ADD target is a NEW page, not a
+      // pre-computed update). Accept null or new_page; anything else is a
+      // contradiction (an ADD can't be an existing_page/update_page target).
+      if (row.target_kind !== null && row.target_kind !== 'new_page') return 'human';
+      if (!isPresentString(row.rationale_ref)) return 'human';
+      if (hasRedactions(row.redactions)) return 'human';
+      if (!isPresentString(row.target_path)) return 'human';
+      if (!isSafeAutoApprovePath(row.target_path)) return 'human';
+      return 'auto_approve';
+    }
 
     if (row.classification !== 'UPDATE' && row.classification !== 'NEEDS_REVIEW' && row.classification !== 'NOOP') {
       return 'human';
     }
-    // UPDATE / NEEDS_REVIEW / NOOP are never auto-approved either — the tier
+    // UPDATE / NEEDS_REVIEW / NOOP are never auto-approved — the tier
     // exists for a future explicit allowlist. Fail closed.
     return 'human';
-
-    // The block below is the historical ADD auto-approve predicate, intentionally
-    // unreachable (see the ADD branch above). Retained as documentation of the
-    // shape a receiver-supported new_page mode would re-enable:
-    //   if (typeof row.confidence !== 'number') return 'human';
-    //   if (!Number.isFinite(row.confidence) || row.confidence < AUTO_APPROVE_MIN_CONFIDENCE) {
-    //     return 'human';
-    //   }
-    //   if (row.target_kind !== null && row.target_kind !== 'existing_page') return 'human';
-    //   if (!isPresentString(row.rationale_ref)) return 'human';
-    //   if (hasRedactions(row.redactions)) return 'human';
-    //   if (!isPresentString(row.target_path)) return 'human';
-    //   if (!isSafeAutoApprovePath(row.target_path)) return 'human';
-    //   return 'auto_approve';
   } catch {
     return 'human';
   }
@@ -140,12 +143,14 @@ export async function maybeAutoApprove(engine: BrainEngine, row: ConnectorCandid
     // This re-validation closes the stale in-memory-row TOCTOU. approveCandidate
     // intentionally re-reads by id, so the residual gap is two adjacent reads
     // before the guarded UPDATE, acceptable for this default-off fail-closed path.
-    const result = await approveCandidateForTrustTier(
-      engine,
-      id,
-      AUTO_PROMOTE_ACTOR,
-      { kind: 'existing_page', path: freshRow.target_path ?? '' },
-    );
+    // Route the promotion target by classification: an ADD proposes a NEW page
+    // → the receiver's new_page mode (which re-checks novelty + opens a PR);
+    // everything else stays on the historical existing_page path.
+    const target: PromotionTarget =
+      freshRow.classification === 'ADD'
+        ? { kind: 'new_page', path: freshRow.target_path ?? '' }
+        : { kind: 'existing_page', path: freshRow.target_path ?? '' };
+    const result = await approveCandidateForTrustTier(engine, id, AUTO_PROMOTE_ACTOR, target);
     return result.row !== null;
   } catch (err) {
     const id = safeCandidateId(row);
@@ -176,6 +181,17 @@ function isSafeAutoApprovePath(path: string): boolean {
   for (const segment of path.split('/')) {
     if (segment === '' || segment.startsWith('.')) return false;
   }
+  // Mirror the receiver's new_page path contract (techtris-brain PR #285):
+  // exactly <dir>/<file>.md — ONE level under a CONTENT_DIR, not README.md,
+  // not a discovery-excluded artifact (integrations/index.md). Without this, a
+  // nested path like playbooks/nested/foo.md would auto-approve here and then
+  // fail closed at the receiver (or worse, be filed where discovery can't seed
+  // it).
+  const segments = path.split('/');
+  if (segments.length !== 2) return false;
+  if (segments[1] === 'README.md') return false;
+  if (!segments[1].endsWith('.md')) return false;
+  if (segments[0] !== 'playbooks') return false;
   return true;
 }
 
