@@ -103,6 +103,19 @@ describe('trustTierDecision', () => {
     expect(trustTierDecision(candidateRow({ target_path: 'docs/foo.md' }))).toBe('human');
   });
 
+  test('nested/non-page/README paths stay human — receiver new_page is one-level', () => {
+    // Mirror the receiver's new_page path contract: exactly <dir>/<file>.md.
+    for (const target_path of [
+      'playbooks/nested/foo.md',   // nested — receiver rejects (not one level)
+      'playbooks/README.md',       // README — receiver rejects
+      'playbooks/foo',             // no .md — receiver rejects
+      'playbooks/foo.txt',         // not a page — receiver rejects
+      'playbooks/../people/x.md',  // traversal — receiver rejects
+    ]) {
+      expect(trustTierDecision(candidateRow({ target_path }))).toBe('human');
+    }
+  });
+
   test('non-ADD classifications stay human', () => {
     for (const classification of ['UPDATE', 'NEEDS_REVIEW', 'NOOP', null] as const) {
       expect(trustTierDecision(candidateRow({ classification }))).toBe('human');

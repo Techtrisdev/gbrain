@@ -181,6 +181,17 @@ function isSafeAutoApprovePath(path: string): boolean {
   for (const segment of path.split('/')) {
     if (segment === '' || segment.startsWith('.')) return false;
   }
+  // Mirror the receiver's new_page path contract (techtris-brain PR #285):
+  // exactly <dir>/<file>.md — ONE level under a CONTENT_DIR, not README.md,
+  // not a discovery-excluded artifact (integrations/index.md). Without this, a
+  // nested path like playbooks/nested/foo.md would auto-approve here and then
+  // fail closed at the receiver (or worse, be filed where discovery can't seed
+  // it).
+  const segments = path.split('/');
+  if (segments.length !== 2) return false;
+  if (segments[1] === 'README.md') return false;
+  if (!segments[1].endsWith('.md')) return false;
+  if (segments[0] !== 'playbooks') return false;
   return true;
 }
 

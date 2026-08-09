@@ -6,6 +6,25 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
+/** Insert a new_page candidate and assert the DB REJECTS it (CHECK violation). */
+async function expectInsertNewPageFails(engine: BrainEngine, sourceRecordId: string): Promise<void> {
+  let threw = false;
+  try {
+    await engine.executeRaw<{ id: number }>(
+      `INSERT INTO connector_candidates
+         (provider, source_id, source_record_id, version, status, classification,
+          target_kind, target_path, confidence)
+       VALUES
+         ('granola', 'default', '${sourceRecordId}', '1', 'accepted', 'ADD',
+          'new_page', 'playbooks/pre108.md', 0.95)
+       RETURNING id`,
+    );
+  } catch {
+    threw = true;
+  }
+  expect(threw).toBe(true);
+}
+
 describe('migrate', () => {
   test('LATEST_VERSION is a number >= 1', () => {
     expect(typeof LATEST_VERSION).toBe('number');
@@ -63,36 +82,27 @@ describe('hasPendingMigrations', () => {
     const engine = new PGLiteEngine();
     await engine.connect({});
     try {
-      // Simulate an OLD brain at v97: create schema, then rewind the version.
+      // Simulate an OLD brain at v97: fresh schema, then rewind the version AND
+      // install the v97-era named 3-value CHECK (what prod would carry).
       await engine.initSchema();
       await engine.setConfig('version', '97');
-      // The v97-era CHECK (3 values) is what prod would have; re-assert it by
-      // re-running the v97 migration's DROP/ADD against the current schema so
-      // the upgrade path is exercised honestly.
-      await engine.runMigration(
-        108,
-        `DO $$
-        DECLARE r record;
-        BEGIN
-          FOR r IN
-            SELECT con.conname
-              FROM pg_constraint con
-              JOIN pg_attribute att
-                ON att.attrelid = con.conrelid
-               AND att.attnum   = ANY (con.conkey)
-             WHERE con.conrelid = 'connector_candidates'::regclass
-               AND con.contype  = 'c'
-               AND att.attname  = 'target_kind'
-          LOOP
-            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
-          END LOOP;
-        END $$;
-
-        ALTER TABLE connector_candidates
-          ADD CONSTRAINT connector_candidates_target_kind_check
-          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page','new_page'));
-        `,
+      await engine.executeRaw(
+        `ALTER TABLE connector_candidates DROP CONSTRAINT IF EXISTS connector_candidates_target_kind_check`,
       );
+      await engine.executeRaw(
+        `ALTER TABLE connector_candidates
+           ADD CONSTRAINT connector_candidates_target_kind_check
+           CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page'))`,
+      );
+      // A new_page insert MUST fail under the v97-era constraint (proves the
+      // 3-value constraint is actually installed).
+      await expectInsertNewPageFails(engine, 'rec-newpage-pre108');
+
+      // Run the REAL migration 108 from the registry (98..107 also apply —
+      // exactly what prod does on upgrade).
+      await runMigrations(engine);
+
+      // Now the same insert must succeed — v108 relaxed the CHECK.
       const rows = await engine.executeRaw<{ id: number }>(
         `INSERT INTO connector_candidates
            (provider, source_id, source_record_id, version, status, classification,
@@ -104,6 +114,23 @@ describe('hasPendingMigrations', () => {
       );
       expect(rows.length).toBe(1);
       expect(rows[0].id).toBeGreaterThan(0);
+
+      // Idempotence: re-running migrations at LATEST applies nothing, and
+      // directly re-applying v108's SQL must not error (catalog-resolved DROP
+      // finds the named 4-value CHECK, drops it, re-adds the same).
+      await runMigrations(engine); // no-op at LATEST — proves nothing re-applies
+      await engine.runMigration(
+        108,
+        MIGRATIONS.find((m) => m.version === 108)!.sqlFor!.pglite!,
+      );
+      await engine.executeRaw(
+        `INSERT INTO connector_candidates
+           (provider, source_id, source_record_id, version, status, classification,
+            target_kind, target_path, confidence)
+         VALUES
+           ('granola', 'default', 'rec-newpage-3', '1', 'accepted', 'ADD',
+            'new_page', 'playbooks/baz.md', 0.95)`,
+      );
     } finally {
       await engine.disconnect();
     }
