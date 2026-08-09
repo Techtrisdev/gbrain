@@ -71,35 +71,33 @@ export function trustTierDecision(
   >,
 ): TrustDecision {
   try {
-    // ADD (new-page) candidates ALWAYS go to human review today. The promotion
-    // receiver (techtris-brain scripts/brain_lint/promote_candidate.py) has no
-    // create-new-page mode: existing_page requires the target file to already
-    // exist, and there is no new_page mode, so auto-approving an ADD would
-    // guarantee a failed promotion ("target file not found"). The trust-tier
-    // auto-approve machinery is retained and gated here so a future receiver
-    // new_page mode can enable it by widening this branch.
-    if (row.classification === 'ADD') return 'human';
+    // The promotion receiver now supports new_page (create a new content page).
+    // A high-confidence ADD with a safe, non-sensitive target path, a rationale,
+    // and no redactions can auto-approve — the receiver re-checks novelty at
+    // promotion time (fails closed if the page already exists) and the PR is
+    // the human review gate (the bridge never auto-merges).
+    if (row.classification === 'ADD') {
+      if (typeof row.confidence !== 'number') return 'human';
+      if (!Number.isFinite(row.confidence) || row.confidence < AUTO_APPROVE_MIN_CONFIDENCE) {
+        return 'human';
+      }
+      // target_kind is null for ADD rows (the ADD target is a NEW page, not a
+      // pre-computed update). Accept null or new_page; anything else is a
+      // contradiction (an ADD can't be an existing_page/update_page target).
+      if (row.target_kind !== null && row.target_kind !== 'new_page') return 'human';
+      if (!isPresentString(row.rationale_ref)) return 'human';
+      if (hasRedactions(row.redactions)) return 'human';
+      if (!isPresentString(row.target_path)) return 'human';
+      if (!isSafeAutoApprovePath(row.target_path)) return 'human';
+      return 'auto_approve';
+    }
 
     if (row.classification !== 'UPDATE' && row.classification !== 'NEEDS_REVIEW' && row.classification !== 'NOOP') {
       return 'human';
     }
-    // UPDATE / NEEDS_REVIEW / NOOP are never auto-approved either — the tier
+    // UPDATE / NEEDS_REVIEW / NOOP are never auto-approved — the tier
     // exists for a future explicit allowlist. Fail closed.
     return 'human';
-
-    // The block below is the historical ADD auto-approve predicate, intentionally
-    // unreachable (see the ADD branch above). Retained as documentation of the
-    // shape a receiver-supported new_page mode would re-enable:
-    //   if (typeof row.confidence !== 'number') return 'human';
-    //   if (!Number.isFinite(row.confidence) || row.confidence < AUTO_APPROVE_MIN_CONFIDENCE) {
-    //     return 'human';
-    //   }
-    //   if (row.target_kind !== null && row.target_kind !== 'existing_page') return 'human';
-    //   if (!isPresentString(row.rationale_ref)) return 'human';
-    //   if (hasRedactions(row.redactions)) return 'human';
-    //   if (!isPresentString(row.target_path)) return 'human';
-    //   if (!isSafeAutoApprovePath(row.target_path)) return 'human';
-    //   return 'auto_approve';
   } catch {
     return 'human';
   }
@@ -140,12 +138,14 @@ export async function maybeAutoApprove(engine: BrainEngine, row: ConnectorCandid
     // This re-validation closes the stale in-memory-row TOCTOU. approveCandidate
     // intentionally re-reads by id, so the residual gap is two adjacent reads
     // before the guarded UPDATE, acceptable for this default-off fail-closed path.
-    const result = await approveCandidateForTrustTier(
-      engine,
-      id,
-      AUTO_PROMOTE_ACTOR,
-      { kind: 'existing_page', path: freshRow.target_path ?? '' },
-    );
+    // Route the promotion target by classification: an ADD proposes a NEW page
+    // → the receiver's new_page mode (which re-checks novelty + opens a PR);
+    // everything else stays on the historical existing_page path.
+    const target: PromotionTarget =
+      freshRow.classification === 'ADD'
+        ? { kind: 'new_page', path: freshRow.target_path ?? '' }
+        : { kind: 'existing_page', path: freshRow.target_path ?? '' };
+    const result = await approveCandidateForTrustTier(engine, id, AUTO_PROMOTE_ACTOR, target);
     return result.row !== null;
   } catch (err) {
     const id = safeCandidateId(row);

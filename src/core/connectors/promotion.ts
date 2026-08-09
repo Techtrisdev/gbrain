@@ -56,9 +56,10 @@ import { mintAppJwt } from './github-app-jwt.ts';
  * path; `update_page` ALSO requires a non-empty `base_compiled_hash` (KTD8 staleness guard).
  */
 export interface PromotionTarget {
-  kind: 'existing_page' | 'inbox' | 'update_page';
+  kind: 'existing_page' | 'inbox' | 'update_page' | 'new_page';
   /** The target path (validated server-side in approveCandidate). For update_page this is the
-   *  classifier-resolved `<slug>.md` content path carried from the row. */
+   *  classifier-resolved `<slug>.md` content path carried from the row. For new_page it is the
+   *  classifier's proposed NEW-page path. */
   path: string;
   /** update_page ONLY: the classifier's real dated timeline line (carried from the row). */
   timeline_entry?: string;
@@ -69,12 +70,12 @@ export interface PromotionTarget {
 
 /**
  * The artifact's `target` object. MODE-DEPENDENT key set (matches the Brain's mode-aware
- * TARGET_SCHEMA): inbox/existing_page carry EXACTLY {mode, path, timeline_entry, body} (4
- * keys); update_page carries those + `base_compiled_hash` (5 keys). `base_compiled_hash` is
+ * TARGET_SCHEMA): inbox/existing_page/new_page carry EXACTLY {mode, path, timeline_entry, body}
+ * (4 keys); update_page carries those + `base_compiled_hash` (5 keys). `base_compiled_hash` is
  * present ONLY for update_page and OMITTED (never null) otherwise.
  */
 export interface PromotionArtifactTarget {
-  mode: 'existing_page' | 'inbox' | 'update_page';
+  mode: 'existing_page' | 'inbox' | 'update_page' | 'new_page';
   path: string;
   timeline_entry: string;
   body: string;
