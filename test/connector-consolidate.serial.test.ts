@@ -790,6 +790,9 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
   function makeEngine(opts: {
     hits?: SearchResult[];
     pages?: Record<string, Page>;
+    /** Source-scoped pages: `{ sourceId: { slug: Page } }`. When set, getPage
+     *  honors the lookup's sourceId (a page in another source is NOT visible). */
+    pagesBySource?: Record<string, Record<string, Page>>;
     config?: Record<string, string>;
   }) {
     const getPageCalls: Array<{ slug: string; sourceId?: string }> = [];
@@ -810,7 +813,16 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
       },
       getPage: async (slug: string, o?: { sourceId?: string }): Promise<Page | null> => {
         getPageCalls.push({ slug, sourceId: o?.sourceId });
-        return opts.pages?.[slug] ?? null;
+        // Respect source scoping: a page registered under a source is only
+        // visible to lookups scoped to that source (or unscoped — pre-existing
+        // semantics). `pages` registers SHARED-source pages (the durable default);
+        // `pagesBySource` keys explicitly and wins for its source.
+        const scope = o?.sourceId;
+        if (scope == null) return opts.pages?.[slug] ?? opts.pagesBySource?.['shared']?.[slug] ?? null;
+        const scoped = scope === 'shared'
+          ? { ...(opts.pages ?? {}), ...(opts.pagesBySource?.['shared'] ?? {}) }
+          : (opts.pagesBySource?.[scope] ?? {});
+        return scoped[slug] ?? null;
       },
       getConfig: async (key: string): Promise<string | null> => opts.config?.[key] ?? null,
     } as unknown as BrainEngine;
@@ -1590,6 +1602,49 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     const r = only(await callClassify(engine));
     expect(r.classification).toBe('ADD');
     expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD whose target exists but in MIXED CASE / .MD form → NEEDS_REVIEW (canonicalized)', async () => {
+    configureEmbedding();
+    // The store keys lowercase slug without .md; the classifier may emit
+    // mixed case or an uppercase .MD suffix. The shared canonicalizer must match.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'Docs/Glossary.MD', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pages: { 'docs/glossary': fakePage('docs/glossary', 'Existing glossary.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+  });
+
+  test('ADD whose target exists ONLY in another source stays ADD (source-scoped novelty)', async () => {
+    configureEmbedding();
+    // Slugs are unique PER SOURCE. A matching slug in an unrelated source must
+    // NOT downgrade a genuinely novel durable-source ADD.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pagesBySource: {
+        'capture-events': { 'docs/glossary': fakePage('docs/glossary', 'Raw capture.', 'capture-events') },
+      },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD whose target exists in the DURABLE source (source-scoped hit) → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The durable source is 'shared' by default — a page there IS the same slug.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pagesBySource: {
+        'shared': { 'docs/glossary': fakePage('docs/glossary', 'Durable glossary.', 'shared') },
+      },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
   });
 
   test('partial fan-out: one partition contradicts (NEEDS_REVIEW), the sibling still UPDATEs', async () => {

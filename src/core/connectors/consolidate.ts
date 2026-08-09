@@ -503,6 +503,32 @@ const DEFAULT_DURABLE_SOURCE = 'shared';
 const CONSOLIDATION_SEARCH_SOURCE_KEY = 'connectors.consolidation_search_source';
 
 /**
+ * Canonicalize a proposed page slug for store comparison. The classifier may
+ * emit `Docs/Glossary`, `docs/glossary.md`, or `DOCS/GLOSSARY.MD` — the store
+ * keys lowercase slugs WITHOUT the `.md` suffix. This is the SINGLE
+ * canonicalizer for every novelty/existence guard (Codex R3: the earlier
+ * inline `replace(/\.md$/)` missed mixed case and uppercase `.MD`).
+ */
+export function canonicalConsolidationSlug(slug: string): string {
+  return slug.trim().toLowerCase().replace(/\.md$/, '');
+}
+
+/**
+ * Resolve the durable-corpus source for ADD-novelty checks. Caller override →
+ * `connectors.consolidation_search_source` config → `shared` (the durable,
+ * human-reviewed corpus). MUST be used by BOTH the classify-time guard and the
+ * persist-time backstop — slugs are unique PER SOURCE, so a cross-source lookup
+ * would wrongly downgrade a genuinely novel ADD (Codex R3).
+ */
+export async function resolveConsolidationSearchSource(
+  engine: BrainEngine,
+  override?: string,
+): Promise<string> {
+  const configured = (await engine.getConfig(CONSOLIDATION_SEARCH_SOURCE_KEY))?.trim();
+  return override?.trim() || configured || DEFAULT_DURABLE_SOURCE;
+}
+
+/**
  * `<page>` data-envelope tag matcher (open/close, attribute-tolerant) — the
  * classifier's analogue of {@link CAPTURE_TAG_RX}. `INJECTION_PATTERNS` does not
  * cover `<page>`, so a candidate body containing `</page>` would otherwise break
@@ -577,8 +603,7 @@ export async function classifyConsolidationFacts(
   // durable corpus. A wrong/empty scope is FAIL-SAFE: 0 candidates → escalate to
   // Tier 2 (human-reviewed), never a false dedup. Operators whose durable source
   // id differs set the config key.
-  const configuredSource = (await input.engine.getConfig(CONSOLIDATION_SEARCH_SOURCE_KEY))?.trim();
-  const searchSource = input.searchSourceId?.trim() || configuredSource || DEFAULT_DURABLE_SOURCE;
+  const searchSource = await resolveConsolidationSearchSource(input.engine, input.searchSourceId);
 
   let hits: SearchResult[] = [];
   let topCosine: number | null = null;
@@ -686,7 +711,7 @@ export async function classifyConsolidationFacts(
   const verified: ConsolidationClassifyResult[] = [];
   for (const v of verdicts) {
     if (v.classification === 'ADD' && v.target_path != null) {
-      const normalizedSlug = v.target_path.trim().replace(/\.md$/, '');
+      const normalizedSlug = canonicalConsolidationSlug(v.target_path);
       let exists = false;
       try {
         exists = (await input.engine.getPage(normalizedSlug, { sourceId: searchSource })) != null;

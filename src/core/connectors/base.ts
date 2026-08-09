@@ -25,6 +25,7 @@ import {
 import { maybeAutoApprove } from './trust-tier.ts';
 import { minimize, strip, type RawConnectorItem } from './redact.ts';
 import { recordConsolidationDecision } from './consolidation-decisions.ts';
+import { canonicalConsolidationSlug, resolveConsolidationSearchSource } from './consolidate.ts';
 import type { ConsolidationClassifyResult } from './consolidate.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────────
@@ -540,21 +541,24 @@ async function persistOneVerdict(
     final = { ...verdict, classification: 'NEEDS_REVIEW' };
   }
 
-  // ADD-novelty guard (KTD-FIX, Codex R1/R2): the classifier's top-K check in
+  // ADD-novelty guard (KTD-FIX, Codex R1/R2/R3): the classifier's top-K check in
   // interpretOneClassification can MISS an existing page — a page outside the
-  // search candidate set, or proposed with a trailing `.md`. A misclassified ADD
-  // of an EXISTING page must never land as an auto-approvable duplicate, so
-  // re-check novelty against the REAL store here, normalized (strip `.md`).
+  // search candidate set, or proposed with a trailing `.md`/mixed case. A
+  // misclassified ADD of an EXISTING page must never land as a duplicate, so
+  // re-check novelty against the REAL store here, using the SAME canonicalizer
+  // and the SAME durable source as the classify-time guard (slugs are unique
+  // PER SOURCE — a cross-source lookup would wrongly downgrade a novel ADD).
   // Fail closed: a lookup error downgrades to NEEDS_REVIEW, never auto-ADD.
   if (
     !singleWriterDowngrade &&
     final.classification === 'ADD' &&
     verdict.target_path != null
   ) {
-    const normalizedSlug = verdict.target_path.trim().replace(/\.md$/, '');
+    const normalizedSlug = canonicalConsolidationSlug(verdict.target_path);
+    const durableSource = await resolveConsolidationSearchSource(engine);
     let addTargetExists = false;
     try {
-      addTargetExists = (await engine.getPage(normalizedSlug)) != null;
+      addTargetExists = (await engine.getPage(normalizedSlug, { sourceId: durableSource })) != null;
     } catch (err) {
       if (isAbortError(err)) throw err;
       console.error(
