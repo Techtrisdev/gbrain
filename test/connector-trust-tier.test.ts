@@ -16,7 +16,7 @@ function candidateRow(overrides: Partial<ConnectorCandidateRow> = {}): Connector
     version: '1',
     source_record_ids: [],
     provider: 'granola',
-    proposed_slug: 'docs/foo',
+    proposed_slug: 'playbooks/foo',
     proposed_markdown: '# Foo\n\nSubstantive connector candidate body.',
     confidence: 0.95,
     redactions: [],
@@ -29,7 +29,7 @@ function candidateRow(overrides: Partial<ConnectorCandidateRow> = {}): Connector
     acted_at: null,
     superseded_by: null,
     target_kind: null,
-    target_path: 'docs/foo.md',
+    target_path: 'playbooks/foo.md',
     promotion_status: null,
     promotion_pr_url: null,
     promotion_branch: null,
@@ -93,8 +93,14 @@ describe('trustTierDecision', () => {
     // PR review gate), so a high-confidence, safe-path, rationale-carrying ADD
     // with no redactions may auto-approve.
     expect(trustTierDecision(candidateRow())).toBe('auto_approve');
-    expect(trustTierDecision(candidateRow({ target_path: 'docs/foo.md' }))).toBe('auto_approve');
+    expect(trustTierDecision(candidateRow({ target_path: 'playbooks/foo.md' }))).toBe('auto_approve');
     expect(trustTierDecision(candidateRow({ classification: 'ADD', confidence: 0.99 }))).toBe('auto_approve');
+  });
+
+  test('docs/ is NOT auto-approvable — receiver new_page rejects docs/', () => {
+    // The path contract is aligned on playbooks/ only: the receiver's new_page
+    // mode accepts CONTENT_DIRS and explicitly rejects docs/ pages.
+    expect(trustTierDecision(candidateRow({ target_path: 'docs/foo.md' }))).toBe('human');
   });
 
   test('non-ADD classifications stay human', () => {
@@ -143,7 +149,7 @@ describe('trustTierDecision', () => {
 
 describe('maybeAutoApprove', () => {
   test('safe high-confidence ADD approves via new_page when enabled', async () => {
-    const row = candidateRow(); // ADD, confidence 0.95, docs/foo.md, rationale, no redactions
+    const row = candidateRow(); // ADD, confidence 0.95, playbooks/foo.md, rationale, no redactions
     const approve = mockApproval(row);
 
     await expect(
@@ -153,7 +159,7 @@ describe('maybeAutoApprove', () => {
     const [engine, id, actor, target] = approve.mock.calls[0];
     expect(id).toBe(123);
     expect(target.kind).toBe('new_page');
-    expect(target.path).toBe('docs/foo.md');
+    expect(target.path).toBe('playbooks/foo.md');
   });
 
   test('default-off config leaves a row untouched', async () => {

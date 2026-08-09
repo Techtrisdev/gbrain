@@ -20,8 +20,13 @@ export type TrustDecision = 'auto_approve' | 'human';
 export const AUTO_APPROVE_MIN_CONFIDENCE = 0.9;
 
 // Maximally conservative initial allow-list. Operators may tune this in a later
-// policy layer, but the code default intentionally limits auto-approval to docs.
-export const AUTO_APPROVE_ALLOWED_PATH_PREFIXES = ['docs/', 'playbooks/'] as const;
+// policy layer, but the code default intentionally limits auto-approval to
+// playbooks/ — the one path prefix BOTH the sender allowlist and the receiver's
+// new_page mode agree on. docs/ is deliberately excluded: the receiver's
+// new_page mode only accepts CONTENT_DIRS (clients/people/projects/
+// integrations/decisions/playbooks) and explicitly rejects docs/ pages (they
+// are not schema-valid under validate_page).
+export const AUTO_APPROVE_ALLOWED_PATH_PREFIXES = ['playbooks/'] as const;
 
 export const AUTO_PROMOTE_ENABLED_KEY = 'connectors.auto_promote_enabled';
 export const AUTO_PROMOTE_ACTOR = 'connector:auto-promote';

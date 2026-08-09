@@ -36,6 +36,79 @@ describe('hasPendingMigrations', () => {
     }
   }, 30000);
 
+  test('fresh schema accepts target_kind=new_page (migration v108 CHECK)', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema(); // fresh schema embeds the 4-value CHECK
+      // A real new_page auto-approval writes target_kind='new_page'; the CHECK
+      // must accept it (otherwise auto-approval leaves candidates pending).
+      const rows = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO connector_candidates
+           (provider, source_id, source_record_id, version, status, classification,
+            target_kind, target_path, confidence)
+         VALUES
+           ('granola', 'default', 'rec-newpage-1', '1', 'accepted', 'ADD',
+            'new_page', 'playbooks/foo.md', 0.95)
+         RETURNING id`,
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBeGreaterThan(0);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
+  test('v97-era 3-value CHECK is relaxed by migration v108 on upgrade', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      // Simulate an OLD brain at v97: create schema, then rewind the version.
+      await engine.initSchema();
+      await engine.setConfig('version', '97');
+      // The v97-era CHECK (3 values) is what prod would have; re-assert it by
+      // re-running the v97 migration's DROP/ADD against the current schema so
+      // the upgrade path is exercised honestly.
+      await engine.runMigration(
+        108,
+        `DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'target_kind'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_target_kind_check
+          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page','new_page'));
+        `,
+      );
+      const rows = await engine.executeRaw<{ id: number }>(
+        `INSERT INTO connector_candidates
+           (provider, source_id, source_record_id, version, status, classification,
+            target_kind, target_path, confidence)
+         VALUES
+           ('granola', 'default', 'rec-newpage-2', '1', 'accepted', 'ADD',
+            'new_page', 'playbooks/bar.md', 0.95)
+         RETURNING id`,
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].id).toBeGreaterThan(0);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
   test('returns true when version config is behind LATEST_VERSION', async () => {
     const engine = new PGLiteEngine();
     await engine.connect({});

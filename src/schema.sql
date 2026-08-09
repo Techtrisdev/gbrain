@@ -1226,7 +1226,7 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   -- All additive + nullable; old rows read NULL. Does NOT touch the `status` CHECK.
   -- 'update_page' (U6) is the consolidation UPDATE receiver mode; relaxed on
   -- existing DBs by migration v97 (catalog-resolved DROP/ADD).
-  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page')),
+  target_kind        TEXT          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page','new_page')),
   target_path        TEXT,
   promotion_status   TEXT          CHECK (promotion_status IS NULL OR promotion_status IN ('pr_opened','indexed','promoted_to_inbox','needs_fix','failed')),
   promotion_pr_url   TEXT,

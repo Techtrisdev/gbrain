@@ -4955,6 +4955,81 @@ export const MIGRATIONS: Migration[] = [
       return rows.length === 1;
     },
   },
+  {
+    version: 108,
+    name: 'connector_candidates_target_kind_new_page',
+    // New-page auto-approve (trust-tier new_page mode): RELAX the
+    // connector_candidates.`target_kind` CHECK to admit a 'new_page' value (the
+    // receiver's create-new-page mode — techtris-brain promote_candidate.py).
+    // Without this, a real DB write of target_kind='new_page' violates the
+    // 3-value CHECK and leaves the candidate pending: auto-approval would never
+    // dispatch.
+    //
+    // As v97/v99: the base CHECK is an UNNAMED inline column constraint, so we
+    // do NOT hardcode the auto-assigned name in DROP CONSTRAINT (a wrong literal
+    // is a SILENT no-op). Instead we RESOLVE every CHECK constraint whose
+    // `conkey` references the `target_kind` column from the catalog, drop each,
+    // then ADD a NAMED 4-value CHECK. Same catalog-resolved pattern as v97
+    // (which relaxed existing_page|inbox -> +update_page).
+    //
+    // FORWARD-ONLY: relaxes the CHECK only; no row UPDATE. The relaxed CHECK is
+    // a strict SUPERSET of the 3-value one, so Postgres VALIDATE over existing
+    // rows always succeeds.
+    //
+    // Idempotent: the catalog DROP-loop re-finds + drops the named 4-value CHECK
+    // and re-adds the same one (auto-name equals chosen name, but never relied
+    // on — the DROP resolves from the catalog).
+    idempotent: true,
+    sqlFor: {
+      postgres: `
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'target_kind'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_target_kind_check
+          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page','new_page')) NOT VALID;
+        ALTER TABLE connector_candidates
+          VALIDATE CONSTRAINT connector_candidates_target_kind_check;
+      `,
+      pglite: `
+        DO $$
+        DECLARE r record;
+        BEGIN
+          FOR r IN
+            SELECT con.conname
+              FROM pg_constraint con
+              JOIN pg_attribute att
+                ON att.attrelid = con.conrelid
+               AND att.attnum   = ANY (con.conkey)
+             WHERE con.conrelid = 'connector_candidates'::regclass
+               AND con.contype  = 'c'
+               AND att.attname  = 'target_kind'
+          LOOP
+            EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+          END LOOP;
+        END $$;
+
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_target_kind_check
+          CHECK (target_kind IS NULL OR target_kind IN ('existing_page','inbox','update_page','new_page'));
+      `,
+    },
+    sql: '', // engine-specific via sqlFor
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
