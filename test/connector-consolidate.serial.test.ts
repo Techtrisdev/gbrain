@@ -1555,6 +1555,43 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     expect(r.classification).toBe('NEEDS_REVIEW');
   });
 
+  test('ADD whose target EXISTS in the store (outside top-K) → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The classifier says ADD + names a page, but the search top-K does NOT
+    // include it (hits: []). The real-store lookup must catch it: a misclassified
+    // ADD of an existing page must never be presented as novel.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pages: { 'docs/glossary': fakePage('docs/glossary', 'Existing glossary.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
+  test('ADD whose target EXISTS only in .md form (normalized) → NEEDS_REVIEW', async () => {
+    configureEmbedding();
+    // The classifier proposed `docs/glossary.md`; the store keys without `.md`.
+    // Normalization (strip .md) must match the existing page.
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary.md', confidence: 0.95 }));
+    const { engine } = makeEngine({
+      hits: [],
+      pages: { 'docs/glossary': fakePage('docs/glossary', 'Existing glossary.', 'shared') },
+    });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('NEEDS_REVIEW');
+  });
+
+  test('ADD whose target is genuinely novel stays ADD (real-store miss)', async () => {
+    configureEmbedding();
+    stubChat(JSON.stringify({ classification: 'ADD', target: 'docs/glossary', confidence: 0.95 }));
+    const { engine } = makeEngine({ hits: [], pages: {} });
+    const r = only(await callClassify(engine));
+    expect(r.classification).toBe('ADD');
+    expect(r.target_path).toBe('docs/glossary');
+  });
+
   test('partial fan-out: one partition contradicts (NEEDS_REVIEW), the sibling still UPDATEs', async () => {
     configureEmbedding();
     stubChat(

@@ -677,7 +677,41 @@ export async function classifyConsolidationFacts(
   if (verdicts.length === 0) {
     return [result('NOOP', clampUnit(input.extractionConfidence), { tier1_cosine: topCosine, model })];
   }
-  return verdicts;
+  // ADD-novelty guard (Codex R2): the top-K `matched` check above can MISS an
+  // existing page — a page outside the search candidate set, or proposed with a
+  // trailing `.md`. A misclassified ADD of an EXISTING page must never be
+  // presented as a novel page (a human could approve a duplicate). Re-check
+  // novelty against the REAL store, source-scoped + normalized. Fail closed: a
+  // lookup error downgrades to NEEDS_REVIEW, never a false ADD.
+  const verified: ConsolidationClassifyResult[] = [];
+  for (const v of verdicts) {
+    if (v.classification === 'ADD' && v.target_path != null) {
+      const normalizedSlug = v.target_path.trim().replace(/\.md$/, '');
+      let exists = false;
+      try {
+        exists = (await input.engine.getPage(normalizedSlug, { sourceId: searchSource })) != null;
+      } catch (err) {
+        if (isAbort(err)) throw err;
+        console.error(
+          `[consolidation] ADD novelty lookup failed for ${normalizedSlug} — downgrading to NEEDS_REVIEW (fail-closed): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+        exists = true;
+      }
+      if (exists) {
+        verified.push(
+          result('NEEDS_REVIEW', v.confidence, {
+            target_path: v.target_path,
+            tier1_cosine: v.tier1_cosine,
+            model: v.model,
+          }),
+        );
+        continue;
+      }
+    }
+    verified.push(v);
+  }
+  return verified;
 }
 
 /** The parsed (pre-validation) Tier-2 output shape. */

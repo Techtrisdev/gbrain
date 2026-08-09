@@ -540,6 +540,34 @@ async function persistOneVerdict(
     final = { ...verdict, classification: 'NEEDS_REVIEW' };
   }
 
+  // ADD-novelty guard (KTD-FIX, Codex R1/R2): the classifier's top-K check in
+  // interpretOneClassification can MISS an existing page — a page outside the
+  // search candidate set, or proposed with a trailing `.md`. A misclassified ADD
+  // of an EXISTING page must never land as an auto-approvable duplicate, so
+  // re-check novelty against the REAL store here, normalized (strip `.md`).
+  // Fail closed: a lookup error downgrades to NEEDS_REVIEW, never auto-ADD.
+  if (
+    !singleWriterDowngrade &&
+    final.classification === 'ADD' &&
+    verdict.target_path != null
+  ) {
+    const normalizedSlug = verdict.target_path.trim().replace(/\.md$/, '');
+    let addTargetExists = false;
+    try {
+      addTargetExists = (await engine.getPage(normalizedSlug)) != null;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      console.error(
+        `[consolidation] ADD novelty lookup failed for ${normalizedSlug} — downgrading to NEEDS_REVIEW (fail-closed): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+      addTargetExists = true;
+    }
+    if (addTargetExists) {
+      final = { ...verdict, classification: 'NEEDS_REVIEW' };
+    }
+  }
+
   const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence, singleWriterDowngrade);
   // FU2: a transient row-INSERT throw must not strand this partition. `toRow` is an
   // idempotent INSERT … ON CONFLICT DO NOTHING (a duplicate key returns written:false,
