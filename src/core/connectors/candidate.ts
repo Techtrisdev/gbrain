@@ -855,7 +855,7 @@ export async function approveCandidate(
 
   // 3b. Egress substance backstop (fail-closed). The original guard fired only on an EMPTY
   //     consolidation UPDATE body (the receiver rejects an empty update_page body); EXTEND it
-  //     to EVERY target mode (inbox / existing_page / update_page) and to any SUB-THRESHOLD
+  //     to EVERY target mode (inbox / existing_page / update_page / new_page) and to any SUB-THRESHOLD
   //     body, so a manually-accepted title-only candidate (the "Westside Pizza <> Techtris
   //     Intro" incident — an admin accept of a contentless candidate) can never become a
   //     promotion PR. For a consolidation UPDATE the artifact body = row.proposed_markdown

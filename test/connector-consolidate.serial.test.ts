@@ -1532,7 +1532,7 @@ describe('classifyConsolidationFacts — U2 tiered classifier', () => {
     const r = only(await callClassify(engine));
     expect(r.classification).toBe('ADD');
     // The proposed slug survives interpretation — a human reviewer sees where the
-    // ADD belongs (and a future receiver new_page mode can auto-promote it).
+    // ADD belongs (and the receiver new_page mode can auto-promote safe ADDs).
     expect(r.target_path).toBe('docs/glossary');
   });
 

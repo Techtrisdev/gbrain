@@ -24,7 +24,7 @@
  *  - The artifact has EXACTLY 5 top-level keys (the Brain's validate_artifact fails closed
  *    on BOTH missing and unknown keys): provider, source_id, source_record_id,
  *    redaction_attestation, target. `target` is MODE-DEPENDENT (the Brain's validate_artifact
- *    is mode-aware): inbox/existing_page carry EXACTLY 4 keys (mode, path, timeline_entry,
+ *    is mode-aware): inbox/existing_page/new_page carry EXACTLY 4 keys (mode, path, timeline_entry,
  *    body); update_page carries EXACTLY 5 (those + base_compiled_hash, the KTD8 compiled-truth
  *    staleness hash — REQUIRED iff update_page, FORBIDDEN otherwise). base_compiled_hash is
  *    OMITTED (never null) for the 4-key modes — JSON.stringify drops an absent key but KEEPS a
@@ -52,8 +52,10 @@ import { mintAppJwt } from './github-app-jwt.ts';
  * The promotion target. `existing_page`/`inbox` are reviewer-selected; `update_page` is the
  * MACHINE-pre-computed Memory-Consolidation UPDATE target — its `path`, `timeline_entry`, and
  * `base_compiled_hash` are sourced from the stored candidate row at approve time (U4), NEVER
- * from the reviewer HTTP request. `existing_page` and `update_page` both require a non-empty
- * path; `update_page` ALSO requires a non-empty `base_compiled_hash` (KTD8 staleness guard).
+ * from the reviewer HTTP request. `new_page` is the machine auto-approve target for a safe
+ * high-confidence ADD (receiver creates a new draft page). `existing_page`, `new_page`, and
+ * `update_page` all require a non-empty path; `update_page` ALSO requires a non-empty
+ * `base_compiled_hash` (KTD8 staleness guard).
  */
 export interface PromotionTarget {
   kind: 'existing_page' | 'inbox' | 'update_page' | 'new_page';
@@ -109,7 +111,7 @@ export const PROMOTION_EVENT_TYPE = 'connector-promotion';
  * THIS write boundary (defense in depth — proposed_markdown was already stripped at
  * toRow, but the artifact is a fresh egress surface to an external repo).
  *
- * MODE-DEPENDENT shape (U4): for inbox/existing_page the `target` is the historical 4-key
+ * MODE-DEPENDENT shape (U4): for inbox/existing_page/new_page the `target` is the historical 4-key
  * object with a HARDCODED provenance `timeline_entry`. For `update_page` (the machine
  * consolidation UPDATE) the `target` carries the classifier's REAL dated `timeline_entry`
  * (from the effective target, which approveCandidate sourced from the stored row) plus a 5th
