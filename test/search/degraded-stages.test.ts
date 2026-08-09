@@ -18,7 +18,10 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { withEnv } from '../helpers/with-env.ts';
 import { runPostFusionStages, cosineReScore, hybridSearch } from '../../src/core/search/hybrid.ts';
+import { getRetrievalResponseMeta } from '../../src/core/search/retrieval-events.ts';
+import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import type { SearchResult, PageInput, HybridSearchMeta } from '../../src/core/types.ts';
@@ -106,6 +109,20 @@ describe('post-fusion stages report fail-open instead of swallowing', () => {
     expect(graphErrored).toBe(true);
     expect(seen).toEqual([]); // it does NOT throw — this is the point
     expect(rs).toHaveLength(2);
+  });
+
+  test('a THROWING observer cannot turn a degraded stage fatal (Codex R1)', async () => {
+    // The stage contract is fail-open. If the failure reporter itself throws
+    // (it is arbitrary caller code — it may throw while formatting `err`), the
+    // stage must STILL be non-fatal: results survive AND the throw is contained.
+    const rs = results();
+    await runPostFusionStages(throwingEngine(), rs, {
+      applyBacklinks: true,
+      salience: 'off',
+      recency: 'off',
+      onStageFailure: () => { throw new Error('observer exploded'); },
+    });
+    expect(rs).toHaveLength(2); // fail-OPEN preserved even when the observer throws
   });
 
   // NOT TESTED, deliberately, and recorded rather than quietly omitted: the
@@ -198,7 +215,6 @@ describe('cosineReScore reports its DB fail-open', () => {
  */
 describe('degraded stages reach _meta on the real search path', () => {
   let engine: PGLiteEngine;
-  const savedKey = process.env.OPENAI_API_KEY;
 
   beforeAll(async () => {
     engine = new PGLiteEngine();
@@ -219,18 +235,20 @@ describe('degraded stages reach _meta on the real search path', () => {
     await engine.upsertChunks('people/alice-example', [
       { chunk_index: 0, chunk_text: 'Alice Example is a test person for degraded-stage tests.', chunk_source: 'compiled_truth' },
     ]);
-    delete process.env.OPENAI_API_KEY; // keyword-only path; no embedding calls
   });
 
   afterAll(async () => {
-    if (savedKey === undefined) delete process.env.OPENAI_API_KEY;
-    else process.env.OPENAI_API_KEY = savedKey;
     await engine.disconnect();
   });
 
   async function metaFor(query: string): Promise<HybridSearchMeta | null> {
     let captured: HybridSearchMeta | null = null;
-    await hybridSearch(engine, query, { onMeta: (m) => { captured = m; } });
+    // Keyword-only path (no embedding calls): delete the key for the duration
+    // of the search via the repo's canonical withEnv helper — direct
+    // process.env mutation trips the check-test-isolation gate.
+    await withEnv({ OPENAI_API_KEY: undefined }, async () => {
+      await hybridSearch(engine, query, { onMeta: (m) => { captured = m; } });
+    });
     return captured;
   }
 
@@ -295,5 +313,46 @@ describe('degraded stages reach _meta on the real search path', () => {
     // Guards against collecting degradation in module scope instead of per-call.
     const meta = await metaFor('Alice');
     expect(meta?.degraded_stages).toBeUndefined();
+  });
+
+  test('operation level: a backlink outage reaches the final response _meta (Codex R1)', async () => {
+    // Codex R1 blocker 2: the search-layer meta tests prove the SINK fires, but
+    // the operations.ts copy (retrievalMeta.degraded_stages -> responseMeta) is
+    // what a retrieval caller actually sees. Drive the REAL query op handler and
+    // read the attached response meta via getRetrievalResponseMeta.
+    const op = operationsByName['query'];
+    const ctx = {
+      engine, remote: false, config: {}, logger: console, dryRun: false,
+      auth: { clientName: 'dg-r1', sourceId: 'default' }, sourceId: 'default',
+    } as unknown as OperationContext;
+    const original = engine.getBacklinkCounts.bind(engine);
+    (engine as unknown as { getBacklinkCounts: unknown }).getBacklinkCounts = async () => {
+      throw new Error('simulated backlink outage');
+    };
+    try {
+      await withEnv({ OPENAI_API_KEY: undefined }, async () => {
+        const out = await op.handler(ctx, { query: 'Alice', limit: 10 }) as SearchResult[];
+        // Fail-open: results still returned.
+        expect(out.length).toBeGreaterThan(0);
+        const meta = getRetrievalResponseMeta(out);
+        expect(meta?.degraded_stages).toContain('backlink');
+      });
+    } finally {
+      (engine as unknown as { getBacklinkCounts: unknown }).getBacklinkCounts = original;
+    }
+  });
+
+  test('operation level: a healthy query has NO degraded_stages on the final response (Codex R1)', async () => {
+    const op = operationsByName['query'];
+    const ctx = {
+      engine, remote: false, config: {}, logger: console, dryRun: false,
+      auth: { clientName: 'dg-r1', sourceId: 'default' }, sourceId: 'default',
+    } as unknown as OperationContext;
+    await withEnv({ OPENAI_API_KEY: undefined }, async () => {
+      const out = await op.handler(ctx, { query: 'Alice', limit: 10 }) as SearchResult[];
+      expect(out.length).toBeGreaterThan(0);
+      const meta = getRetrievalResponseMeta(out);
+      expect(meta?.degraded_stages).toBeUndefined();
+    });
   });
 });

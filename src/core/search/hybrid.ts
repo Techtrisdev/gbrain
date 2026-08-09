@@ -333,6 +333,20 @@ export async function runPostFusionStages(
   opts: PostFusionOpts,
 ): Promise<void> {
   if (results.length === 0) return;
+  // Codex R1 (PR #96): a failure observer must NEVER be allowed to turn a
+  // degraded-but-fail-open stage into a fatal one. The observer is arbitrary
+  // caller code (it may throw while formatting `err`), so every callback goes
+  // through this no-throw notifier: the stage contract stays fail-open no
+  // matter what the observer does.
+  const notifyFailure = (stage: string, err: unknown): void => {
+    try {
+      opts.onStageFailure?.(stage, err);
+    } catch {
+      // The observer itself failed. The stage is STILL non-fatal — the
+      // response must not fail because the failure reporter failed.
+    }
+  };
+
 
   // v0.40.4 attribution stamp (D12=A) — capture base_score ONCE at entry,
   // BEFORE any boost mutates r.score. Without this, --explain can't
@@ -361,7 +375,7 @@ export async function runPostFusionStages(
       // Still non-fatal; preserves the existing pre-v0.29.1 contract. The only
       // change is that the skip is now reported — results served without the
       // backlink boost were previously indistinguishable from boosted ones.
-      opts.onStageFailure?.('backlink', err);
+      notifyFailure('backlink', err);
     }
   }
 
@@ -379,7 +393,7 @@ export async function runPostFusionStages(
       applySalienceBoost(results, scores, opts.salience, floorThreshold);
     } catch (err) {
       // Still non-fatal; reported so the missing boost is visible.
-      opts.onStageFailure?.('salience', err);
+      notifyFailure('salience', err);
     }
   }
 
@@ -399,7 +413,7 @@ export async function runPostFusionStages(
       );
     } catch (err) {
       // Still non-fatal; reported so the missing decay is visible.
-      opts.onStageFailure?.('recency', err);
+      notifyFailure('recency', err);
     }
   }
 
@@ -420,7 +434,7 @@ export async function runPostFusionStages(
     } catch (err) {
       // Still non-fatal; preserves the per-stage contract. Reported so a
       // silently-absent graph-signals stage is not read as "signals didn't fire".
-      opts.onStageFailure?.('graph_signals', err);
+      notifyFailure('graph_signals', err);
     }
   }
 }
@@ -1648,6 +1662,17 @@ export async function hybridSearchCached(
       : {}),
     ...(innerMeta?.reranker_failed ? { reranker_failed: true } : {}),
     ...(innerMeta?.keyword_relaxed ? { keyword_relaxed: true } : {}),
+    // v0.46 — carry degraded_stages up from the inner hybridSearch. The
+    // reconstructed meta enumerates fields, so without this the post-fusion
+    // stage failures reached innerMeta and were then DROPPED before the
+    // operations.ts copy — a retrieval caller saw a healthy _meta. This is
+    // the field the operations layer (operations.ts attachRetrievalResponseMeta
+    // path) forwards to the final response; dropping it here defeated the
+    // entire degraded-mode honesty feature on the cached path (Codex R1,
+    // operation-level test caught it).
+    ...(innerMeta?.degraded_stages?.length
+      ? { degraded_stages: [...innerMeta.degraded_stages] }
+      : {}),
     // v0.43 — carry the answerability verdict up from the inner hybridSearch so
     // the cache writeback (query_cache.meta) records the shadow harvest signal.
     ...(innerMeta?.answerability_outcome !== undefined
@@ -1834,7 +1859,12 @@ export async function cosineReScore(
     // But an un-rescored return is served in plain RRF order, which is a DIFFERENT
     // ranking from the one the caller thinks it asked for. Previously that was
     // invisible; now it is reported so `_meta.degraded_stages` can say so.
-    onFailure?.(err);
+    // Codex R1 (PR #96): the reporter must not be allowed to make this fatal.
+    try {
+      onFailure?.(err);
+    } catch {
+      // Observer failed; stage is STILL fail-open.
+    }
     return results;
   }
 
