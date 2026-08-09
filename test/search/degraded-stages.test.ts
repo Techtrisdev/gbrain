@@ -204,6 +204,22 @@ describe('cosineReScore reports its DB fail-open', () => {
     expect(reported).toBeNull();
     expect(out).toBe(noChunks);
   });
+
+  test('a THROWING observer cannot turn the rescore fail-open fatal (Codex R2 advisory)', async () => {
+    // Codex R2 advisory 1: the shared post-fusion notifier test covers
+    // runPostFusionStages, but cosineReScore has its OWN try/catch around
+    // onFailure?.() — pin that independently so a regression in the rescore
+    // path can't hide behind the other test.
+    const rs = results();
+    const out = await cosineReScore(
+      throwingEngine(),
+      rs,
+      new Float32Array([1, 0, 0]),
+      'embedding',
+      () => { throw new Error('observer exploded'); },
+    );
+    expect(out).toBe(rs); // fail-OPEN preserved even when the observer throws
+  });
 });
 
 /**
