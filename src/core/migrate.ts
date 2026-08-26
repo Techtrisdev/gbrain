@@ -5132,7 +5132,7 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
     verify: async (engine) => {
-      const rows = await engine.executeRaw<{ table_name: string }>(
+      const tables = await engine.executeRaw<{ table_name: string }>(
         `SELECT table_name FROM information_schema.tables
           WHERE table_schema = 'public'
             AND table_name IN (
@@ -5143,7 +5143,187 @@ export const MIGRATIONS: Migration[] = [
               'context_mirror_checkpoints'
             )`,
       );
-      return new Set(rows.map((row) => row.table_name)).size === 5;
+      return new Set(tables.map((row) => row.table_name)).size === 5;
+    },
+  },
+  {
+    version: 110,
+    name: 'context_mirror_generation_and_review_ledger',
+    idempotent: true,
+    sql: `
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_session_id TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_generation INTEGER;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_partition TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS requires_human_review BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS evidence_trust TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS review_warning TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS evidence_trust TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS review_warning TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS requires_human_review BOOLEAN NOT NULL DEFAULT false;
+
+      DO $$
+      DECLARE r record;
+      BEGIN
+        FOR r IN
+          SELECT con.conname
+            FROM pg_constraint con
+            JOIN pg_attribute att
+              ON att.attrelid = con.conrelid
+             AND att.attnum = ANY (con.conkey)
+           WHERE con.conrelid = 'connector_candidates'::regclass
+             AND con.contype = 'c'
+             AND att.attname = 'status'
+        LOOP
+          EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+        END LOOP;
+      END $$;
+      ALTER TABLE connector_candidates
+        ADD CONSTRAINT connector_candidates_status_check
+        CHECK (status IN ('pending','accepted','rejected','needs_review','awaiting_review_capacity'));
+
+      DO $$ BEGIN
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_context_generation_check
+          CHECK (context_generation IS NULL OR context_generation >= 1);
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+      DO $$ BEGIN
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_evidence_trust_check
+          CHECK (evidence_trust IS NULL OR evidence_trust = 'untrusted_transcript');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+      DO $$ BEGIN
+        ALTER TABLE consolidation_decisions
+          ADD CONSTRAINT consolidation_decisions_evidence_trust_check
+          CHECK (evidence_trust IS NULL OR evidence_trust = 'untrusted_transcript');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+      CREATE INDEX IF NOT EXISTS connector_candidates_context_lineage_idx
+        ON connector_candidates (source_id, context_session_id, context_generation, context_partition)
+        WHERE context_session_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS context_mirror_generations (
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        input_hash TEXT NOT NULL,
+        originator TEXT,
+        runtime TEXT,
+        transform_version TEXT NOT NULL,
+        model TEXT NOT NULL,
+        expected_manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
+        expected_partitions INTEGER NOT NULL DEFAULT 0 CHECK (expected_partitions >= 0),
+        materialized_partitions INTEGER NOT NULL DEFAULT 0 CHECK (materialized_partitions >= 0),
+        state TEXT NOT NULL DEFAULT 'building'
+          CHECK (state IN ('building','complete','superseded','quarantined','unverified_legacy')),
+        is_current BOOLEAN NOT NULL DEFAULT true,
+        requires_human_review BOOLEAN NOT NULL DEFAULT false,
+        recovery_hold BOOLEAN NOT NULL DEFAULT false,
+        completed_at TIMESTAMPTZ,
+        superseded_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, session_id, generation),
+        FOREIGN KEY (source_id, session_id)
+          REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_generations_current_idx
+        ON context_mirror_generations (source_id, session_id) WHERE is_current;
+      CREATE INDEX IF NOT EXISTS context_mirror_generations_ready_idx
+        ON context_mirror_generations (source_id, state, completed_at, session_id, generation)
+        WHERE is_current AND state = 'complete';
+
+      CREATE TABLE IF NOT EXISTS context_mirror_partitions (
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        partition_key TEXT NOT NULL,
+        distilled_slug TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending'
+          CHECK (state IN ('pending','claimed','decided','degraded','failed','superseded','unverified_legacy')),
+        claim_id TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        candidate_id BIGINT REFERENCES connector_candidates(id) ON DELETE SET NULL,
+        decision_classification TEXT,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        decided_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, session_id, generation, partition_key),
+        FOREIGN KEY (source_id, session_id, generation)
+          REFERENCES context_mirror_generations(source_id, session_id, generation) ON DELETE CASCADE,
+        CONSTRAINT context_mirror_partitions_claim_shape CHECK (
+          (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+          OR state <> 'claimed'
+        )
+      );
+      CREATE INDEX IF NOT EXISTS context_mirror_partitions_pending_idx
+        ON context_mirror_partitions (source_id, created_at, session_id, generation, partition_key)
+        WHERE state = 'pending';
+
+      CREATE TABLE IF NOT EXISTS context_mirror_review_reservations (
+        reservation_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        cohort_kind TEXT NOT NULL DEFAULT 'fresh' CHECK (cohort_kind IN ('fresh','historical')),
+        reserved_slots INTEGER NOT NULL CHECK (reserved_slots >= 0),
+        reserved_bytes BIGINT NOT NULL CHECK (reserved_bytes >= 0),
+        state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','consumed','released','expired')),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (source_id, session_id, generation),
+        FOREIGN KEY (source_id, session_id, generation)
+          REFERENCES context_mirror_generations(source_id, session_id, generation) ON DELETE CASCADE,
+        CONSTRAINT context_mirror_review_reservation_active_shape CHECK (
+          state <> 'active' OR (reserved_slots > 0 AND reserved_bytes > 0)
+        )
+      );
+
+      CREATE TABLE IF NOT EXISTS context_mirror_recovery_holds (
+        source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+        active BOOLEAN NOT NULL DEFAULT false,
+        reason TEXT NOT NULL DEFAULT '',
+        held_at TIMESTAMPTZ,
+        released_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT context_mirror_recovery_hold_shape CHECK (
+          (active AND held_at IS NOT NULL AND released_at IS NULL) OR NOT active
+        )
+      );
+    `,
+    verify: async (engine) => {
+      const tables = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'context_mirror_generations',
+              'context_mirror_partitions',
+              'context_mirror_review_reservations',
+              'context_mirror_recovery_holds'
+            )`,
+      );
+      const columns = await engine.executeRaw<{ table_name: string; column_name: string }>(
+        `SELECT table_name, column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND (
+              (table_name = 'connector_candidates' AND column_name IN (
+                'context_session_id','context_generation','context_partition','correlation_id',
+                'requires_human_review','evidence_trust','review_warning'
+              ))
+              OR
+              (table_name = 'consolidation_decisions' AND column_name IN (
+                'correlation_id','requires_human_review','evidence_trust','review_warning'
+              ))
+            )`,
+      );
+      return new Set(tables.map((row) => row.table_name)).size === 4
+        && new Set(columns.map((row) => `${row.table_name}.${row.column_name}`)).size === 11;
     },
   },
 ];

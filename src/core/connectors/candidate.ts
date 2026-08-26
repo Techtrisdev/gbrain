@@ -72,9 +72,19 @@ export interface ConnectorCandidateItem {
   base_compiled_hash?: string | null;
   /** Candidate status override. NOOP lands 'rejected' (off the pending queue); a GENUINE
    *  contradiction lands 'needs_review' (a distinct review surface, T6). Default 'pending'. */
-  status?: 'pending' | 'accepted' | 'rejected' | 'needs_review';
+  status?: 'pending' | 'accepted' | 'rejected' | 'needs_review' | 'awaiting_review_capacity';
   /** Status reason. NOOP sets 'NOOP'. strip()'d. Default null. */
   status_reason?: string | null;
+  /** Context Mirror lineage. Absent for ordinary SaaS connector candidates. */
+  context_session_id?: string | null;
+  context_generation?: number | null;
+  context_partition?: string | null;
+  correlation_id?: string | null;
+  /** Corrections and recovered evidence can never use trust-tier auto approval. */
+  requires_human_review?: boolean;
+  /** Provenance boundary: transcript-derived text is untrusted quoted evidence. */
+  evidence_trust?: 'untrusted_transcript' | null;
+  review_warning?: string | null;
 }
 
 // ── Row type (what we insert / return) ────────────────────────────────────────
@@ -97,7 +107,7 @@ export interface ConnectorCandidateRow {
   expires_at: Date | null;
   as_of: Date | null;
   rationale_ref: string | null;
-  status: 'pending' | 'accepted' | 'rejected' | 'needs_review';
+  status: 'pending' | 'accepted' | 'rejected' | 'needs_review' | 'awaiting_review_capacity';
   status_reason: string | null;
   acted_by: string | null;
   acted_at: Date | null;
@@ -116,6 +126,13 @@ export interface ConnectorCandidateRow {
   base_compiled_hash: string | null;
   timeline_entry: string | null;
   classification: ConsolidationClassification | null;
+  context_session_id: string | null;
+  context_generation: number | null;
+  context_partition: string | null;
+  correlation_id: string | null;
+  requires_human_review: boolean;
+  evidence_trust: 'untrusted_transcript' | null;
+  review_warning: string | null;
   proposed_at: Date;
 }
 
@@ -273,6 +290,13 @@ function buildCandidateRow(
     classification: item.classification ?? null,
     timeline_entry: item.timeline_entry != null ? strip(item.timeline_entry) : null,
     base_compiled_hash: item.base_compiled_hash ?? null,
+    context_session_id: item.context_session_id != null ? strip(item.context_session_id) : null,
+    context_generation: item.context_generation ?? null,
+    context_partition: item.context_partition != null ? strip(item.context_partition) : null,
+    correlation_id: item.correlation_id != null ? strip(item.correlation_id) : null,
+    requires_human_review: item.requires_human_review ?? false,
+    evidence_trust: item.evidence_trust ?? null,
+    review_warning: item.review_warning != null ? strip(item.review_warning) : null,
   };
 }
 
@@ -322,6 +346,7 @@ export async function toRow(
   //  $20  classification     TEXT
   //  $21  timeline_entry     TEXT
   //  $22  base_compiled_hash TEXT
+  //  $23..$29 Context Mirror lineage and trust metadata
   const params: unknown[] = [
     candidate.source_id,            // $1
     candidate.source_record_id,     // $2
@@ -345,6 +370,13 @@ export async function toRow(
     candidate.classification,       // $20
     candidate.timeline_entry,       // $21
     candidate.base_compiled_hash,   // $22
+    candidate.context_session_id,   // $23
+    candidate.context_generation,   // $24
+    candidate.context_partition,    // $25
+    candidate.correlation_id,       // $26
+    candidate.requires_human_review,// $27
+    candidate.evidence_trust,       // $28
+    candidate.review_warning,       // $29
   ];
 
   const insertSql = `
@@ -356,7 +388,9 @@ export async function toRow(
       redactions,
       expires_at, as_of, rationale_ref,
       status, status_reason, acted_by, acted_at, superseded_by,
-      target_kind, target_path, classification, timeline_entry, base_compiled_hash
+      target_kind, target_path, classification, timeline_entry, base_compiled_hash,
+      context_session_id, context_generation, context_partition, correlation_id,
+      requires_human_review, evidence_trust, review_warning
     ) VALUES (
       $1, $2, $3,
       $4::text[],
@@ -365,7 +399,8 @@ export async function toRow(
       $9::jsonb,
       $10, $11, $12,
       $13, $14, $15, $16, $17,
-      $18, $19, $20, $21, $22
+      $18, $19, $20, $21, $22,
+      $23, $24, $25, $26, $27, $28, $29
     )
     ON CONFLICT (source_id, source_record_id, version) DO NOTHING
     RETURNING ${CANDIDATE_COLUMNS}
@@ -460,6 +495,8 @@ const CANDIDATE_COLS = [
   'promotion_branch', 'promoted_at', 'artifact_hash',
   // Memory Consolidation Engine (U6 columns / U3 writer)
   'base_compiled_hash', 'timeline_entry', 'classification',
+  'context_session_id', 'context_generation', 'context_partition', 'correlation_id',
+  'requires_human_review', 'evidence_trust', 'review_warning',
   'proposed_at',
 ] as const;
 /** Bare column list, for RETURNING / unqualified SELECT. */
@@ -591,6 +628,10 @@ export async function sweepExpiredCandidates(engine: BrainEngine): Promise<numbe
   const rows = await engine.executeRaw<{ id: number }>(
     `DELETE FROM connector_candidates
       WHERE expires_at IS NOT NULL AND expires_at < now() AND status <> 'accepted'
+        AND NOT EXISTS (
+          SELECT 1 FROM context_mirror_recovery_holds h
+           WHERE h.source_id = connector_candidates.source_id AND h.active
+        )
       RETURNING id`,
     [],
   );

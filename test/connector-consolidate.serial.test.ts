@@ -419,6 +419,10 @@ describe('recordConsolidationDecision — decision-log writer', () => {
       targetPath: 'people/alice-example.md',
       tier1Cosine: 0.41,
       model: 'anthropic:claude-sonnet-4-6',
+      correlationId: 'default:session-1:g2:mem-1',
+      evidenceTrust: 'untrusted_transcript' as const,
+      reviewWarning: 'Transcript evidence requires human review.',
+      requiresHumanReview: true,
     };
 
     expect((await recordConsolidationDecision(pglite, decision)).written).toBe(true);
@@ -431,8 +435,13 @@ describe('recordConsolidationDecision — decision-log writer', () => {
       target_path: string;
       tier1_cosine: number;
       model: string;
+      correlation_id: string;
+      evidence_trust: string;
+      review_warning: string;
+      requires_human_review: boolean;
     }>(
-      `SELECT classification, confidence, target_path, tier1_cosine, model
+      `SELECT classification, confidence, target_path, tier1_cosine, model,
+              correlation_id, evidence_trust, review_warning, requires_human_review
          FROM consolidation_decisions
         WHERE source_id = 'default' AND source_record_id = 'rec-1' AND version = '1'`,
     );
@@ -441,6 +450,10 @@ describe('recordConsolidationDecision — decision-log writer', () => {
     expect(rows[0].target_path).toBe('people/alice-example.md');
     expect(Math.abs(rows[0].confidence - 0.82)).toBeLessThan(1e-6);
     expect(Math.abs(rows[0].tier1_cosine - 0.41)).toBeLessThan(1e-6);
+    expect(rows[0].correlation_id).toBe('default:session-1:g2:mem-1');
+    expect(rows[0].evidence_trust).toBe('untrusted_transcript');
+    expect(rows[0].review_warning).toBe('Transcript evidence requires human review.');
+    expect(rows[0].requires_human_review).toBe(true);
   });
 
   test('a different classification for the same tuple is a distinct audit row', async () => {

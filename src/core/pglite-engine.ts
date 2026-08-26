@@ -863,6 +863,10 @@ export class PGLiteEngine implements BrainEngine {
       `DELETE FROM pages
        WHERE deleted_at IS NOT NULL
          AND deleted_at < now() - ($1 || ' hours')::interval
+         AND NOT EXISTS (
+           SELECT 1 FROM context_mirror_recovery_holds h
+            WHERE h.source_id = pages.source_id AND h.active
+         )
        RETURNING slug`,
       [hours]
     );

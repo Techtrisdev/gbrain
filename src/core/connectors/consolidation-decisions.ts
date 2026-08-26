@@ -61,6 +61,14 @@ export interface ConsolidationDecisionInput {
   tier1Cosine?: number | null;
   /** The model that produced the decision (nullable). */
   model?: string | null;
+  /** Context Mirror generation/partition correlation id (nullable for other connectors). */
+  correlationId?: string | null;
+  /** Evidence trust classification carried into the immutable audit row. */
+  evidenceTrust?: 'untrusted_transcript' | null;
+  /** Human-facing warning that must survive candidate lifecycle changes. */
+  reviewWarning?: string | null;
+  /** Historical repair/correction evidence can never auto-promote. */
+  requiresHumanReview?: boolean;
 }
 
 /**
@@ -76,10 +84,12 @@ export async function recordConsolidationDecision(
   const rows = await engine.executeRaw<{ id: number }>(
     `INSERT INTO consolidation_decisions (
        source_id, source_record_id, version,
-       classification, confidence, target_path, tier1_cosine, model
+       classification, confidence, target_path, tier1_cosine, model,
+       correlation_id, evidence_trust, review_warning, requires_human_review
      ) VALUES (
        $1, $2, $3,
-       $4, $5, $6, $7, $8
+       $4, $5, $6, $7, $8,
+       $9, $10, $11, $12
      )
      ON CONFLICT (source_id, source_record_id, version, classification) DO NOTHING
      RETURNING id`,
@@ -92,6 +102,10 @@ export async function recordConsolidationDecision(
       input.targetPath ?? null,
       input.tier1Cosine ?? null,
       input.model ?? null,
+      input.correlationId ?? null,
+      input.evidenceTrust ?? null,
+      input.reviewWarning ?? null,
+      input.requiresHumanReview ?? false,
     ],
   );
   return { written: rows.length > 0 };

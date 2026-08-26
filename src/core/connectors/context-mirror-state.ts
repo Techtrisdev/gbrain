@@ -5,6 +5,12 @@ import type { BrainEngine } from '../engine.ts';
 const BOOTSTRAP_CHECKPOINT = 'capture_session_scan_v1';
 const DEFAULT_BOOTSTRAP_BATCH = 5_000;
 const CLAIM_LEASE_MS = 15 * 60_000;
+const PARTITION_LEASE_MS = 15 * 60_000;
+const REVIEW_RESERVATION_MS = 60 * 60_000;
+const DEFAULT_PENDING_REVIEW_LIMIT = 10;
+const DEFAULT_STAGING_LIMIT = 50;
+const DEFAULT_STAGING_BYTES = 25 * 1024 * 1024;
+const DEFAULT_REVIEW_MAX_AGE_HOURS = 7 * 24;
 
 export interface DurableSessionHead {
   sessionId: string;
@@ -36,6 +42,60 @@ export interface PersistedProviderResult {
   usage: Record<string, number>;
 }
 
+export interface ContextGenerationInput {
+  sourceId: string;
+  sessionId: string;
+  generation: number;
+  inputHash: string;
+  originator: string | null;
+  runtime: string | null;
+  transformVersion: string;
+  model: string;
+  requiresHumanReview?: boolean;
+}
+
+export interface ContextGenerationPartition {
+  partitionKey: string;
+  distilledSlug: string;
+  contentHash: string;
+}
+
+export interface ClaimedContextPartition extends ContextGenerationPartition {
+  sourceId: string;
+  sessionId: string;
+  generation: number;
+  claimId: string;
+  requiresHumanReview: boolean;
+}
+
+export interface ReviewCapacitySnapshot {
+  pendingLimit: number;
+  stagingLimit: number;
+  stagingBytesLimit: number;
+  humanPending: number;
+  staged: number;
+  stagedBytes: number;
+  reservedSlots: number;
+  reservedBytes: number;
+  freshQuota: number;
+  humanOldestAt: Date | null;
+  stagedOldestAt: Date | null;
+  humanMaxAgeHours: number;
+  stagingMaxAgeHours: number;
+  humanAgeExceeded: boolean;
+  stagingAgeExceeded: boolean;
+  historicalHuman: number;
+  historicalStaged: number;
+  historicalReservedSlots: number;
+}
+
+export interface ContextMirrorRecoveryHold {
+  active: boolean;
+  reason: string;
+  heldAt: Date | null;
+  releasedAt: Date | null;
+}
+
 interface CaptureMetadataRow {
   id: number | string;
   slug: string;
@@ -54,6 +114,64 @@ interface ScanCursor {
 export function supportsContextMirrorOperationalState(engine: BrainEngine): boolean {
   const row = engine as BrainEngine & { sql?: unknown; db?: unknown };
   return (engine.kind === 'postgres' && row.sql != null) || (engine.kind === 'pglite' && row.db != null);
+}
+
+export async function readContextMirrorRecoveryHold(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<ContextMirrorRecoveryHold> {
+  const rows = await engine.executeRaw<{
+    active: boolean;
+    reason: string;
+    held_at: Date | string | null;
+    released_at: Date | string | null;
+  }>(
+    `SELECT active, reason, held_at, released_at
+       FROM context_mirror_recovery_holds WHERE source_id = $1`,
+    [sourceId],
+  );
+  const row = rows[0];
+  return {
+    active: row?.active === true,
+    reason: row?.reason ?? '',
+    heldAt: row?.held_at ? new Date(row.held_at) : null,
+    releasedAt: row?.released_at ? new Date(row.released_at) : null,
+  };
+}
+
+/** Operator-facing state primitive used by the guarded deployment/recovery
+ * workflow. An empty reason can never activate the hold. */
+export async function setContextMirrorRecoveryHold(
+  engine: BrainEngine,
+  sourceId: string,
+  active: boolean,
+  reason: string,
+): Promise<ContextMirrorRecoveryHold> {
+  const cleanReason = reason.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240);
+  if (active && !cleanReason) throw new Error('context mirror recovery hold requires a reason');
+  await engine.executeRaw(
+    `INSERT INTO context_mirror_recovery_holds (
+       source_id, active, reason, held_at, released_at, updated_at
+     ) VALUES (
+       $1, $2, $3,
+       CASE WHEN $2 THEN now() ELSE NULL END,
+       CASE WHEN $2 THEN NULL ELSE now() END,
+       now()
+     )
+     ON CONFLICT (source_id) DO UPDATE SET
+       active = EXCLUDED.active,
+       reason = EXCLUDED.reason,
+       held_at = CASE
+         WHEN EXCLUDED.active AND context_mirror_recovery_holds.active
+           THEN context_mirror_recovery_holds.held_at
+         WHEN EXCLUDED.active THEN now()
+         ELSE context_mirror_recovery_holds.held_at
+       END,
+       released_at = CASE WHEN EXCLUDED.active THEN NULL ELSE now() END,
+       updated_at = now()`,
+    [sourceId, active, cleanReason],
+  );
+  return await readContextMirrorRecoveryHold(engine, sourceId);
 }
 
 function parseJsonObject(value: unknown): Record<string, unknown> {
@@ -518,4 +636,537 @@ export async function releaseSessionClaim(
       WHERE source_id = $1 AND session_id = $2 AND claim_id = $3 AND state = 'claimed'`,
     [args.sourceId, args.sessionId, args.claimId],
   );
+}
+
+/** Create the current generation before any provider send. A changed input hash
+ * can never be smuggled into the same generation identity. */
+export async function ensureContextGeneration(
+  engine: BrainEngine,
+  input: ContextGenerationInput,
+): Promise<void> {
+  await engine.transaction(async (tx) => {
+    const existing = await tx.executeRaw<{ input_hash: string }>(
+      `SELECT input_hash FROM context_mirror_generations
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    if (existing[0] && existing[0].input_hash !== input.inputHash) {
+      throw new Error('context mirror generation input hash changed without a generation increment');
+    }
+    await tx.executeRaw(
+      `UPDATE context_mirror_generations
+          SET is_current = false,
+              state = CASE WHEN state = 'complete' THEN 'superseded' ELSE state END,
+              superseded_at = COALESCE(superseded_at, now()), updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation <> $3 AND is_current`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    await tx.executeRaw(
+      `UPDATE context_mirror_partitions
+          SET state = 'superseded', claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation <> $3
+          AND state IN ('pending','claimed','failed')`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    await tx.executeRaw(
+      `UPDATE context_mirror_review_reservations
+          SET state = 'released', updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation <> $3 AND state = 'active'`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    await tx.executeRaw(
+      `INSERT INTO context_mirror_generations (
+         source_id, session_id, generation, input_hash, originator, runtime,
+         transform_version, model, state, is_current, requires_human_review
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'building',true,$9)
+       ON CONFLICT (source_id, session_id, generation) DO UPDATE SET
+         originator = COALESCE(EXCLUDED.originator, context_mirror_generations.originator),
+         runtime = COALESCE(EXCLUDED.runtime, context_mirror_generations.runtime),
+         transform_version = EXCLUDED.transform_version,
+         model = EXCLUDED.model,
+         is_current = true,
+         requires_human_review = context_mirror_generations.requires_human_review OR EXCLUDED.requires_human_review,
+         updated_at = now()`,
+      [
+        input.sourceId, input.sessionId, input.generation, input.inputHash,
+        input.originator, input.runtime, input.transformVersion, input.model,
+        input.requiresHumanReview ?? false,
+      ],
+    );
+  });
+}
+
+/** Verify the materialized page/chunk manifest, then make the generation visible
+ * to consolidation and seed one durable partition row per memory. */
+export async function completeContextGeneration(
+  engine: BrainEngine,
+  input: ContextGenerationInput & { partitions: ContextGenerationPartition[] },
+): Promise<void> {
+  await engine.transaction(async (tx) => {
+    const verified = input.partitions.length === 0
+      ? 0
+      : Number((await tx.executeRaw<{ count: number | string }>(
+          `SELECT count(DISTINCT p.slug) AS count
+             FROM pages p
+             JOIN content_chunks c ON c.page_id = p.id
+            WHERE p.source_id = $1 AND p.deleted_at IS NULL
+              AND p.slug = ANY($2::text[])`,
+          [input.sourceId, input.partitions.map((part) => part.distilledSlug)],
+        ))[0]?.count ?? 0);
+    if (verified !== input.partitions.length) {
+      throw new Error(`context mirror generation manifest incomplete: ${verified}/${input.partitions.length} pages chunked`);
+    }
+    const generationRows = await tx.executeRaw<{ input_hash: string }>(
+      `SELECT input_hash FROM context_mirror_generations
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3 FOR UPDATE`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    if (!generationRows[0] || generationRows[0].input_hash !== input.inputHash) {
+      throw new Error('context mirror generation is missing or its input hash no longer matches');
+    }
+    for (const part of input.partitions) {
+      const existing = await tx.executeRaw<{ content_hash: string }>(
+        `SELECT content_hash FROM context_mirror_partitions
+          WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND partition_key = $4`,
+        [input.sourceId, input.sessionId, input.generation, part.partitionKey],
+      );
+      if (existing[0] && existing[0].content_hash !== part.contentHash) {
+        throw new Error(`context mirror partition ${part.partitionKey} changed inside one generation`);
+      }
+      await tx.executeRaw(
+        `INSERT INTO context_mirror_partitions (
+           source_id, session_id, generation, partition_key, distilled_slug, content_hash
+         ) VALUES ($1,$2,$3,$4,$5,$6)
+         ON CONFLICT (source_id, session_id, generation, partition_key) DO NOTHING`,
+        [input.sourceId, input.sessionId, input.generation, part.partitionKey, part.distilledSlug, part.contentHash],
+      );
+    }
+    const manifest = input.partitions.map((part) => ({
+      partition: part.partitionKey,
+      slug: part.distilledSlug,
+      content_hash: part.contentHash,
+    }));
+    await tx.executeRaw(
+      `UPDATE context_mirror_generations
+          SET expected_manifest = $4::jsonb,
+              expected_partitions = $5,
+              materialized_partitions = $5,
+              state = 'complete', is_current = true,
+              completed_at = COALESCE(completed_at, now()), updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+      [input.sourceId, input.sessionId, input.generation, JSON.stringify(manifest), input.partitions.length],
+    );
+    // The moment a replacement generation is complete, an older unresolved
+    // review candidate is no longer safe to approve. Reject it immediately;
+    // the first candidate from this generation later fills superseded_by in the
+    // same candidate+decision transaction. Accepted/indexed history is immutable.
+    await tx.executeRaw(
+      `UPDATE connector_candidates
+          SET status = 'rejected', status_reason = 'superseded_generation_pending_replacement',
+              acted_at = COALESCE(acted_at, now())
+        WHERE source_id = $1 AND context_session_id = $2
+          AND context_generation < $3
+          AND status IN ('pending','needs_review','awaiting_review_capacity')`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+  });
+}
+
+export async function markContextGenerationQuarantined(
+  engine: BrainEngine,
+  sourceId: string,
+  sessionId: string,
+  generation: number,
+): Promise<void> {
+  await engine.executeRaw(
+    `UPDATE context_mirror_generations
+        SET state = 'quarantined', updated_at = now()
+      WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+    [sourceId, sessionId, generation],
+  );
+}
+
+/** Source-serialized capacity reservation. Provider work may start only after
+ * its worst-case six-output footprint fits the human+staging envelope. */
+export async function reserveReviewCapacity(
+  engine: BrainEngine,
+  input: { sourceId: string; sessionId: string; generation: number; slots: number; bytes: number; now: Date; cohortKind?: 'fresh' | 'historical' },
+): Promise<string | null> {
+  if (!Number.isInteger(input.slots) || input.slots < 1 || !Number.isInteger(input.bytes) || input.bytes < 1) {
+    throw new Error('context mirror review reservation must use positive finite slots and bytes');
+  }
+  return await engine.transaction(async (tx) => {
+    await tx.executeRaw(`SELECT id FROM sources WHERE id = $1 FOR UPDATE`, [input.sourceId]);
+    await tx.executeRaw(
+      `UPDATE context_mirror_review_reservations
+          SET state = 'expired', updated_at = now()
+        WHERE source_id = $1 AND state = 'active' AND expires_at <= $2::timestamptz`,
+      [input.sourceId, input.now.toISOString()],
+    );
+    const existing = await tx.executeRaw<{ reservation_id: string; state: string }>(
+      `SELECT reservation_id, state FROM context_mirror_review_reservations
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    if (existing[0]?.state === 'active') return existing[0].reservation_id;
+    const snapshot = await reviewCapacitySnapshot(tx, input.sourceId);
+    if (snapshot.humanAgeExceeded || snapshot.stagingAgeExceeded) return null;
+    const occupiedSlots = snapshot.humanPending + snapshot.staged + snapshot.reservedSlots;
+    const slotsLimit = snapshot.pendingLimit + snapshot.stagingLimit;
+    if (occupiedSlots + input.slots > slotsLimit) return null;
+    if (input.cohortKind === 'historical') {
+      const historicalOccupied = snapshot.historicalHuman + snapshot.historicalStaged +
+        snapshot.historicalReservedSlots;
+      if (historicalOccupied + input.slots > Math.max(0, slotsLimit - snapshot.freshQuota)) return null;
+    }
+    if (snapshot.stagedBytes + snapshot.reservedBytes + input.bytes > snapshot.stagingBytesLimit) return null;
+    const reservationId = existing[0]?.reservation_id ?? randomUUID();
+    if (existing[0]) {
+      await tx.executeRaw(
+        `UPDATE context_mirror_review_reservations
+            SET cohort_kind = $4, reserved_slots = $5, reserved_bytes = $6,
+                state = 'active', expires_at = $7::timestamptz, updated_at = now()
+          WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+        [
+          input.sourceId, input.sessionId, input.generation, input.cohortKind ?? 'fresh',
+          input.slots, input.bytes,
+          new Date(input.now.getTime() + REVIEW_RESERVATION_MS).toISOString(),
+        ],
+      );
+    } else {
+      await tx.executeRaw(
+        `INSERT INTO context_mirror_review_reservations (
+           reservation_id, source_id, session_id, generation, cohort_kind,
+           reserved_slots, reserved_bytes, state, expires_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8::timestamptz)`,
+        [
+          reservationId, input.sourceId, input.sessionId, input.generation,
+          input.cohortKind ?? 'fresh', input.slots, input.bytes,
+          new Date(input.now.getTime() + REVIEW_RESERVATION_MS).toISOString(),
+        ],
+      );
+    }
+    return reservationId;
+  });
+}
+
+export async function releaseReviewReservation(
+  engine: BrainEngine,
+  sourceId: string,
+  sessionId: string,
+  generation: number,
+  state: 'consumed' | 'released' = 'consumed',
+): Promise<void> {
+  await engine.executeRaw(
+    `UPDATE context_mirror_review_reservations
+        SET state = $4, updated_at = now()
+      WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND state = 'active'`,
+    [sourceId, sessionId, generation, state],
+  );
+}
+
+/** Replace a pre-provider worst-case reservation with the exact number of
+ * materialized memory partitions. The per-partition byte bound remains
+ * conservative until each partition reaches a terminal decision. */
+export async function resizeReviewReservation(
+  engine: BrainEngine,
+  sourceId: string,
+  sessionId: string,
+  generation: number,
+  slots: number,
+  bytesPerSlot: number,
+): Promise<void> {
+  if (!Number.isInteger(slots) || slots < 0 || !Number.isInteger(bytesPerSlot) || bytesPerSlot < 1) {
+    throw new Error('context mirror reservation resize requires finite non-negative slots and positive bytes');
+  }
+  await engine.executeRaw(
+    `UPDATE context_mirror_review_reservations
+        SET reserved_slots = $4,
+            reserved_bytes = $4::integer * $5::bigint,
+            state = CASE WHEN $4 = 0 THEN 'consumed' ELSE 'active' END,
+            updated_at = now()
+      WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND state = 'active'`,
+    [sourceId, sessionId, generation, slots, bytesPerSlot],
+  );
+}
+
+export async function reviewCapacitySnapshot(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<ReviewCapacitySnapshot> {
+  const sourceRows = await engine.executeRaw<{ config: unknown }>(
+    `SELECT config FROM sources WHERE id = $1`,
+    [sourceId],
+  );
+  const root = parseJsonObject(sourceRows[0]?.config);
+  const connectors = parseJsonObject(root.connectors);
+  const config = parseJsonObject(connectors.context_mirror);
+  const pendingLimit = boundedConfigInt(config.pending_review_limit, DEFAULT_PENDING_REVIEW_LIMIT, 0, 25);
+  const stagingLimit = boundedConfigInt(config.staging_review_limit, DEFAULT_STAGING_LIMIT, 0, 50);
+  const stagingBytesLimit = boundedConfigInt(config.staging_review_bytes, DEFAULT_STAGING_BYTES, 1, DEFAULT_STAGING_BYTES);
+  const humanMaxAgeHours = boundedConfigInt(
+    config.pending_review_max_age_hours,
+    DEFAULT_REVIEW_MAX_AGE_HOURS,
+    1,
+    30 * 24,
+  );
+  const stagingMaxAgeHours = boundedConfigInt(
+    config.staging_review_max_age_hours,
+    DEFAULT_REVIEW_MAX_AGE_HOURS,
+    1,
+    30 * 24,
+  );
+  const rows = await engine.executeRaw<{
+    human_pending: number | string;
+    staged: number | string;
+    staged_bytes: number | string;
+    reserved_slots: number | string;
+    reserved_bytes: number | string;
+    human_oldest_at: Date | string | null;
+    staged_oldest_at: Date | string | null;
+    historical_human: number | string;
+    historical_staged: number | string;
+    historical_reserved_slots: number | string;
+  }>(
+    `SELECT
+       (SELECT count(*) FROM connector_candidates
+         WHERE source_id = $1 AND status IN ('pending','needs_review')) AS human_pending,
+       (SELECT count(*) FROM connector_candidates
+         WHERE source_id = $1 AND status = 'awaiting_review_capacity') AS staged,
+       (SELECT COALESCE(sum(octet_length(COALESCE(proposed_markdown,''))),0) FROM connector_candidates
+         WHERE source_id = $1 AND status = 'awaiting_review_capacity') AS staged_bytes,
+       (SELECT COALESCE(sum(reserved_slots),0) FROM context_mirror_review_reservations
+         WHERE source_id = $1 AND state = 'active' AND expires_at > now()) AS reserved_slots,
+       (SELECT COALESCE(sum(reserved_bytes),0) FROM context_mirror_review_reservations
+         WHERE source_id = $1 AND state = 'active' AND expires_at > now()) AS reserved_bytes,
+       (SELECT min(proposed_at) FROM connector_candidates
+         WHERE source_id = $1 AND status IN ('pending','needs_review')) AS human_oldest_at,
+       (SELECT min(proposed_at) FROM connector_candidates
+         WHERE source_id = $1 AND status = 'awaiting_review_capacity') AS staged_oldest_at,
+       (SELECT count(*) FROM connector_candidates
+         WHERE source_id = $1 AND status IN ('pending','needs_review') AND requires_human_review) AS historical_human,
+       (SELECT count(*) FROM connector_candidates
+         WHERE source_id = $1 AND status = 'awaiting_review_capacity' AND requires_human_review) AS historical_staged,
+       (SELECT COALESCE(sum(reserved_slots),0) FROM context_mirror_review_reservations
+         WHERE source_id = $1 AND state = 'active' AND expires_at > now()
+           AND cohort_kind = 'historical') AS historical_reserved_slots`,
+    [sourceId],
+  );
+  const row = rows[0];
+  const humanOldestAt = row?.human_oldest_at ? new Date(row.human_oldest_at) : null;
+  const stagedOldestAt = row?.staged_oldest_at ? new Date(row.staged_oldest_at) : null;
+  const nowMs = Date.now();
+  return {
+    pendingLimit,
+    stagingLimit,
+    stagingBytesLimit,
+    humanPending: Number(row?.human_pending ?? 0),
+    staged: Number(row?.staged ?? 0),
+    stagedBytes: Number(row?.staged_bytes ?? 0),
+    reservedSlots: Number(row?.reserved_slots ?? 0),
+    reservedBytes: Number(row?.reserved_bytes ?? 0),
+    freshQuota: pendingLimit === 0 ? 0 : Math.min(pendingLimit, Math.max(1, Math.ceil(0.2 * pendingLimit))),
+    humanOldestAt,
+    stagedOldestAt,
+    humanMaxAgeHours,
+    stagingMaxAgeHours,
+    humanAgeExceeded: humanOldestAt != null && nowMs - humanOldestAt.getTime() > humanMaxAgeHours * 3_600_000,
+    stagingAgeExceeded: stagedOldestAt != null && nowMs - stagedOldestAt.getTime() > stagingMaxAgeHours * 3_600_000,
+    historicalHuman: Number(row?.historical_human ?? 0),
+    historicalStaged: Number(row?.historical_staged ?? 0),
+    historicalReservedSlots: Number(row?.historical_reserved_slots ?? 0),
+  };
+}
+
+export async function chooseReviewAdmissionStatus(
+  engine: BrainEngine,
+  sourceId: string,
+  preferred: 'pending' | 'needs_review',
+  candidateBytes: number,
+  historical: boolean,
+): Promise<'pending' | 'needs_review' | 'awaiting_review_capacity'> {
+  if (!Number.isInteger(candidateBytes) || candidateBytes < 0) {
+    throw new Error('context mirror candidate bytes must be a finite non-negative integer');
+  }
+  await engine.executeRaw(`SELECT id FROM sources WHERE id = $1 FOR UPDATE`, [sourceId]);
+  const snapshot = await reviewCapacitySnapshot(engine, sourceId);
+  if (snapshot.humanAgeExceeded || snapshot.stagingAgeExceeded) {
+    throw new Error('context mirror review capacity age limit exceeded');
+  }
+  const historicalHumanLimit = Math.max(0, snapshot.pendingLimit - snapshot.freshQuota);
+  if (
+    snapshot.humanPending < snapshot.pendingLimit &&
+    (!historical || snapshot.historicalHuman < historicalHumanLimit)
+  ) return preferred;
+  if (
+    snapshot.staged < snapshot.stagingLimit &&
+    snapshot.stagedBytes + candidateBytes <= snapshot.stagingBytesLimit
+  ) {
+    return 'awaiting_review_capacity';
+  }
+  throw new Error('context mirror review capacity exhausted after reservation');
+}
+
+/** Move staged candidates into the human queue in stable oldest-first order.
+ * Source locking makes concurrent admissions conserve the configured WIP cap. */
+export async function admitWaitingCandidates(engine: BrainEngine, sourceId: string): Promise<number> {
+  return await engine.transaction(async (tx) => {
+    await tx.executeRaw(`SELECT id FROM sources WHERE id = $1 FOR UPDATE`, [sourceId]);
+    const snapshot = await reviewCapacitySnapshot(tx, sourceId);
+    const available = Math.max(0, snapshot.pendingLimit - snapshot.humanPending);
+    if (available === 0) return 0;
+    const rows = await tx.executeRaw<{ id: number | string }>(
+      `WITH next AS (
+         SELECT id
+           FROM connector_candidates
+          WHERE source_id = $1 AND status = 'awaiting_review_capacity'
+          ORDER BY proposed_at ASC, id ASC
+          LIMIT $2
+          FOR UPDATE
+       )
+       UPDATE connector_candidates c
+          SET status = CASE WHEN c.classification = 'NEEDS_REVIEW' THEN 'needs_review' ELSE 'pending' END,
+              status_reason = NULL
+         FROM next
+        WHERE c.id = next.id
+       RETURNING c.id`,
+      [sourceId, available],
+    );
+    return rows.length;
+  });
+}
+
+export async function claimContextPartitions(
+  engine: BrainEngine,
+  sourceId: string,
+  limit: number,
+  now: Date,
+): Promise<ClaimedContextPartition[]> {
+  await engine.executeRaw(
+    `UPDATE context_mirror_partitions
+        SET state = 'pending', claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE source_id = $1 AND state = 'claimed' AND lease_expires_at < $2::timestamptz`,
+    [sourceId, now.toISOString()],
+  );
+  const candidates = await engine.executeRaw<{
+    session_id: string; generation: number | string; partition_key: string;
+    distilled_slug: string; content_hash: string; requires_human_review: boolean;
+  }>(
+    `SELECT p.session_id, p.generation, p.partition_key, p.distilled_slug,
+            p.content_hash, g.requires_human_review
+       FROM context_mirror_partitions p
+       JOIN context_mirror_generations g
+         ON g.source_id = p.source_id AND g.session_id = p.session_id AND g.generation = p.generation
+      WHERE p.source_id = $1 AND p.state IN ('pending','failed')
+        AND g.is_current AND g.state = 'complete'
+      ORDER BY g.completed_at ASC, p.session_id ASC, p.generation ASC, p.partition_key ASC
+      LIMIT $2`,
+    [sourceId, limit],
+  );
+  const claimed: ClaimedContextPartition[] = [];
+  for (const candidate of candidates) {
+    const claimId = randomUUID();
+    const rows = await engine.executeRaw<{ one: number }>(
+      `UPDATE context_mirror_partitions
+          SET state = 'claimed', claim_id = $5, lease_expires_at = $6::timestamptz,
+              attempt_count = attempt_count + 1, updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND partition_key = $4
+          AND state IN ('pending','failed')
+        RETURNING 1 AS one`,
+      [
+        sourceId, candidate.session_id, Number(candidate.generation), candidate.partition_key,
+        claimId, new Date(now.getTime() + PARTITION_LEASE_MS).toISOString(),
+      ],
+    );
+    if (!rows[0]) continue;
+    claimed.push({
+      sourceId,
+      sessionId: candidate.session_id,
+      generation: Number(candidate.generation),
+      partitionKey: candidate.partition_key,
+      distilledSlug: candidate.distilled_slug,
+      contentHash: candidate.content_hash,
+      claimId,
+      requiresHumanReview: candidate.requires_human_review,
+    });
+  }
+  return claimed;
+}
+
+export async function finishContextPartition(
+  engine: BrainEngine,
+  input: ClaimedContextPartition & {
+    state: 'decided' | 'degraded' | 'failed';
+    candidateId?: number | null;
+    classification?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+  },
+): Promise<boolean> {
+  return await engine.transaction(async (tx) => {
+    const rows = await tx.executeRaw<{ one: number }>(
+      `UPDATE context_mirror_partitions
+          SET state = $6, candidate_id = $7, decision_classification = $8,
+              last_error_code = $9, last_error_message = $10,
+              decided_at = CASE WHEN $6 IN ('decided','degraded') THEN now() ELSE decided_at END,
+              claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND partition_key = $4
+          AND claim_id = $5 AND state = 'claimed'
+        RETURNING 1 AS one`,
+      [
+        input.sourceId, input.sessionId, input.generation, input.partitionKey, input.claimId,
+        input.state, input.candidateId ?? null, input.classification ?? null,
+        input.errorCode ?? null, input.errorMessage?.slice(0, 500) ?? null,
+      ],
+    );
+    if (!rows[0]) return false;
+    if (input.state === 'decided' || input.state === 'degraded') {
+      await tx.executeRaw(
+        `UPDATE context_mirror_review_reservations
+            SET reserved_bytes = CASE
+                  WHEN reserved_slots <= 1 THEN 0
+                  ELSE greatest(0, reserved_bytes - ceil(reserved_bytes::numeric / reserved_slots)::bigint)
+                END,
+                reserved_slots = greatest(0, reserved_slots - 1),
+                state = CASE WHEN reserved_slots <= 1 THEN 'consumed' ELSE state END,
+                updated_at = now()
+          WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND state = 'active'`,
+        [input.sourceId, input.sessionId, input.generation],
+      );
+    }
+    return true;
+  });
+}
+
+export async function releaseContextPartition(engine: BrainEngine, input: ClaimedContextPartition): Promise<void> {
+  await engine.executeRaw(
+    `UPDATE context_mirror_partitions
+        SET state = 'pending', claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+      WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND partition_key = $4
+        AND claim_id = $5 AND state = 'claimed'`,
+    [input.sourceId, input.sessionId, input.generation, input.partitionKey, input.claimId],
+  );
+}
+
+export async function releaseReservationWhenGenerationResolved(
+  engine: BrainEngine,
+  sourceId: string,
+  sessionId: string,
+  generation: number,
+): Promise<void> {
+  const rows = await engine.executeRaw<{ unresolved: number | string }>(
+    `SELECT count(*) FILTER (WHERE state IN ('pending','claimed','failed')) AS unresolved
+       FROM context_mirror_partitions
+      WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+    [sourceId, sessionId, generation],
+  );
+  if (Number(rows[0]?.unresolved ?? 0) === 0) {
+    await releaseReviewReservation(engine, sourceId, sessionId, generation, 'consumed');
+  }
+}
+
+function boundedConfigInt(value: unknown, fallback: number, min: number, max: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(numeric)));
 }

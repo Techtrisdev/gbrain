@@ -290,6 +290,10 @@ export async function purgeExpiredSources(
      WHERE archived = true
        AND archive_expires_at IS NOT NULL
        AND archive_expires_at <= now()
+       AND NOT EXISTS (
+         SELECT 1 FROM context_mirror_recovery_holds h
+          WHERE h.source_id = sources.id AND h.active
+       )
      RETURNING id`,
   );
   return rows.map((r) => r.id);

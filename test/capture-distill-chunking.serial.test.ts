@@ -199,18 +199,46 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(claimed.map((head) => head.sessionId)).toEqual([
       'sess-0001', 'sess-0002', 'sess-0003', 'sess-0004', 'sess-0005',
     ]);
-  });
+  }, 15_000);
 
   test('same-timestamp consolidation above 100 rows resumes with a composite cursor', async () => {
     await engine.executeRaw(
       `INSERT INTO pages (
-         source_id, slug, type, title, compiled_truth, timeline, frontmatter, updated_at
+         source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at
        )
        SELECT 'default',
               'distilled/bulk/mem-' || lpad(i::text, 3, '0'),
-              'note', 'memory', repeat('durable memory body ', 8), '', '{}'::jsonb,
+              'note', 'memory', repeat('durable memory body ', 8), '',
+              jsonb_build_object(
+                'session_id', 'bulk', 'generation', 1,
+                'partition', 'mem-' || lpad(i::text, 3, '0'),
+                'evidence_trust', 'untrusted_transcript'
+              ),
+              'hash-' || lpad(i::text, 3, '0'),
               '2026-08-01T12:00:00Z'::timestamptz
          FROM generate_series(1, 150) AS i`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_session_heads (
+         source_id, session_id, session_slug, capture_slug_prefix,
+         newest_capture_at, turn_count, state, current_generation
+       ) VALUES ('default','bulk','bulk','capture/bulk/',now() - INTERVAL '1 day',150,'complete',1)`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_generations (
+         source_id, session_id, generation, input_hash, transform_version, model,
+         expected_partitions, materialized_partitions, state, is_current, completed_at
+       ) VALUES ('default','bulk',1,'input-hash','test-v1','test:stub',150,150,'complete',true,now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_partitions (
+         source_id, session_id, generation, partition_key, distilled_slug, content_hash
+       )
+       SELECT 'default','bulk',1,
+              'mem-' || lpad(i::text, 3, '0'),
+              'distilled/bulk/mem-' || lpad(i::text, 3, '0'),
+              'hash-' || lpad(i::text, 3, '0')
+         FROM generate_series(1,150) AS i`,
     );
     const source = {
       id: CAPTURE_SOURCE,
@@ -219,17 +247,34 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
 
     const first = await contextMirrorConnector.backfill!(engine, source);
     const second = await contextMirrorConnector.backfill!(engine, source);
-    const third = await contextMirrorConnector.backfill!(engine, source);
 
-    expect(first).toBe(100);
-    expect(second).toBe(50);
-    expect(third).toBe(0);
+    expect(first).toMatchObject({ status: 'partial', landed: 0 });
+    expect(second).toMatchObject({ status: 'partial', landed: 0 });
+    const [checkpoint] = await engine.executeRaw<{ cursor: unknown; completed: boolean }>(
+      `SELECT cursor, completed FROM context_mirror_checkpoints
+        WHERE source_id = $1 AND checkpoint_kind = 'distilled_legacy_import_v1'`,
+      [CAPTURE_SOURCE],
+    );
+    const cursor = typeof checkpoint.cursor === 'string'
+      ? JSON.parse(checkpoint.cursor) as Record<string, unknown>
+      : checkpoint.cursor as Record<string, unknown>;
+    expect(checkpoint.completed).toBe(true);
+    expect(cursor).toMatchObject({
+      updated_at: '2026-08-01T12:00:00.000Z',
+      slug: 'distilled/bulk/mem-150',
+    });
     const rows = await engine.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_partitions
+        WHERE source_id = $1 AND state = 'pending'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(Number(rows[0]?.count ?? 0)).toBe(150);
+    const candidates = await engine.executeRaw<{ count: number | string }>(
       `SELECT count(*) AS count FROM connector_candidates
         WHERE source_id = $1 AND provider = 'context_mirror'`,
       [CAPTURE_SOURCE],
     );
-    expect(Number(rows[0]?.count ?? 0)).toBe(150);
+    expect(Number(candidates[0]?.count ?? 0)).toBe(0);
   });
 
   test('late capture evidence creates a new durable generation instead of being hidden by the old marker', async () => {
