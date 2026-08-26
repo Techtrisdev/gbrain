@@ -1338,6 +1338,109 @@ CREATE TABLE IF NOT EXISTS connector_tokens (
 CREATE INDEX IF NOT EXISTS connector_tokens_source_provider_idx
   ON connector_tokens (source_id, provider);
 
+-- ============================================================
+-- Context Mirror operational state (v109).
+-- Content pages remain evidence; these source-scoped tables are the durable
+-- work ledger used for bounded discovery, claims, provider-call recovery, and
+-- restart-safe circuit breaking.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  session_id            TEXT        NOT NULL,
+  session_slug          TEXT        NOT NULL,
+  capture_slug_prefix   TEXT        NOT NULL,
+  newest_capture_at     TIMESTAMPTZ NOT NULL,
+  turn_count            INTEGER     NOT NULL CHECK (turn_count >= 0),
+  first_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  first_eligible_at     TIMESTAMPTZ,
+  cohort_at             TIMESTAMPTZ,
+  state                 TEXT        NOT NULL DEFAULT 'pending'
+                                    CHECK (state IN ('pending','claimed','result_persisted','complete','quarantined','ambiguous')),
+  disposition           TEXT,
+  claim_id              TEXT,
+  lease_expires_at      TIMESTAMPTZ,
+  attempt_count         INTEGER     NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  current_generation    INTEGER     NOT NULL DEFAULT 1 CHECK (current_generation >= 1),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, session_id),
+  CONSTRAINT context_mirror_session_heads_slug_unique UNIQUE (source_id, session_slug),
+  CONSTRAINT context_mirror_session_heads_claim_shape CHECK (
+    (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+    OR state <> 'claimed'
+  )
+);
+
+CREATE INDEX IF NOT EXISTS context_mirror_session_heads_pending_idx
+  ON context_mirror_session_heads (source_id, first_eligible_at, session_id)
+  WHERE state = 'pending' AND first_eligible_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS context_mirror_distill_runs (
+  run_id                TEXT        PRIMARY KEY,
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  status                TEXT        NOT NULL CHECK (status IN ('running','ok','partial','failed','aborted')),
+  stop_reason           TEXT,
+  limits                JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  selected_count        INTEGER     NOT NULL DEFAULT 0 CHECK (selected_count >= 0),
+  completed_count       INTEGER     NOT NULL DEFAULT 0 CHECK (completed_count >= 0),
+  failed_count          INTEGER     NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+  deferred_count        INTEGER     NOT NULL DEFAULT 0 CHECK (deferred_count >= 0),
+  started_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at           TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS context_mirror_distill_runs_source_started_idx
+  ON context_mirror_distill_runs (source_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS context_mirror_provider_calls (
+  correlation_id        TEXT        PRIMARY KEY,
+  run_id                TEXT        NOT NULL REFERENCES context_mirror_distill_runs(run_id) ON DELETE CASCADE,
+  source_id             TEXT        NOT NULL,
+  session_id            TEXT        NOT NULL,
+  generation            INTEGER     NOT NULL CHECK (generation >= 1),
+  state                 TEXT        NOT NULL CHECK (state IN ('prepared','inflight','result_persisted','failed','ambiguous_provider_outcome')),
+  request_fingerprint   TEXT        NOT NULL,
+  result_json           JSONB,
+  usage_json            JSONB,
+  error_class           TEXT,
+  error_message         TEXT,
+  prepared_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at               TIMESTAMPTZ,
+  result_persisted_at   TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (source_id, session_id)
+    REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_provider_calls_recoverable_result_idx
+  ON context_mirror_provider_calls (source_id, session_id, generation)
+  WHERE state = 'result_persisted';
+
+CREATE INDEX IF NOT EXISTS context_mirror_provider_calls_session_idx
+  ON context_mirror_provider_calls (source_id, session_id, generation, prepared_at DESC);
+
+CREATE TABLE IF NOT EXISTS context_mirror_circuits (
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  provider              TEXT        NOT NULL,
+  state                 TEXT        NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open','half_open')),
+  reason                TEXT,
+  error_fingerprint     TEXT,
+  consecutive_failures  INTEGER     NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+  opened_at             TIMESTAMPTZ,
+  next_probe_at         TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS context_mirror_checkpoints (
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  checkpoint_kind       TEXT        NOT NULL,
+  cursor                JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  completed             BOOLEAN     NOT NULL DEFAULT false,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, checkpoint_kind)
+);
+
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS $$
 BEGIN
@@ -1407,6 +1510,11 @@ BEGIN
     ALTER TABLE connector_candidates ENABLE ROW LEVEL SECURITY;
     -- TECH-2033 encrypted connector token custody store
     ALTER TABLE connector_tokens ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_session_heads ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_distill_runs ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_provider_calls ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_circuits ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_checkpoints ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;

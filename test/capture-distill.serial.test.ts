@@ -27,6 +27,7 @@ import {
   type ChatOpts,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
+import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
 import {
   distillCaptureSessions,
   groupCapturesBySession,
@@ -51,6 +52,7 @@ function makeFakeEngine(seededPages: Page[] = []) {
   const puts: { slug: string; page: PageInput; sourceId?: string }[] = [];
   const chunkWrites: { slug: string; count: number; sourceId?: string }[] = [];
   const deletes: { slug: string; sourceId?: string }[] = [];
+  const getCalls: { slug: string; sourceId?: string }[] = [];
   const listCalls: (PageFilters | undefined)[] = [];
   const allPages = (): Page[] => [...seededPages, ...store.values()];
 
@@ -82,7 +84,8 @@ function makeFakeEngine(seededPages: Page[] = []) {
   };
 
   // getPage: store (latest write) wins over the seeded set; null when unknown.
-  const getPage = async (slug: string): Promise<Page | null> => {
+  const getPage = async (slug: string, opts?: { sourceId?: string }): Promise<Page | null> => {
+    getCalls.push({ slug, sourceId: opts?.sourceId });
     return store.get(slug) ?? allPages().find((p) => p.slug === slug) ?? null;
   };
 
@@ -124,6 +127,36 @@ function makeFakeEngine(seededPages: Page[] = []) {
     store.delete(slug);
   };
 
+  const executeRaw = async (sql: string, params: unknown[] = []): Promise<unknown[]> => {
+    if (!sql.includes('WITH capture_sessions AS')) throw new Error(`unexpected SQL in fake engine: ${sql}`);
+    const sourceId = String(params[0] ?? 'capture-events');
+    const grouped = new Map<string, { session_id: string; capture_slug_prefix: string; turns: number; newest_at: Date }>();
+    for (const page of allPages()) {
+      const slug = String(page.slug ?? '');
+      if (!slug.startsWith('capture/') || page.source_id !== sourceId) continue;
+      const pathSession = slug.split('/')[1] ?? '';
+      const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
+      const sessionId = typeof fm.session_id === 'string' && fm.session_id ? fm.session_id : pathSession;
+      const capturedAt = typeof fm.captured_at === 'string' ? new Date(fm.captured_at) : null;
+      const updated = capturedAt && Number.isFinite(capturedAt.getTime()) ? capturedAt : new Date(page.updated_at);
+      const current = grouped.get(sessionId);
+      if (!current) {
+        grouped.set(sessionId, {
+          session_id: sessionId,
+          capture_slug_prefix: `capture/${pathSession}/`,
+          turns: 1,
+          newest_at: updated,
+        });
+      } else {
+        current.turns += 1;
+        if (updated > current.newest_at) current.newest_at = updated;
+      }
+    }
+    return [...grouped.values()].sort((a, b) =>
+      a.newest_at.getTime() - b.newest_at.getTime() || a.session_id.localeCompare(b.session_id),
+    );
+  };
+
   const engine = {
     kind: 'pglite',
     listPages,
@@ -132,8 +165,9 @@ function makeFakeEngine(seededPages: Page[] = []) {
     putPage,
     upsertChunks,
     deletePage,
+    executeRaw,
   } as unknown as BrainEngine;
-  return { engine, puts, listCalls, store, chunkWrites, deletes };
+  return { engine, puts, listCalls, store, chunkWrites, deletes, getCalls };
 }
 
 /** A bare `distill-state/<slug>` marker page (only the slug is read by the done-set). */
@@ -461,6 +495,96 @@ describe('distillCaptureSessions — failure tolerance', () => {
     expect(report.sessions[0].error).toContain('unavailable');
     expect(puts.length).toBe(0);
   });
+
+  test('the durable executor owns the only bounded transient retry', async () => {
+    const { engine } = makeFakeEngine([
+      mkCapture({ slug: 'capture/retry/prompt-1', session_id: 'retry', updated_at: OLD }),
+    ]);
+    let calls = 0;
+    const sdkRetries: Array<number | undefined> = [];
+    __setChatTransportForTests(async (chatOpts): Promise<ChatResult> => {
+      calls += 1;
+      sdkRetries.push(chatOpts.maxRetries);
+      if (calls === 1) {
+        throw new AITransientError('rate limited', { status: 429, retryAfterMs: 0 });
+      }
+      return {
+        text: JSON.stringify(['retry succeeded once']),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      };
+    });
+
+    const report = await distillCaptureSessions(engine, {
+      now: NOW,
+      maxRetries: 1,
+      maxCalls: 2,
+      maxInputTokens: 100_000,
+      maxOutputTokens: 3_000,
+    });
+
+    expect(calls).toBe(2);
+    expect(sdkRetries).toEqual([0, 0]);
+    expect(report.calls).toBe(2);
+    expect(report.status).toBe('ok');
+    expect(report.distilled).toBe(1);
+  });
+
+  test('a systemic provider/config failure stops the batch after one call and stays visible', async () => {
+    const { engine, puts } = makeFakeEngine([
+      mkCapture({ slug: 'capture/first/prompt-1', session_id: 'first', updated_at: OLD }),
+      mkCapture({ slug: 'capture/second/prompt-1', session_id: 'second', updated_at: OLD }),
+    ]);
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls += 1;
+      throw new AIConfigError('billing disabled');
+    });
+
+    const report = await distillCaptureSessions(engine, { now: NOW, maxSessions: 2 });
+
+    expect(calls).toBe(1);
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('systemic_failure');
+    expect(report.failed).toBe(1);
+    expect(report.deferred).toBe(1);
+    expect(report.sessions.find((s) => s.session_id === 'first')?.error_class).toBe('config');
+    expect(report.sessions.find((s) => s.session_id === 'second')?.status).toBe('deferred');
+    expect(puts.length).toBe(0);
+  });
+});
+
+describe('distillCaptureSessions — bounded work selection', () => {
+  test('a session cap selects the oldest sessions and hydrates only their capture pages', async () => {
+    const seeded: Page[] = [];
+    for (let i = 0; i < 10; i++) {
+      const hour = String(i).padStart(2, '0');
+      seeded.push(mkCapture({
+        slug: `capture/sess-${hour}/prompt-1`,
+        session_id: `sess-${hour}`,
+        updated_at: `2026-06-28T${hour}:00:00Z`,
+      }));
+    }
+    const { engine, getCalls } = makeFakeEngine(seeded);
+    const { calls } = stubChat(() => '["memory"]');
+
+    const report = await distillCaptureSessions(engine, { now: NOW, maxSessions: 2 });
+
+    expect(report.status).toBe('partial');
+    expect(report.stop_reason).toBe('session_limit');
+    expect(report.eligible).toBe(10);
+    expect(report.selected).toBe(2);
+    expect(report.deferred).toBe(8);
+    expect(report.distilled).toBe(2);
+    expect(calls.length).toBe(2);
+    expect(getCalls.filter((call) => call.slug.startsWith('capture/')).map((call) => call.slug)).toEqual([
+      'capture/sess-00/prompt-1',
+      'capture/sess-01/prompt-1',
+    ]);
+  });
 });
 
 // ── Uncapped enumeration (the listAllSlugs rewire — no silent 100-row drop) ───
@@ -484,7 +608,13 @@ describe('distillCaptureSessions — uncapped enumeration (>100)', () => {
     const { engine, puts } = makeFakeEngine(seeded);
     stubChat(() => '["one durable memory"]');
 
-    const report = await distillCaptureSessions(engine, { now: NOW });
+    const report = await distillCaptureSessions(engine, {
+      now: NOW,
+      maxSessions: N,
+      maxCalls: N,
+      maxInputTokens: 1_000_000,
+      maxOutputTokens: N * 1500,
+    });
 
     // With the old listPages(100) cap, total_sessions would have been 100.
     expect(report.total_sessions).toBe(N);

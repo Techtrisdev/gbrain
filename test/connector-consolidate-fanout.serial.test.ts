@@ -272,4 +272,31 @@ describe('U4 — multi-topic fan-out end-to-end smoke + receiver-compat', () => 
     const branches = srids.map((s) => receiverBranch('granola', 'default', s));
     expect(new Set(branches).size).toBe(3); // N independent, receiver-promotable proposals
   });
+
+  test('a malformed consolidation response lands evidence but reports a degraded poll', async () => {
+    await enableGranolaConsolidation();
+    stubChatRouting({ extract: () => 'not-json' });
+
+    const result = await landRecords(
+      engine,
+      'default',
+      granolaLike,
+      [rec('meet-degraded', 'A substantive meeting record that must not disappear.')],
+      { consolidate: true },
+    );
+
+    expect(result).toMatchObject({
+      written: 1,
+      status: 'partial',
+      diagnostics: [{
+        stage: 'consolidate',
+        code: 'consolidation_extract_degraded',
+      }],
+    });
+    const rows = await engine.executeRaw<{ classification: string | null }>(
+      `SELECT classification FROM connector_candidates
+        WHERE source_id = 'default' AND source_record_id = 'meet-degraded'`,
+    );
+    expect(rows).toEqual([{ classification: null }]);
+  });
 });

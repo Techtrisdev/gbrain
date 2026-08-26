@@ -6,7 +6,11 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { resolveConnectorPollTargets } from '../src/commands/connector.ts';
+import {
+  connectorPollSummary,
+  pollConnectorTargets,
+  resolveConnectorPollTargets,
+} from '../src/commands/connector.ts';
 
 let engine: PGLiteEngine;
 beforeAll(async () => {
@@ -51,5 +55,25 @@ describe('resolveConnectorPollTargets', () => {
   test('--provider without --source → usage error', async () => {
     const { error } = await resolveConnectorPollTargets(engine, { provider: 'granola' });
     expect(error).toBeTruthy();
+  });
+});
+
+describe('connector poll result aggregation', () => {
+  test('continues after one target throws and produces a final nonzero summary', async () => {
+    const targets = [
+      { sourceId: 'broken', provider: 'context_mirror' },
+      { sourceId: 'healthy', provider: 'calendar' },
+    ];
+    const called: string[] = [];
+    const results = await pollConnectorTargets(engine, targets, async (_engine, target) => {
+      called.push(target.sourceId);
+      if (target.sourceId === 'broken') throw new Error('provider unavailable');
+      return { sourceId: target.sourceId, provider: target.provider, status: 'ok', landed: 2, tombstoned: 0 };
+    });
+
+    expect(called).toEqual(['broken', 'healthy']);
+    expect(results[0]).toMatchObject({ status: 'failed', landed: 0 });
+    expect(results[1]).toMatchObject({ status: 'ok', landed: 2 });
+    expect(connectorPollSummary(results)).toMatchObject({ status: 'failed', exitCode: 1, landed: 2 });
   });
 });

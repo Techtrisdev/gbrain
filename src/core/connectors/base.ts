@@ -61,6 +61,23 @@ export interface NormalizedRecord {
   item: RawConnectorItem;
   /** Proposed brain slug (stripped by the framework). */
   proposedSlug?: string;
+  /** Stable upstream generation/version used by the candidate idempotency key. */
+  recordVersion?: string;
+}
+
+export type ConnectorRunStatus = 'ok' | 'partial' | 'failed';
+
+export interface ConnectorDiagnostic {
+  stage: string;
+  code: string;
+  message: string;
+}
+
+/** Backward-compatible structured result for connectors with multi-stage work. */
+export interface ConnectorBackfillResult {
+  status: ConnectorRunStatus;
+  landed: number;
+  diagnostics?: ConnectorDiagnostic[];
 }
 
 /** The contract every SaaS connector implements. */
@@ -107,7 +124,7 @@ export interface SaaSConnector {
   toCandidate(record: NormalizedRecord, sourceId: string): ConnectorCandidateItem;
   /** Outbound backfill (initial/periodic sync). Declared here; implemented per-connector
    *  once connector_tokens / OAuth (TECH-2033) lands. Uses the same landRecords path. */
-  backfill?(engine: BrainEngine, source: ConnectorSource): Promise<number>;
+  backfill?(engine: BrainEngine, source: ConnectorSource): Promise<number | ConnectorBackfillResult>;
   /** Optional post-connect hook, invoked by the OAuth /callback AFTER storeToken
    *  persists the grant (TECH-2040). A connector whose inbound trigger requires
    *  provider-side setup beyond the token grant (e.g. Google Calendar's
@@ -168,6 +185,14 @@ export function hmacSha256Verify(rawBody: Buffer, secret: string, signatureHex: 
 export interface LandResult {
   written: number;
   total: number;
+  /** Present when a multi-stage landing path needs to report degraded work. */
+  status?: ConnectorRunStatus;
+  diagnostics?: ConnectorDiagnostic[];
+}
+
+interface ConsolidationLandResult {
+  written: number;
+  diagnostics: ConnectorDiagnostic[];
 }
 
 /** Options for {@link landRecords}. */
@@ -214,11 +239,17 @@ export async function landRecords(
   // passthrough, and this read runs OUTSIDE the per-record try/catch, so an
   // unguarded throw here would otherwise abort the entire poll.
   let consolidation: ConsolidationDeps | null = null;
+  const diagnostics: ConnectorDiagnostic[] = [];
   if (opts.consolidate) {
     try {
       consolidation = await loadConsolidation(engine, sourceId);
-    } catch {
+    } catch (err) {
       consolidation = null;
+      diagnostics.push({
+        stage: 'consolidate',
+        code: 'consolidation_setup_failed',
+        message: safeConnectorDiagnostic(err),
+      });
     }
   }
 
@@ -249,6 +280,7 @@ export async function landRecords(
       profile: record.profile,
       item: { sourceRecordId: min.sourceRecordId, metadata: min.metadata, summary: min.summary },
       proposedSlug: record.proposedSlug,
+      recordVersion: record.recordVersion,
     };
     const raw = connector.toCandidate(redacted, sourceId);
     const candidate: ConnectorCandidateItem = {
@@ -276,7 +308,9 @@ export async function landRecords(
     // The consolidation path may FAN OUT one capture into N candidate rows, so it
     // returns the COUNT it wrote (not a boolean); the raw passthrough writes one.
     if (consolidation) {
-      written += await landOneConsolidated(engine, sourceId, connector, candidate, consolidation);
+      const result = await landOneConsolidated(engine, sourceId, connector, candidate, consolidation);
+      written += result.written;
+      diagnostics.push(...result.diagnostics);
     } else {
       const landed = await toRow(engine, candidate);
       if (landed.written) {
@@ -285,7 +319,9 @@ export async function landRecords(
       }
     }
   }
-  return { written, total: records.length };
+  return diagnostics.length > 0
+    ? { written, total: records.length, status: 'partial', diagnostics }
+    : { written, total: records.length };
 }
 
 // ── Consolidation seam (U3) — POLL-only; degrade-to-passthrough by construction ──
@@ -350,22 +386,31 @@ async function landOneConsolidated(
   connector: SaaSConnector,
   candidate: ConnectorCandidateItem,
   deps: ConsolidationDeps,
-): Promise<number> {
+): Promise<ConsolidationLandResult> {
   const provider = candidate.provider ?? connector.provider;
   const version = strip(candidate.version ?? '1');
-  const passthrough = async (): Promise<number> => {
+  const diagnostics: ConnectorDiagnostic[] = [];
+  const passthrough = async (
+    diagnostic?: Omit<ConnectorDiagnostic, 'stage'>,
+  ): Promise<ConsolidationLandResult> => {
+    if (diagnostic) diagnostics.push({ stage: 'consolidate', ...diagnostic });
     const landed = await toRow(engine, candidate);
-    if (!landed.written) return 0;
-    await maybeAutoApprove(engine, landed.row);
-    return 1;
+    if (landed.written) await maybeAutoApprove(engine, landed.row);
+    return { written: landed.written ? 1 : 0, diagnostics };
   };
   try {
     // Gate: per-connector flag (default false) + chat reachable. Either off →
     // today's raw passthrough (no DB pre-check, no LLM). The POLL-only structural
     // gate already held at the call site; this is the per-connector + availability
     // layer. extractConsolidationFacts re-checks both internally (defense in depth).
-    if (!deps.enabled(provider, deps.sourceConfig) || !isAvailable('chat')) {
+    if (!deps.enabled(provider, deps.sourceConfig)) {
       return await passthrough();
+    }
+    if (!isAvailable('chat')) {
+      return await passthrough({
+        code: 'consolidation_provider_unavailable',
+        message: 'consolidation is enabled but the chat provider is unavailable',
+      });
     }
 
     // KTD2 invariant guard. The fan-out key `<captureId>::<target>` AND the
@@ -382,7 +427,10 @@ async function landOneConsolidated(
         `[consolidation] captureId contains '::' for ${sourceId}/${provider} — ` +
           `degrading to raw passthrough (fan-out keying requires no '::' in the capture id)`,
       );
-      return await passthrough();
+      return await passthrough({
+        code: 'invalid_capture_identity',
+        message: "capture identity contains the reserved '::' fan-out delimiter",
+      });
     }
 
     // Idempotency pre-check (KTD3, fan-out-aware): a re-poll of an already-
@@ -392,7 +440,7 @@ async function landOneConsolidated(
     // extraction, no new row, not counted); the first poll's verdicts + decision
     // log stand.
     if (await captureConsolidated(engine, sourceId, candidate.source_record_id, version)) {
-      return 0;
+      return { written: 0, diagnostics };
     }
 
     // U1 → U2. extract reads the REDACTED capture summary (proposed_markdown,
@@ -401,7 +449,10 @@ async function landOneConsolidated(
     const extracted = await deps.extract({ captureText, provider, sourceConfig: deps.sourceConfig, engine });
     if (!extracted) {
       // U1 degrade (flag off / chat down / empty / malformed) → raw passthrough.
-      return await passthrough();
+      return await passthrough({
+        code: 'consolidation_extract_degraded',
+        message: 'fact extraction failed, was refused, or returned invalid output',
+      });
     }
     const verdicts = await deps.classify({
       facts: extracted.facts,
@@ -413,21 +464,33 @@ async function landOneConsolidated(
     if (!verdicts) {
       // Only the disabled-connector entry gate returns null here (already gated
       // above) — defensive: degrade to raw passthrough.
-      return await passthrough();
+      return await passthrough({
+        code: 'consolidation_classify_degraded',
+        message: 'fact classification did not produce a durable decision',
+      });
     }
 
-    const { written, threw } = await persistConsolidated(
+    const persisted = await persistConsolidated(
       engine, sourceId, candidate, version, verdicts, deps.surfaceMinConfidence,
     );
-    if (written > 0) return written;
+    diagnostics.push(...persisted.diagnostics);
+    if (persisted.written > 0) return { written: persisted.written, diagnostics };
     // Nothing landed. Preserve via raw passthrough ONLY when the capture genuinely got
     // nothing persisted: empty verdicts (no durable facts → land the idempotency marker
     // so a re-poll skips it) or a verdict that THREW (its INSERT failed). If verdicts
     // existed and ALL merely CONFLICTED (no throw), a concurrent poll already
     // consolidated this capture — return 0, do NOT write a spurious bare-id raw
     // candidate (review finding 3: the all-conflict fallback double-write under a race).
-    if (verdicts.length === 0 || threw) return await passthrough();
-    return 0;
+    if (verdicts.length === 0) {
+      return await passthrough();
+    }
+    if (persisted.threw) {
+      return await passthrough({
+        code: 'consolidation_partition_persist_failed',
+        message: 'one or more consolidation partitions could not be persisted',
+      });
+    }
+    return { written: 0, diagnostics };
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
     // KTD4 degrade: any other throw isolates to THIS record. Throws reach here only
@@ -437,7 +500,10 @@ async function landOneConsolidated(
     // are contained INSIDE persistConsolidated (a poison verdict degrades only
     // itself), and the decision-log write is non-fatal there, so neither re-degrades
     // an already-persisted consolidated row to a raw passthrough.
-    return await passthrough();
+    return await passthrough({
+      code: 'consolidation_record_degraded',
+      message: safeConnectorDiagnostic(err),
+    });
   }
 }
 
@@ -459,15 +525,17 @@ async function persistConsolidated(
   version: string,
   verdicts: ConsolidationClassifyResult[],
   surfaceMinConfidence: number,
-): Promise<{ written: number; threw: boolean }> {
+): Promise<{ written: number; threw: boolean; diagnostics: ConnectorDiagnostic[] }> {
   const captureId = candidate.source_record_id;
   const fanOut = verdicts.length > 1;
   let written = 0;
   let threw = false;
+  const diagnostics: ConnectorDiagnostic[] = [];
   for (const [index, verdict] of verdicts.entries()) {
     try {
       written += await persistOneVerdict(
         engine, sourceId, candidate, captureId, version, verdict, index, fanOut, surfaceMinConfidence,
+        diagnostics,
       );
     } catch (err) {
       if (isAbortError(err)) throw err; // graceful shutdown still propagates.
@@ -485,9 +553,14 @@ async function persistConsolidated(
           `${sourceId}/${fanoutRecordId(captureId, verdict, index, fanOut)} (${verdict.classification}): ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
+      diagnostics.push({
+        stage: 'consolidate',
+        code: 'consolidation_partition_persist_failed',
+        message: safeConnectorDiagnostic(err),
+      });
     }
   }
-  return { written, threw };
+  return { written, threw, diagnostics };
 }
 
 /**
@@ -507,6 +580,7 @@ async function persistOneVerdict(
   index: number,
   fanOut: boolean,
   surfaceMinConfidence: number,
+  diagnostics: ConnectorDiagnostic[],
 ): Promise<number> {
   const recordId = fanoutRecordId(captureId, verdict, index, fanOut);
   // Re-key the per-target row only when fanning out (recordId === captureId for a
@@ -631,6 +705,11 @@ async function persistOneVerdict(
         `(${final.classification}) — candidate row persisted, audit row dropped: ` +
         `${err instanceof Error ? err.message : String(err)}`,
     );
+    diagnostics.push({
+      stage: 'consolidate',
+      code: 'consolidation_decision_log_failed',
+      message: safeConnectorDiagnostic(err),
+    });
   }
   if (fanOut && !written) {
     // Swallowed ON CONFLICT inside a fan-out (review finding 4): the model named one
@@ -843,6 +922,16 @@ async function hasInflightUpdatePage(engine: BrainEngine, targetPath: string): P
 function isAbortError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === 'AbortError' || /aborted|cancell?ed/i.test(err.message);
+}
+
+/** Bounded, one-line diagnostic text suitable for structured connector output. */
+function safeConnectorDiagnostic(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/(?:sk-|Bearer\s+)[A-Za-z0-9._-]{12,}/gi, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240) || 'unknown consolidation failure';
 }
 
 function safeParse(value: string): Record<string, unknown> | null {

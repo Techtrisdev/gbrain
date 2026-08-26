@@ -62,12 +62,33 @@
  * durable) IS marked done so a no-signal session isn't re-paid every poll.
  */
 
-import { chat, isAvailable } from '../ai/gateway.ts';
+import { chat, isAvailable, withBudgetTracker, type ChatResult } from '../ai/gateway.ts';
+import { AIConfigError, AITransientError } from '../ai/errors.ts';
+import { BudgetExhausted, BudgetTracker } from '../budget/budget-tracker.ts';
 import { INJECTION_PATTERNS } from '../think/sanitize.ts';
 import { computeContentHash } from '../ingestion/types.ts';
 import { chunkText } from '../chunkers/recursive.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page, PageInput } from '../types.ts';
+import {
+  advanceSessionHeadBootstrap,
+  claimPendingSessionHeads,
+  closeCircuit,
+  finishDistillRun,
+  finishSession,
+  markProviderCallFailed,
+  markProviderCallInflight,
+  openCircuit,
+  persistProviderResult,
+  prepareProviderCall,
+  quarantineAmbiguousInflightCalls,
+  readCircuit,
+  readPersistedProviderResult,
+  releaseSessionClaim,
+  startDistillRun,
+  supportsContextMirrorOperationalState,
+  type DurableSessionHead,
+} from './context-mirror-state.ts';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -103,6 +124,15 @@ export const MAX_CONVO_CHARS = 48_000;
 const MAX_MEMORY_CHARS = 500;
 /** Max output tokens for the single distillation call. */
 const DISTILL_MAX_TOKENS = 1500;
+/** Safe defaults for unattended callers. Every boundary is finite. */
+export const DEFAULT_MAX_SESSIONS = 5;
+export const DEFAULT_MAX_CALLS = 5;
+export const DEFAULT_MAX_INPUT_TOKENS = 100_000;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 20_000;
+export const DEFAULT_MAX_COST_USD = 0.25;
+export const DEFAULT_MAX_RUNTIME_MS = 10 * 60_000;
+export const DEFAULT_MAX_MEMORY_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * System prompt for the distiller — ported from the proven standalone
@@ -144,6 +174,26 @@ export interface DistillOptions {
   abortSignal?: AbortSignal;
   /** Override the chat model (default: the gateway's configured chat model). */
   model?: string;
+  /** Maximum sessions selected for this run. Default 5. */
+  maxSessions?: number;
+  /** Maximum provider calls for this run. Default 5. */
+  maxCalls?: number;
+  /** Conservative cumulative input-token reservation. Default 100k. */
+  maxInputTokens?: number;
+  /** Conservative cumulative output-token reservation. Default 20k. */
+  maxOutputTokens?: number;
+  /** Optional hard USD ceiling enforced by BudgetTracker. */
+  maxCostUsd?: number;
+  /** Wall-clock ceiling for the run. Default 10 minutes. */
+  maxRuntimeMs?: number;
+  /** Maximum hydrated transcript bytes retained for one session. Default 64 MiB. */
+  maxMemoryBytes?: number;
+  /** Per-provider-call timeout. Default 60 seconds. */
+  requestTimeoutMs?: number;
+  /** Durable executor retries for transient failures. The AI SDK is always called with zero retries. */
+  maxRetries?: number;
+  /** Optional budget audit path (tests and D-drive installations). */
+  budgetAuditPath?: string;
 }
 
 export type SessionStatus =
@@ -151,7 +201,23 @@ export type SessionStatus =
   | 'already_distilled' // a marker already exists; skipped
   | 'active' // newest capture too recent (idle < threshold); skipped
   | 'would_distill' // dry-run: eligible, nothing written
+  | 'deferred' // eligible but outside this run's bounded slice
   | 'failed'; // LLM/gateway failure; NOT marked done (retries next run)
+
+export type DistillErrorClass = 'config' | 'transient' | 'budget' | 'content' | 'validation' | 'unknown';
+export type DistillRunStatus = 'ok' | 'partial' | 'failed';
+export type DistillStopReason =
+  | 'completed'
+  | 'session_limit'
+  | 'call_limit'
+  | 'input_token_limit'
+  | 'output_token_limit'
+  | 'runtime_limit'
+  | 'memory_limit'
+  | 'cost_limit'
+  | 'systemic_failure'
+  | 'chat_unavailable'
+  | 'session_failures';
 
 export interface SessionReport {
   session_id: string;
@@ -165,24 +231,52 @@ export interface SessionReport {
   pages?: string[];
   /** Failure reason for `failed`. */
   error?: string;
+  /** Sanitized classification used for operator action and retry scope. */
+  error_class?: DistillErrorClass;
 }
 
 export interface DistillReport {
+  status: DistillRunStatus;
+  stop_reason: DistillStopReason;
   source_id: string;
   idle_hours_threshold: number;
   dry_run: boolean;
   total_sessions: number;
   eligible: number;
+  selected: number;
+  deferred: number;
   distilled: number;
   memories_written: number;
   pages_written: number;
   skipped_already: number;
   skipped_active: number;
   failed: number;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost_usd: number | null;
+  elapsed_ms: number;
   /** True when the chat gateway was reachable for this run (false → eligible sessions fail). */
   chat_available: boolean;
   sessions: SessionReport[];
 }
+
+interface CaptureSessionSummary {
+  sessionId: string;
+  captureSlugPrefix: string;
+  turns: number;
+  newestMs: number;
+}
+
+type DistillConversationOutcome =
+  | { status: 'distilled'; memories: string[]; usage: ChatResult['usage'] }
+  | { status: 'session_rejected'; errorClass: 'content' | 'validation'; error: string }
+  | {
+      status: 'systemic_failure';
+      errorClass: 'config' | 'transient' | 'budget' | 'unknown';
+      error: string;
+      retryAfterMs?: number;
+    };
 
 // ── Pure helpers (exported for unit tests) ───────────────────────────────────
 
@@ -361,13 +455,31 @@ function isAbort(err: unknown): boolean {
  */
 export async function distillConversation(
   convoText: string,
-  opts: { model?: string; abortSignal?: AbortSignal } = {},
-): Promise<string[] | null> {
-  if (!isAvailable('chat')) return null;
-  if (!convoText.trim()) return [];
+  opts: {
+    model?: string;
+    abortSignal?: AbortSignal;
+    requestTimeoutMs?: number;
+    maxRetries?: number;
+  } = {},
+): Promise<DistillConversationOutcome> {
+  if (!isAvailable('chat')) {
+    return { status: 'systemic_failure', errorClass: 'config', error: 'chat gateway unavailable' };
+  }
+  if (!convoText.trim()) {
+    return {
+      status: 'distilled',
+      memories: [],
+      usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0 },
+    };
+  }
 
   let result;
   try {
+    const timeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const abortSignal = opts.abortSignal
+      ? AbortSignal.any([opts.abortSignal, timeoutSignal])
+      : timeoutSignal;
     result = await chat({
       model: opts.model,
       system: DISTILL_SYSTEM,
@@ -378,20 +490,125 @@ export async function distillConversation(
         },
       ],
       maxTokens: DISTILL_MAX_TOKENS,
-      abortSignal: opts.abortSignal,
+      abortSignal,
+      maxRetries: opts.maxRetries ?? 0,
     });
   } catch (err) {
-    if (isAbort(err)) throw err;
-    return null;
+    if (opts.abortSignal?.aborted && isAbort(err)) throw err;
+    const classified = classifyDistillError(err);
+    return {
+      status: 'systemic_failure',
+      errorClass: classified.errorClass,
+      error: classified.message,
+      retryAfterMs: classified.retryAfterMs,
+    };
   }
-  if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') return null;
-  return parseDistillMemories(result.text);
+  if (result.stopReason === 'refusal' || result.stopReason === 'content_filter') {
+    return { status: 'session_rejected', errorClass: 'content', error: `provider ${result.stopReason}` };
+  }
+  const memories = parseDistillMemories(result.text);
+  if (memories === null) {
+    return { status: 'session_rejected', errorClass: 'validation', error: 'distillation produced no parseable output' };
+  }
+  return { status: 'distilled', memories, usage: result.usage };
+}
+
+function classifyDistillError(err: unknown): {
+  errorClass: 'config' | 'transient' | 'budget' | 'unknown';
+  message: string;
+  retryAfterMs?: number;
+} {
+  const chain: unknown[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && !seen.has(current) && chain.length < 12) {
+    seen.add(current);
+    chain.push(current);
+    if (current && typeof current === 'object') {
+      const row = current as { cause?: unknown; lastError?: unknown; errors?: unknown[] };
+      current = row.cause ?? row.lastError ?? row.errors?.[row.errors.length - 1];
+    } else {
+      break;
+    }
+  }
+
+  const message = sanitizeError(chain.map((value) => value instanceof Error ? value.message : String(value)).find(Boolean) ?? 'unknown provider failure');
+  if (chain.some((value) => value instanceof BudgetExhausted)) return { errorClass: 'budget', message };
+  if (chain.some((value) => value instanceof AIConfigError)) return { errorClass: 'config', message };
+  const retryAfterMs = retryDelayFrom(chain);
+  if (chain.some((value) => value instanceof AITransientError)) {
+    return { errorClass: 'transient', message, retryAfterMs };
+  }
+
+  for (const value of chain) {
+    if (!value || typeof value !== 'object') continue;
+    const row = value as { status?: number; statusCode?: number; code?: string; message?: string };
+    const status = row.status ?? row.statusCode;
+    if (status === 401 || status === 402 || status === 403 || status === 404) {
+      return { errorClass: 'config', message };
+    }
+    if (status === 429 && /billing|credit|quota|spend|payment/i.test(`${row.code ?? ''} ${row.message ?? ''}`)) {
+      return { errorClass: 'config', message };
+    }
+    if (status === 429 || (typeof status === 'number' && status >= 500)) {
+      return { errorClass: 'transient', message, retryAfterMs };
+    }
+  }
+  return { errorClass: 'unknown', message };
+}
+
+function retryDelayFrom(chain: unknown[]): number | undefined {
+  for (const value of chain) {
+    if (!value || typeof value !== 'object') continue;
+    const row = value as {
+      retryAfterMs?: unknown;
+      retry_after_ms?: unknown;
+      responseHeaders?: unknown;
+      headers?: unknown;
+    };
+    const direct = Number(row.retryAfterMs ?? row.retry_after_ms);
+    if (Number.isFinite(direct) && direct >= 0) return Math.min(direct, 30_000);
+    const headers = row.responseHeaders ?? row.headers;
+    let raw: unknown;
+    if (headers instanceof Headers) raw = headers.get('retry-after');
+    else if (headers && typeof headers === 'object') {
+      const record = headers as Record<string, unknown>;
+      raw = record['retry-after'] ?? record['Retry-After'];
+    }
+    if (typeof raw === 'string' && raw.trim()) {
+      const seconds = Number(raw);
+      if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 30_000);
+      const at = Date.parse(raw);
+      if (Number.isFinite(at)) return Math.max(0, Math.min(at - Date.now(), 30_000));
+    }
+  }
+  return undefined;
+}
+
+async function waitForRetry(ms: number, abortSignal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    abortSignal?.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(abortSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  });
+}
+
+function sanitizeError(message: string): string {
+  return message
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/(?:sk-|Bearer\s+)[A-Za-z0-9._-]{12,}/gi, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240) || 'unknown provider failure';
 }
 
 // ── Page builders ────────────────────────────────────────────────────────────
 
 /** Build a distilled-memory PageInput. compiled_truth IS the memory (what the connector reads). */
-function buildMemoryPage(memory: string, sessionId: string, nowIso: string): PageInput {
+function buildMemoryPage(memory: string, sessionId: string, generation: number, nowIso: string): PageInput {
   const title = memory.split('\n')[0]?.slice(0, 80) || 'Distilled memory';
   return {
     type: 'note',
@@ -400,6 +617,7 @@ function buildMemoryPage(memory: string, sessionId: string, nowIso: string): Pag
     timeline: '',
     frontmatter: {
       session_id: sessionId,
+      generation,
       distilled: true,
       distilled_at: nowIso,
       source_kind: 'capture-distill',
@@ -410,7 +628,7 @@ function buildMemoryPage(memory: string, sessionId: string, nowIso: string): Pag
 }
 
 /** Build the idempotency marker PageInput (written at `distill-state/<slug>`). */
-function buildMarkerPage(sessionId: string, count: number, nowIso: string): PageInput {
+function buildMarkerPage(sessionId: string, generation: number, count: number, nowIso: string): PageInput {
   const body = `Session ${sessionId} distilled to ${count} memory statement(s) at ${nowIso}.`;
   return {
     type: 'note',
@@ -419,6 +637,7 @@ function buildMarkerPage(sessionId: string, count: number, nowIso: string): Page
     timeline: '',
     frontmatter: {
       session_id: sessionId,
+      generation,
       distilled_at: nowIso,
       memory_count: count,
       kind: 'distill-marker',
@@ -490,6 +709,69 @@ async function hydrateCapturePages(
   return pages;
 }
 
+/** Discover source-scoped session metadata without hydrating transcript bodies. */
+async function listCaptureSessionSummaries(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<CaptureSessionSummary[]> {
+  const rows = await engine.executeRaw<{
+    session_id: string;
+    capture_slug_prefix: string;
+    turns: number | string;
+    newest_at: Date | string;
+  }>(
+    `WITH capture_sessions AS (
+       SELECT COALESCE(NULLIF(p.frontmatter->>'session_id', ''), split_part(p.slug, '/', 2)) AS session_id,
+              'capture/' || split_part(p.slug, '/', 2) || '/' AS capture_slug_prefix,
+              COUNT(*)::integer AS turns,
+              MAX(
+                CASE
+                  WHEN COALESCE(p.frontmatter->>'captured_at', '') ~
+                       '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}'
+                    THEN (p.frontmatter->>'captured_at')::timestamptz
+                  ELSE p.updated_at
+                END
+              ) AS newest_at
+         FROM pages p
+        WHERE p.source_id = $1
+          AND p.deleted_at IS NULL
+          AND p.slug LIKE 'capture/%'
+        GROUP BY 1, 2
+     )
+     SELECT session_id, capture_slug_prefix, turns, newest_at
+       FROM capture_sessions
+      WHERE session_id <> ''
+      ORDER BY newest_at ASC, session_id ASC`,
+    [sourceId],
+  );
+  return rows.map((row) => ({
+    sessionId: String(row.session_id),
+    captureSlugPrefix: String(row.capture_slug_prefix),
+    turns: Number(row.turns),
+    newestMs: new Date(row.newest_at).getTime(),
+  })).filter((row) => row.sessionId !== '' && Number.isFinite(row.newestMs));
+}
+
+function finiteInt(name: string, value: number | undefined, fallback: number, min: number): number {
+  const resolved = value ?? fallback;
+  if (!Number.isFinite(resolved) || !Number.isInteger(resolved) || resolved < min) {
+    throw new Error(`${name} must be a finite integer >= ${min}`);
+  }
+  return resolved;
+}
+
+function finiteNumber(name: string, value: number | undefined, fallback: number, min: number): number {
+  const resolved = value ?? fallback;
+  if (!Number.isFinite(resolved) || resolved < min) {
+    throw new Error(`${name} must be a finite number >= ${min}`);
+  }
+  return resolved;
+}
+
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 /**
@@ -503,23 +785,147 @@ export async function distillCaptureSessions(
   engine: BrainEngine,
   opts: DistillOptions = {},
 ): Promise<DistillReport> {
+  const startedAt = Date.now();
   const sourceId = opts.sourceId ?? DEFAULT_DISTILL_SOURCE;
-  const idleHours = opts.idleHours ?? DEFAULT_IDLE_HOURS;
+  const idleHours = finiteNumber('idleHours', opts.idleHours, DEFAULT_IDLE_HOURS, 0);
   const dryRun = opts.dryRun ?? false;
   const now = opts.now ?? new Date();
   const nowMs = now.getTime();
   const idleMs = idleHours * 3_600_000;
+  const maxSessions = finiteInt('maxSessions', opts.maxSessions, DEFAULT_MAX_SESSIONS, 1);
+  const maxCalls = finiteInt('maxCalls', opts.maxCalls, DEFAULT_MAX_CALLS, 1);
+  const maxInputTokens = finiteInt('maxInputTokens', opts.maxInputTokens, DEFAULT_MAX_INPUT_TOKENS, 1);
+  const maxOutputTokens = finiteInt('maxOutputTokens', opts.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 1);
+  const maxRuntimeMs = finiteInt('maxRuntimeMs', opts.maxRuntimeMs, DEFAULT_MAX_RUNTIME_MS, 1);
+  const maxMemoryBytes = finiteInt('maxMemoryBytes', opts.maxMemoryBytes, DEFAULT_MAX_MEMORY_BYTES, 1);
+  const requestTimeoutMs = finiteInt('requestTimeoutMs', opts.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 1);
+  const maxRetries = finiteInt('maxRetries', opts.maxRetries, 0, 0);
+  if (opts.maxCostUsd !== undefined && (!Number.isFinite(opts.maxCostUsd) || opts.maxCostUsd <= 0)) {
+    throw new Error('maxCostUsd must be a finite number > 0');
+  }
 
-  // Uncapped enumeration: listAllSlugs returns the COMPLETE slug set (no 100-cap),
-  // so no idle session is silently dropped and the done-set is never truncated.
-  const [captureSlugs, markerSlugs] = await Promise.all([
-    enumerateAllSlugs(engine, sourceId, CAPTURE_PREFIX),
-    enumerateAllSlugs(engine, sourceId, DISTILL_STATE_PREFIX),
-  ]);
-  // Markers need only their slug (done-set); captures are hydrated to full Page rows.
-  const done = doneSlugsFrom(markerSlugs);
-  const capturePages = await hydrateCapturePages(engine, captureSlugs, sourceId);
-  const groups = groupCapturesBySession(capturePages);
+  const durable = !dryRun && supportsContextMirrorOperationalState(engine);
+  let durableRunId: string | null = null;
+  let durableHeads = new Map<string, DurableSessionHead>();
+  let durableEligible = 0;
+  let durableTotal = 0;
+  let bootstrapComplete = true;
+  let summaries: CaptureSessionSummary[];
+  let done: Set<string>;
+
+  if (durable) {
+    await quarantineAmbiguousInflightCalls(engine, sourceId);
+    const bootstrap = await advanceSessionHeadBootstrap(engine, {
+      sourceId,
+      now,
+      idleHours,
+      sessionSlug: toSessionSlug,
+    });
+    bootstrapComplete = bootstrap.complete;
+    durableEligible = bootstrap.pendingEligible;
+    durableTotal = bootstrap.totalHeads;
+    durableRunId = await startDistillRun(engine, sourceId, {
+      maxSessions,
+      maxCalls,
+      maxInputTokens,
+      maxOutputTokens,
+      maxCostUsd: opts.maxCostUsd ?? 0,
+      maxRuntimeMs,
+      maxMemoryBytes,
+      requestTimeoutMs,
+      maxRetries,
+    });
+    const circuit = await readCircuit(engine, sourceId, 'chat');
+    if (circuit.state === 'open' && circuit.nextProbeAt && circuit.nextProbeAt.getTime() > nowMs) {
+      const report: DistillReport = {
+        status: 'failed',
+        stop_reason: 'systemic_failure',
+        source_id: sourceId,
+        idle_hours_threshold: idleHours,
+        dry_run: false,
+        total_sessions: durableTotal,
+        eligible: durableEligible,
+        selected: 0,
+        deferred: durableEligible,
+        distilled: 0,
+        memories_written: 0,
+        pages_written: 0,
+        skipped_already: 0,
+        skipped_active: 0,
+        failed: 0,
+        calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: null,
+        elapsed_ms: Date.now() - startedAt,
+        chat_available: isAvailable('chat'),
+        sessions: [],
+      };
+      await finishDistillRun(engine, durableRunId, {
+        status: report.status,
+        stopReason: 'circuit_open',
+        selected: 0,
+        completed: 0,
+        failed: 0,
+        deferred: report.deferred,
+      });
+      return report;
+    }
+    if (!bootstrapComplete) {
+      const report: DistillReport = {
+        status: 'partial',
+        stop_reason: 'session_limit',
+        source_id: sourceId,
+        idle_hours_threshold: idleHours,
+        dry_run: false,
+        total_sessions: durableTotal,
+        eligible: 0,
+        selected: 0,
+        deferred: 0,
+        distilled: 0,
+        memories_written: 0,
+        pages_written: 0,
+        skipped_already: 0,
+        skipped_active: 0,
+        failed: 0,
+        calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: null,
+        elapsed_ms: Date.now() - startedAt,
+        chat_available: isAvailable('chat'),
+        sessions: [],
+      };
+      await finishDistillRun(engine, durableRunId, {
+        status: report.status,
+        stopReason: 'bootstrap_incomplete',
+        selected: 0,
+        completed: 0,
+        failed: 0,
+        deferred: 0,
+      });
+      return report;
+    }
+    const claimLimit = circuit.state === 'open' ? 1 : maxSessions;
+    const claimed = await claimPendingSessionHeads(engine, sourceId, claimLimit, now);
+    durableHeads = new Map(claimed.map((head) => [head.sessionId, head]));
+    summaries = claimed.map((head) => ({
+      sessionId: head.sessionId,
+      captureSlugPrefix: head.captureSlugPrefix,
+      turns: head.turns,
+      newestMs: head.newestMs,
+    }));
+    done = new Set();
+  } else {
+    // Compatibility path for dry-runs and lightweight unit engines. Real
+    // deployed engines use the durable metadata queue above.
+    const [legacySummaries, markerSlugs] = await Promise.all([
+      listCaptureSessionSummaries(engine, sourceId),
+      enumerateAllSlugs(engine, sourceId, DISTILL_STATE_PREFIX),
+    ]);
+    summaries = legacySummaries;
+    done = doneSlugsFrom(markerSlugs);
+  }
 
   // Chat availability is checked ONCE: when unavailable (no API key / not
   // configured), every eligible session would fail identically — short-circuit
@@ -528,32 +934,38 @@ export async function distillCaptureSessions(
   const chatAvailable = isAvailable('chat');
 
   const report: DistillReport = {
+    status: 'ok',
+    stop_reason: 'completed',
     source_id: sourceId,
     idle_hours_threshold: idleHours,
     dry_run: dryRun,
-    total_sessions: groups.size,
+    total_sessions: summaries.length,
     eligible: 0,
+    selected: 0,
+    deferred: 0,
     distilled: 0,
     memories_written: 0,
     pages_written: 0,
     skipped_already: 0,
     skipped_active: 0,
     failed: 0,
+    calls: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    estimated_cost_usd: null,
+    elapsed_ms: 0,
     chat_available: chatAvailable,
     sessions: [],
   };
 
-  // Stable ordering: oldest-newest by newest capture time, for deterministic output.
-  const ordered = [...groups.entries()].sort((a, b) => newestCaptureMs(a[1]) - newestCaptureMs(b[1]));
-
-  for (const [sessionId, sessionPages] of ordered) {
-    const sessionSlug = toSessionSlug(sessionId);
-    const newest = newestCaptureMs(sessionPages);
-    const idleHrs = newest > 0 ? (nowMs - newest) / 3_600_000 : Number.POSITIVE_INFINITY;
+  const selected: CaptureSessionSummary[] = [];
+  for (const summary of summaries) {
+    const sessionSlug = toSessionSlug(summary.sessionId);
+    const idleHrs = (nowMs - summary.newestMs) / 3_600_000;
     const base: SessionReport = {
-      session_id: sessionId,
+      session_id: summary.sessionId,
       session_slug: sessionSlug,
-      turns: sessionPages.length,
+      turns: summary.turns,
       idle_hours: Math.round(idleHrs * 100) / 100,
       status: 'active',
     };
@@ -563,38 +975,288 @@ export async function distillCaptureSessions(
       report.sessions.push({ ...base, status: 'already_distilled' });
       continue;
     }
-    if (nowMs - newest < idleMs) {
+    if (nowMs - summary.newestMs < idleMs) {
       report.skipped_active += 1;
       report.sessions.push({ ...base, status: 'active' });
       continue;
     }
-
-    // Eligible.
     report.eligible += 1;
-    if (dryRun) {
-      report.sessions.push({ ...base, status: 'would_distill' });
+    if (selected.length < maxSessions) {
+      selected.push(summary);
+    } else {
+      report.deferred += 1;
+      report.sessions.push({ ...base, status: 'deferred' });
+    }
+  }
+  report.selected = selected.length;
+  if (durable) {
+    report.total_sessions = durableTotal;
+    report.eligible = durableEligible;
+    report.selected = selected.length;
+    report.deferred = Math.max(0, durableEligible - selected.length);
+  }
+  if (report.deferred > 0) {
+    report.status = 'partial';
+    report.stop_reason = 'session_limit';
+  }
+
+  const sessionBase = (summary: CaptureSessionSummary): SessionReport => ({
+    session_id: summary.sessionId,
+    session_slug: toSessionSlug(summary.sessionId),
+    turns: summary.turns,
+    idle_hours: Math.round(((nowMs - summary.newestMs) / 3_600_000) * 100) / 100,
+    status: 'active',
+  });
+
+  if (dryRun) {
+    for (const summary of selected) report.sessions.push({ ...sessionBase(summary), status: 'would_distill' });
+    report.elapsed_ms = Date.now() - startedAt;
+    return report;
+  }
+
+  if (!chatAvailable && selected.length > 0) {
+    const [first, ...rest] = selected;
+    report.failed = 1;
+    report.status = 'failed';
+    report.stop_reason = 'chat_unavailable';
+    report.sessions.push({
+      ...sessionBase(first),
+      status: 'failed',
+      error: 'chat gateway unavailable',
+      error_class: 'config',
+    });
+    for (const summary of rest) {
+      report.deferred += 1;
+      report.sessions.push({ ...sessionBase(summary), status: 'deferred' });
+    }
+    report.elapsed_ms = Date.now() - startedAt;
+    if (durable && durableRunId) {
+      for (const head of durableHeads.values()) {
+        await releaseSessionClaim(engine, {
+          sourceId,
+          sessionId: head.sessionId,
+          claimId: head.claimId,
+        });
+      }
+      await openCircuit(
+        engine,
+        sourceId,
+        'chat',
+        'chat gateway unavailable',
+        computeContentHash('config:chat gateway unavailable'),
+        new Date(nowMs + 60 * 60_000),
+      );
+      await finishDistillRun(engine, durableRunId, {
+        status: report.status,
+        stopReason: report.stop_reason,
+        selected: report.selected,
+        completed: report.distilled,
+        failed: report.failed,
+        deferred: report.deferred,
+      });
+    }
+    return report;
+  }
+
+  const tracker = opts.maxCostUsd === undefined
+    ? null
+    : new BudgetTracker({
+      maxCostUsd: opts.maxCostUsd,
+      maxRuntimeMs,
+      label: 'context-mirror-distill',
+      ...(opts.budgetAuditPath ? { auditPath: opts.budgetAuditPath } : {}),
+    });
+  let reservedInputTokens = 0;
+  let reservedOutputTokens = 0;
+
+  const deferRemaining = (from: number, reason: DistillStopReason): void => {
+    for (let i = from; i < selected.length; i++) {
+      report.deferred += 1;
+      report.sessions.push({ ...sessionBase(selected[i]), status: 'deferred' });
+    }
+    report.status = reason === 'systemic_failure' || reason === 'cost_limit' ? 'failed' : 'partial';
+    report.stop_reason = reason;
+  };
+
+  const runSelected = async (): Promise<void> => {
+  for (let index = 0; index < selected.length; index++) {
+    const summary = selected[index];
+    const sessionId = summary.sessionId;
+    const sessionSlug = toSessionSlug(sessionId);
+    const base = sessionBase(summary);
+
+    if (Date.now() - startedAt >= maxRuntimeMs) {
+      deferRemaining(index, 'runtime_limit');
+      break;
+    }
+
+    const captureSlugs = await enumerateAllSlugs(engine, sourceId, summary.captureSlugPrefix);
+    const sessionPages = await hydrateCapturePages(engine, captureSlugs, sourceId);
+    const transcriptBytes = sessionPages.reduce(
+      (sum, page) => sum + Buffer.byteLength(`${page.compiled_truth ?? ''}${page.timeline ?? ''}`, 'utf8'),
+      0,
+    );
+    if (transcriptBytes > maxMemoryBytes) {
+      report.failed += 1;
+      report.sessions.push({
+        ...base,
+        status: 'failed',
+        error: 'session exceeds memory limit',
+        error_class: 'validation',
+      });
+      const durableHead = durableHeads.get(sessionId);
+      if (durable && durableHead) {
+        await finishSession(engine, {
+          sourceId,
+          sessionId,
+          claimId: durableHead.claimId,
+          state: 'quarantined',
+          disposition: 'memory_limit',
+        });
+      }
       continue;
     }
-    if (!chatAvailable) {
-      report.failed += 1;
-      report.sessions.push({ ...base, status: 'failed', error: 'chat gateway unavailable' });
-      continue;
+
+    const convo = assembleConversation(sessionPages);
+    const estimatedInput = estimateTokens(convo);
+    const durableHead = durableHeads.get(sessionId);
+    const generation = durableHead?.generation ?? 1;
+    const recovered = durable
+      ? await readPersistedProviderResult(engine, sourceId, sessionId, generation)
+      : null;
+    if (!recovered) {
+      if (report.calls >= maxCalls) {
+        deferRemaining(index, 'call_limit');
+        break;
+      }
+      if (reservedInputTokens + estimatedInput > maxInputTokens) {
+        deferRemaining(index, 'input_token_limit');
+        break;
+      }
+      if (reservedOutputTokens + DISTILL_MAX_TOKENS > maxOutputTokens) {
+        deferRemaining(index, 'output_token_limit');
+        break;
+      }
+      reservedInputTokens += estimatedInput;
+      reservedOutputTokens += DISTILL_MAX_TOKENS;
+      report.calls += 1;
     }
 
     try {
-      const convo = assembleConversation(sessionPages);
-      const memories = await distillConversation(convo, { model: opts.model, abortSignal: opts.abortSignal });
-      if (memories === null) {
+      let correlationId: string | null = recovered?.correlationId ?? null;
+      let outcome: DistillConversationOutcome;
+      if (recovered) {
+        outcome = {
+          status: 'distilled',
+          memories: recovered.memories,
+          usage: {
+            input_tokens: recovered.usage.input_tokens ?? 0,
+            output_tokens: recovered.usage.output_tokens ?? 0,
+            cache_read_tokens: recovered.usage.cache_read_tokens ?? 0,
+            cache_creation_tokens: recovered.usage.cache_creation_tokens ?? 0,
+          },
+        };
+      } else {
+        let retry = 0;
+        for (;;) {
+          correlationId = null;
+          if (durable && durableRunId) {
+            correlationId = await prepareProviderCall(engine, {
+              runId: durableRunId,
+              sourceId,
+              sessionId,
+              generation,
+              requestFingerprint: computeContentHash(`${opts.model ?? 'default'}\n${convo}`),
+            });
+            await markProviderCallInflight(engine, correlationId);
+          }
+          outcome = await distillConversation(convo, {
+            model: opts.model,
+            abortSignal: opts.abortSignal,
+            requestTimeoutMs,
+            // The durable loop here is the sole retry owner.
+            maxRetries: 0,
+          });
+          if (outcome.status === 'distilled' && durable && correlationId) {
+            await persistProviderResult(engine, correlationId, outcome.memories, outcome.usage);
+          }
+          if (outcome.status !== 'distilled' && durable && correlationId) {
+            await markProviderCallFailed(engine, correlationId, outcome.errorClass, outcome.error);
+          }
+          const canRetry = outcome.status === 'systemic_failure' &&
+            outcome.errorClass === 'transient' && retry < maxRetries;
+          if (!canRetry) break;
+          if (report.calls >= maxCalls ||
+              reservedInputTokens + estimatedInput > maxInputTokens ||
+              reservedOutputTokens + DISTILL_MAX_TOKENS > maxOutputTokens ||
+              Date.now() - startedAt >= maxRuntimeMs) {
+            break;
+          }
+          const delay = outcome.status === 'systemic_failure'
+            ? outcome.retryAfterMs ?? Math.min(1_000 * (2 ** retry), 30_000)
+            : 0;
+          if (Date.now() - startedAt + delay >= maxRuntimeMs) break;
+          await waitForRetry(delay, opts.abortSignal);
+          retry += 1;
+          report.calls += 1;
+          reservedInputTokens += estimatedInput;
+          reservedOutputTokens += DISTILL_MAX_TOKENS;
+        }
+      }
+      if (outcome.status === 'systemic_failure') {
         report.failed += 1;
-        report.sessions.push({ ...base, status: 'failed', error: 'distillation produced no parseable output' });
+        report.sessions.push({
+          ...base,
+          status: 'failed',
+          error: outcome.error,
+          error_class: outcome.errorClass,
+        });
+        if (durable && durableHead) {
+          await releaseSessionClaim(engine, {
+            sourceId,
+            sessionId,
+            claimId: durableHead.claimId,
+          });
+          await openCircuit(
+            engine,
+            sourceId,
+            'chat',
+            outcome.error,
+            computeContentHash(`${outcome.errorClass}:${outcome.error}`),
+            new Date(nowMs + 60 * 60_000),
+          );
+        }
+        deferRemaining(index + 1, outcome.errorClass === 'budget' ? 'cost_limit' : 'systemic_failure');
+        break;
+      }
+      if (outcome.status === 'session_rejected') {
+        report.failed += 1;
+        report.sessions.push({
+          ...base,
+          status: 'failed',
+          error: outcome.error,
+          error_class: outcome.errorClass,
+        });
+        if (durable && durableHead) {
+          await finishSession(engine, {
+            sourceId,
+            sessionId,
+            claimId: durableHead.claimId,
+            state: 'quarantined',
+            disposition: outcome.errorClass,
+          });
+        }
         continue;
       }
+      report.input_tokens += outcome.usage.input_tokens;
+      report.output_tokens += outcome.usage.output_tokens;
+      const memories = outcome.memories;
 
       const nowIso = now.toISOString();
       const written: string[] = [];
       for (let i = 0; i < memories.length; i++) {
         const slug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${i + 1}`;
-        const page = buildMemoryPage(memories[i], sessionId, nowIso);
+        const page = buildMemoryPage(memories[i], sessionId, generation, nowIso);
         await engine.putPage(slug, page, { sourceId });
         // putPage upserts the `pages` row ONLY — it creates no `content_chunks`.
         // The embed sweep (`gbrain embed --stale` / autopilot's embed phase)
@@ -645,7 +1307,7 @@ export async function distillCaptureSessions(
       // fewer memories.
       for (let k = memories.length + 1; k <= memories.length + ORPHAN_PROBE_LIMIT; k++) {
         const orphanSlug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${k}`;
-        if ((await engine.getPage(orphanSlug)) === null) break;
+        if ((await engine.getPage(orphanSlug, { sourceId })) === null) break;
         await engine.deletePage(orphanSlug, { sourceId });
       }
 
@@ -656,7 +1318,7 @@ export async function distillCaptureSessions(
       // pruned by the loop above.
       await engine.putPage(
         `${DISTILL_STATE_PREFIX}${sessionSlug}`,
-        buildMarkerPage(sessionId, memories.length, nowIso),
+        buildMarkerPage(sessionId, generation, memories.length, nowIso),
         { sourceId },
       );
 
@@ -664,16 +1326,67 @@ export async function distillCaptureSessions(
       report.memories_written += memories.length;
       report.pages_written += written.length;
       report.sessions.push({ ...base, status: 'distilled', memories: memories.length, pages: written });
+      if (durable && durableHead) {
+        await finishSession(engine, {
+          sourceId,
+          sessionId,
+          claimId: durableHead.claimId,
+          state: 'complete',
+          disposition: memories.length === 0 ? 'no_signal' : 'distilled',
+        });
+        await closeCircuit(engine, sourceId, 'chat');
+      }
     } catch (err) {
       if (isAbort(err)) throw err; // shutdown propagates
       report.failed += 1;
       report.sessions.push({
         ...base,
         status: 'failed',
-        error: err instanceof Error ? err.message : String(err),
+        error: sanitizeError(err instanceof Error ? err.message : String(err)),
+        error_class: 'unknown',
       });
+      const durableHead = durableHeads.get(sessionId);
+      if (durable && durableHead) {
+        await releaseSessionClaim(engine, {
+          sourceId,
+          sessionId,
+          claimId: durableHead.claimId,
+        });
+      }
     }
   }
 
+  };
+
+  if (tracker) {
+    await withBudgetTracker(tracker, runSelected);
+    report.estimated_cost_usd = tracker.snapshot().cumulativeCostUsd;
+  } else {
+    await runSelected();
+  }
+
+  if (report.status === 'ok' && report.failed > 0) {
+    report.status = 'partial';
+    report.stop_reason = 'session_failures';
+  }
+
+  report.elapsed_ms = Date.now() - startedAt;
+  if (durable && durableRunId) {
+    for (const head of durableHeads.values()) {
+      await releaseSessionClaim(engine, {
+        sourceId,
+        sessionId: head.sessionId,
+        claimId: head.claimId,
+      });
+    }
+    await finishDistillRun(engine, durableRunId, {
+      status: report.status,
+      stopReason: report.stop_reason,
+      selected: report.selected,
+      completed: report.distilled,
+      failed: report.failed,
+      deferred: report.deferred,
+    });
+  }
   return report;
 }

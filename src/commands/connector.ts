@@ -75,6 +75,69 @@ export async function resolveConnectorPollTargets(
   return { targets };
 }
 
+type ConnectorPollRunner = (
+  engine: BrainEngine,
+  target: ConnectorPollTarget,
+) => Promise<ConnectorPollResult>;
+
+function sanitizedPollError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 500) || 'connector poll failed';
+}
+
+/**
+ * Poll every selected target even when one target throws. A connector-specific
+ * outage must be visible in the final result without starving unrelated
+ * connectors that happen to be scheduled in the same process.
+ */
+export async function pollConnectorTargets(
+  engine: BrainEngine,
+  targets: ConnectorPollTarget[],
+  runner: ConnectorPollRunner = runConnectorPoll,
+): Promise<ConnectorPollResult[]> {
+  const results: ConnectorPollResult[] = [];
+  for (const target of targets) {
+    try {
+      results.push(await runner(engine, target));
+    } catch (err) {
+      results.push({
+        ...target,
+        status: 'failed',
+        landed: 0,
+        tombstoned: 0,
+        diagnostics: [{
+          stage: 'poll',
+          code: 'poll_exception',
+          message: sanitizedPollError(err),
+        }],
+      });
+    }
+  }
+  return results;
+}
+
+export interface ConnectorPollSummary {
+  status: 'ok' | 'partial' | 'failed';
+  exitCode: 0 | 1;
+  landed: number;
+  tombstoned: number;
+}
+
+/** Reduce per-target truth into the command's stable overall outcome. */
+export function connectorPollSummary(results: ConnectorPollResult[]): ConnectorPollSummary {
+  const status = results.some((result) => result.status === 'failed')
+    ? 'failed'
+    : results.some((result) => result.status === 'partial')
+      ? 'partial'
+      : 'ok';
+  return {
+    status,
+    exitCode: status === 'failed' ? 1 : 0,
+    landed: results.reduce((n, result) => n + result.landed, 0),
+    tombstoned: results.reduce((n, result) => n + result.tombstoned, 0),
+  };
+}
+
 export async function runConnector(engine: BrainEngine | null, args: string[]): Promise<void> {
   const sub = args[0];
   if (!sub || sub === '--help' || sub === '-h') {
@@ -123,22 +186,24 @@ async function runPoll(engine: BrainEngine | null, args: string[]): Promise<void
     return;
   }
 
-  const results: ConnectorPollResult[] = [];
-  for (const t of targets) {
-    results.push(await runConnectorPoll(engine, t));
-  }
-  const landed = results.reduce((n, r) => n + r.landed, 0);
-  const tombstoned = results.reduce((n, r) => n + r.tombstoned, 0);
+  const results = await pollConnectorTargets(engine, targets);
+  const summary = connectorPollSummary(results);
 
   if (json) {
-    console.log(JSON.stringify({ targets, polled: results.length, landed, tombstoned, results }, null, 2));
+    console.log(JSON.stringify({ targets, polled: results.length, ...summary, results }, null, 2));
   } else {
     for (const r of results) {
-      const tail = r.skippedReason ? `skipped (${r.skippedReason})` : `landed=${r.landed} tombstoned=${r.tombstoned}`;
+      const tail = r.skippedReason
+        ? `skipped (${r.skippedReason})`
+        : `${r.status}: landed=${r.landed} tombstoned=${r.tombstoned}`;
       console.log(`  ${r.sourceId}/${r.provider}: ${tail}`);
     }
-    console.log(`connector poll: ${results.length} target(s) polled, landed=${landed}, tombstoned=${tombstoned}`);
+    console.log(
+      `connector poll: ${summary.status}, ${results.length} target(s) polled, ` +
+        `landed=${summary.landed}, tombstoned=${summary.tombstoned}`,
+    );
   }
+  if (summary.exitCode !== 0) process.exitCode = summary.exitCode;
 }
 
 // ── connector review (U4 + T6) — push what the human must act on TO the human ──────

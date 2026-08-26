@@ -478,7 +478,8 @@ async function incrementalSyncLocked(engine: BrainEngine, source: ConnectorSourc
 
   // No stored syncToken (first push before any backfill) → full resync.
   if (!syncToken) {
-    return calendarConnector.backfill!(engine, source);
+    const result = await calendarConnector.backfill!(engine, source);
+    return typeof result === 'number' ? result : result.landed;
   }
 
   let pageToken: string | null = null;
@@ -493,7 +494,8 @@ async function incrementalSyncLocked(engine: BrainEngine, source: ConnectorSourc
       // 410 Gone: the syncToken is stale. Drop it and full-resync (Google's contract).
       if (err instanceof CalendarGoneError) {
         await clearSyncToken(engine, source);
-        return calendarConnector.backfill!(engine, { ...source, config: dropSyncTokenInSnapshot(source) });
+        const result = await calendarConnector.backfill!(engine, { ...source, config: dropSyncTokenInSnapshot(source) });
+        return typeof result === 'number' ? result : result.landed;
       }
       throw err;
     }

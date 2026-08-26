@@ -236,6 +236,32 @@ describe('runConnectorPoll — AC1: calls backfill, idempotent', () => {
     expect(backfillCalls[0].id).toBe('s1');
   });
 
+  test('a structured partial backfill stays partial instead of looking green', async () => {
+    const provider = 'poll-structured-partial';
+    registerConnector({
+      provider,
+      signatureHeader: 'x-test-signature',
+      verifyWebhook: () => true,
+      accountFromPayload: () => 'acct-1',
+      normalize: () => [],
+      toCandidate: (record, sourceId) => ({ source_id: sourceId, source_record_id: record.sourceRecordId }),
+      backfill: async () => ({
+        status: 'partial',
+        landed: 3,
+        diagnostics: [{ stage: 'distill', code: 'session_limit', message: '8 sessions deferred' }],
+      }),
+    });
+    const { engine } = makeFakeEngine({ sourceRow: { id: 's1', config: withConnector(provider, true) } });
+
+    const result = await runConnectorPoll(engine, { sourceId: 's1', provider }, NO_ENV);
+
+    expect(result.status).toBe('partial');
+    expect(result.landed).toBe(3);
+    expect(result.diagnostics).toEqual([
+      { stage: 'distill', code: 'session_limit', message: '8 sessions deferred' },
+    ]);
+  });
+
   test('REGRESSION: backfill is invoked with `this` bound — a connector using this.normalize (granola-shape) polls cleanly', async () => {
     // poll.ts extracts `const backfill = connector.backfill` into a deferred closure. If
     // that extraction is UNBOUND, `this` is undefined inside backfill and any `this.normalize`

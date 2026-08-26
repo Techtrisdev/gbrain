@@ -28,15 +28,33 @@ import {
   distillCaptureSessions,
   DEFAULT_DISTILL_SOURCE,
   DEFAULT_IDLE_HOURS,
+  DEFAULT_MAX_CALLS,
+  DEFAULT_MAX_COST_USD,
+  DEFAULT_MAX_INPUT_TOKENS,
+  DEFAULT_MAX_MEMORY_BYTES,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  DEFAULT_MAX_RUNTIME_MS,
+  DEFAULT_MAX_SESSIONS,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   type DistillReport,
   type SessionReport,
 } from '../core/connectors/distill.ts';
 
-interface DistillArgs {
+export interface DistillArgs {
   source: string;
   idleHours: number;
   dryRun: boolean;
   json: boolean;
+  maxSessions: number;
+  maxCalls: number;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  maxCostUsd: number;
+  maxRuntimeMs: number;
+  maxMemoryBytes: number;
+  requestTimeoutMs: number;
+  maxRetries: number;
+  model?: string;
 }
 
 const HELP = `Usage: gbrain capture distill [options]
@@ -58,6 +76,16 @@ Options:
                        Distilled pages + markers are written to the SAME source.
   --idle-hours <N>     Only distill sessions whose newest raw capture is older
                        than N hours (= "completed"). Default: ${DEFAULT_IDLE_HOURS}.
+  --max-sessions <N>   Maximum sessions selected (default: ${DEFAULT_MAX_SESSIONS}).
+  --max-calls <N>      Maximum provider calls (default: ${DEFAULT_MAX_CALLS}).
+  --max-input-tokens <N>   Input-token ceiling (default: ${DEFAULT_MAX_INPUT_TOKENS}).
+  --max-output-tokens <N>  Output-token ceiling (default: ${DEFAULT_MAX_OUTPUT_TOKENS}).
+  --max-cost-usd <N>   Hard USD ceiling (default: ${DEFAULT_MAX_COST_USD}).
+  --max-runtime-ms <N> Wall-clock ceiling (default: ${DEFAULT_MAX_RUNTIME_MS}).
+  --max-memory-bytes <N> Per-session transcript ceiling (default: ${DEFAULT_MAX_MEMORY_BYTES}).
+  --request-timeout-ms <N> Provider-call timeout (default: ${DEFAULT_REQUEST_TIMEOUT_MS}).
+  --max-retries <N>    Durable transient retries; SDK retries stay off (default: 0).
+  --model <id>         Explicit chat model override.
   --dry-run            List the sessions that WOULD distill; write nothing.
   --json               Machine-readable report.
   --help, -h           Show this help.
@@ -76,12 +104,50 @@ Examples:
   gbrain capture distill --source capture-events --json
 `;
 
-function parseDistillArgs(args: string[]): DistillArgs | { help: true } {
+function requiredValue(args: string[], index: number, flag: string): string {
+  const value = args[index + 1];
+  if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+  return value;
+}
+
+function finiteFlag(flag: string, value: string, opts: { integer?: boolean; min: number }): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || (opts.integer === true && !Number.isInteger(parsed)) || parsed < opts.min) {
+    const kind = opts.integer === true ? 'integer' : 'number';
+    throw new Error(`${flag} must be a finite ${kind} >= ${opts.min}`);
+  }
+  return parsed;
+}
+
+export function parseDistillArgs(args: string[]): DistillArgs | { help: true } {
   const out: DistillArgs = {
     source: DEFAULT_DISTILL_SOURCE,
     idleHours: DEFAULT_IDLE_HOURS,
     dryRun: false,
     json: false,
+    maxSessions: DEFAULT_MAX_SESSIONS,
+    maxCalls: DEFAULT_MAX_CALLS,
+    maxInputTokens: DEFAULT_MAX_INPUT_TOKENS,
+    maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+    maxCostUsd: DEFAULT_MAX_COST_USD,
+    maxRuntimeMs: DEFAULT_MAX_RUNTIME_MS,
+    maxMemoryBytes: DEFAULT_MAX_MEMORY_BYTES,
+    requestTimeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+    maxRetries: 0,
+  };
+  const integerFlags: Record<string, keyof Pick<
+    DistillArgs,
+    'maxSessions' | 'maxCalls' | 'maxInputTokens' | 'maxOutputTokens' | 'maxRuntimeMs' |
+    'maxMemoryBytes' | 'requestTimeoutMs' | 'maxRetries'
+  >> = {
+    '--max-sessions': 'maxSessions',
+    '--max-calls': 'maxCalls',
+    '--max-input-tokens': 'maxInputTokens',
+    '--max-output-tokens': 'maxOutputTokens',
+    '--max-runtime-ms': 'maxRuntimeMs',
+    '--max-memory-bytes': 'maxMemoryBytes',
+    '--request-timeout-ms': 'requestTimeoutMs',
+    '--max-retries': 'maxRetries',
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -89,16 +155,33 @@ function parseDistillArgs(args: string[]): DistillArgs | { help: true } {
     if (a === '--dry-run') { out.dryRun = true; continue; }
     if (a === '--json') { out.json = true; continue; }
     if (a === '--source') {
-      const v = args[++i];
-      if (v) out.source = v;
+      out.source = requiredValue(args, i, a);
+      i += 1;
       continue;
     }
     if (a === '--idle-hours') {
-      const v = args[++i];
-      const n = Number(v);
-      if (Number.isFinite(n) && n >= 0) out.idleHours = n;
+      out.idleHours = finiteFlag(a, requiredValue(args, i, a), { min: 0 });
+      i += 1;
       continue;
     }
+    const key = integerFlags[a];
+    if (key) {
+      const min = key === 'maxRetries' ? 0 : 1;
+      out[key] = finiteFlag(a, requiredValue(args, i, a), { integer: true, min });
+      i += 1;
+      continue;
+    }
+    if (a === '--max-cost-usd') {
+      out.maxCostUsd = finiteFlag(a, requiredValue(args, i, a), { min: Number.MIN_VALUE });
+      i += 1;
+      continue;
+    }
+    if (a === '--model') {
+      out.model = requiredValue(args, i, a);
+      i += 1;
+      continue;
+    }
+    throw new Error(`unknown capture distill option: ${a}`);
     // unknown flag → ignore (matches `gbrain capture` parsing posture)
   }
   return out;
@@ -115,6 +198,8 @@ function statusLine(s: SessionReport): string {
       return `  – ${s.session_slug}  already distilled`;
     case 'active':
       return `  – ${s.session_slug}  (${s.turns} turns, ${idle}) still active (< threshold)`;
+    case 'deferred':
+      return `  - ${s.session_slug}  (${s.turns} turns, ${idle}) deferred by run limits`;
     case 'failed':
       return `  ✗ ${s.session_slug}  (${s.turns} turns) FAILED: ${s.error ?? 'unknown'}`;
   }
@@ -152,7 +237,14 @@ function renderHuman(r: DistillReport): string {
  * path (cli.ts routes `capture --help` before connecting a DB).
  */
 export async function runCaptureDistill(engine: BrainEngine | null, args: string[]): Promise<void> {
-  const parsed = parseDistillArgs(args);
+  let parsed: DistillArgs | { help: true };
+  try {
+    parsed = parseDistillArgs(args);
+  } catch (err) {
+    console.error(`capture distill: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 2;
+    return;
+  }
   if ('help' in parsed) {
     console.log(HELP);
     return;
@@ -167,6 +259,16 @@ export async function runCaptureDistill(engine: BrainEngine | null, args: string
     sourceId: parsed.source,
     idleHours: parsed.idleHours,
     dryRun: parsed.dryRun,
+    maxSessions: parsed.maxSessions,
+    maxCalls: parsed.maxCalls,
+    maxInputTokens: parsed.maxInputTokens,
+    maxOutputTokens: parsed.maxOutputTokens,
+    maxCostUsd: parsed.maxCostUsd,
+    maxRuntimeMs: parsed.maxRuntimeMs,
+    maxMemoryBytes: parsed.maxMemoryBytes,
+    requestTimeoutMs: parsed.requestTimeoutMs,
+    maxRetries: parsed.maxRetries,
+    model: parsed.model,
   });
 
   if (parsed.json) {
@@ -174,4 +276,5 @@ export async function runCaptureDistill(engine: BrainEngine | null, args: string
   } else {
     process.stdout.write(renderHuman(report));
   }
+  if (report.status === 'failed') process.exitCode = 1;
 }

@@ -2090,6 +2090,8 @@ export interface ChatOpts {
   tools?: ChatToolDef[];
   maxTokens?: number;
   abortSignal?: AbortSignal;
+  /** AI SDK retry count. Queue-backed callers set 0 so they remain the only retry owner. */
+  maxRetries?: number;
   /**
    * Anthropic-specific: cache the system prompt + last tool def. Silently
    * ignored on providers without `supports_prompt_cache`.
@@ -2283,6 +2285,7 @@ export async function chat(opts: ChatOpts): Promise<ChatResult> {
       tools: opts.tools && opts.tools.length > 0 ? tools : undefined,
       maxOutputTokens: opts.maxTokens ?? 4096,
       abortSignal: opts.abortSignal,
+      ...(opts.maxRetries !== undefined && { maxRetries: opts.maxRetries }),
       providerOptions: Object.keys(providerOptions).length > 0 ? providerOptions : undefined,
     });
 

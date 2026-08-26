@@ -6,7 +6,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
-import type { MinionJob, MinionJobStatus } from '../core/minions/types.ts';
+import { UnrecoverableError, type MinionJob, type MinionJobStatus } from '../core/minions/types.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 
@@ -1476,7 +1476,15 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
       seenRecordIds = raw as string[];
     }
     const confirmedEmpty = job.data.confirmedEmpty === true;
-    return await runConnectorPoll(engine, { sourceId, provider, seenRecordIds, confirmedEmpty });
+    const result = await runConnectorPoll(engine, { sourceId, provider, seenRecordIds, confirmedEmpty });
+    if (result.status === 'failed') {
+      const diagnostic = result.diagnostics?.[0];
+      throw new UnrecoverableError(
+        `connector_poll failed for ${sourceId}/${provider}: ` +
+          `${diagnostic?.code ?? 'connector_failed'}: ${diagnostic?.message ?? 'no diagnostic provided'}`,
+      );
+    }
+    return result;
   });
 
   process.stderr.write('[minion worker] brain-health-100 handlers registered (11 ops, 3 protected) + embed-backfill (v0.40) + connector_poll (TECH-2038)\n');

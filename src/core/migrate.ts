@@ -5030,6 +5030,122 @@ export const MIGRATIONS: Migration[] = [
     },
     sql: '', // engine-specific via sqlFor
   },
+  {
+    version: 109,
+    name: 'context_mirror_operational_state',
+    // Source-scoped durable state for bounded capture discovery, session
+    // claims, restart-safe provider calls, and persistent circuit breaking.
+    // Additive and idempotent on both Postgres and PGLite.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
+        session_slug TEXT NOT NULL,
+        capture_slug_prefix TEXT NOT NULL,
+        newest_capture_at TIMESTAMPTZ NOT NULL,
+        turn_count INTEGER NOT NULL CHECK (turn_count >= 0),
+        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        first_eligible_at TIMESTAMPTZ,
+        cohort_at TIMESTAMPTZ,
+        state TEXT NOT NULL DEFAULT 'pending'
+          CHECK (state IN ('pending','claimed','result_persisted','complete','quarantined','ambiguous')),
+        disposition TEXT,
+        claim_id TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        current_generation INTEGER NOT NULL DEFAULT 1 CHECK (current_generation >= 1),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, session_id),
+        CONSTRAINT context_mirror_session_heads_slug_unique UNIQUE (source_id, session_slug),
+        CONSTRAINT context_mirror_session_heads_claim_shape CHECK (
+          (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+          OR state <> 'claimed'
+        )
+      );
+      CREATE INDEX IF NOT EXISTS context_mirror_session_heads_pending_idx
+        ON context_mirror_session_heads (source_id, first_eligible_at, session_id)
+        WHERE state = 'pending' AND first_eligible_at IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS context_mirror_distill_runs (
+        run_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('running','ok','partial','failed','aborted')),
+        stop_reason TEXT,
+        limits JSONB NOT NULL DEFAULT '{}'::jsonb,
+        selected_count INTEGER NOT NULL DEFAULT 0 CHECK (selected_count >= 0),
+        completed_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_count >= 0),
+        failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+        deferred_count INTEGER NOT NULL DEFAULT 0 CHECK (deferred_count >= 0),
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS context_mirror_distill_runs_source_started_idx
+        ON context_mirror_distill_runs (source_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS context_mirror_provider_calls (
+        correlation_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES context_mirror_distill_runs(run_id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        state TEXT NOT NULL CHECK (state IN ('prepared','inflight','result_persisted','failed','ambiguous_provider_outcome')),
+        request_fingerprint TEXT NOT NULL,
+        result_json JSONB,
+        usage_json JSONB,
+        error_class TEXT,
+        error_message TEXT,
+        prepared_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        sent_at TIMESTAMPTZ,
+        result_persisted_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        FOREIGN KEY (source_id, session_id)
+          REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_provider_calls_recoverable_result_idx
+        ON context_mirror_provider_calls (source_id, session_id, generation)
+        WHERE state = 'result_persisted';
+      CREATE INDEX IF NOT EXISTS context_mirror_provider_calls_session_idx
+        ON context_mirror_provider_calls (source_id, session_id, generation, prepared_at DESC);
+
+      CREATE TABLE IF NOT EXISTS context_mirror_circuits (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open','half_open')),
+        reason TEXT,
+        error_fingerprint TEXT,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+        opened_at TIMESTAMPTZ,
+        next_probe_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, provider)
+      );
+
+      CREATE TABLE IF NOT EXISTS context_mirror_checkpoints (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        checkpoint_kind TEXT NOT NULL,
+        cursor JSONB NOT NULL DEFAULT '{}'::jsonb,
+        completed BOOLEAN NOT NULL DEFAULT false,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, checkpoint_kind)
+      );
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'context_mirror_session_heads',
+              'context_mirror_distill_runs',
+              'context_mirror_provider_calls',
+              'context_mirror_circuits',
+              'context_mirror_checkpoints'
+            )`,
+      );
+      return new Set(rows.map((row) => row.table_name)).size === 5;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
