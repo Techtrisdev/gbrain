@@ -23,6 +23,13 @@ import {
   artifactHash,
   type PromotionTarget,
 } from './promotion.ts';
+import {
+  assertPromotionRetryFresh,
+  ensurePromotionTransition,
+  preparePromotionRetry,
+  readPromotionTransitionByCandidate,
+  recordPromotionDispatchBlocked,
+} from './promotion-state.ts';
 
 // ── Input type ────────────────────────────────────────────────────────────────
 
@@ -831,6 +838,21 @@ export interface ApproveResult {
   promotion: { invoked: boolean; pending?: boolean; prUrl?: string; error?: string };
 }
 
+function targetFromAcceptedCandidate(candidate: ConnectorCandidateRow): PromotionTarget {
+  const kind = candidate.target_kind;
+  if (kind == null) throw new PromotionTargetError('accepted candidate is missing its promotion target');
+  return {
+    kind,
+    path: candidate.target_path ?? '',
+    ...(kind === 'update_page'
+      ? {
+          timeline_entry: candidate.timeline_entry ?? undefined,
+          base_compiled_hash: candidate.base_compiled_hash ?? undefined,
+        }
+      : {}),
+  };
+}
+
 /**
  * Approve a PENDING candidate, honoring a MACHINE-pre-computed consolidation UPDATE target when
  * the stored row carries one (U4) and otherwise the reviewer-selected target.
@@ -927,33 +949,77 @@ export async function approveCandidate(
   // 5. Accept UPDATE, guarded by status='pending' for idempotency. A consolidation UPDATE row
   //    keeps its classifier-set target_kind/target_path (do NOT clobber the 'update_page' the
   //    classifier wrote at land time); a reviewer-driven row persists the chosen target.
-  const rows = honorStored
-    ? await engine.executeRaw<ConnectorCandidateRow>(
-        `UPDATE connector_candidates
-            SET status = 'accepted', acted_by = $2, acted_at = now(), artifact_hash = $3
-          WHERE id = $1 AND status = 'pending'
-          RETURNING ${CANDIDATE_COLUMNS}`,
-        [id, strip(actor), hash],
-      )
-    : await engine.executeRaw<ConnectorCandidateRow>(
-        `UPDATE connector_candidates
-            SET status = 'accepted', acted_by = $2, acted_at = now(),
-                target_kind = $3, target_path = $4, artifact_hash = $5
-          WHERE id = $1 AND status = 'pending'
-          RETURNING ${CANDIDATE_COLUMNS}`,
-        [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
-      );
+  const rows = await engine.transaction(async (tx) => {
+    const acceptedRows = honorStored
+      ? await tx.executeRaw<ConnectorCandidateRow>(
+          `UPDATE connector_candidates
+              SET status = 'accepted', acted_by = $2, acted_at = now(), artifact_hash = $3
+            WHERE id = $1 AND status = 'pending'
+            RETURNING ${CANDIDATE_COLUMNS}`,
+          [id, strip(actor), hash],
+        )
+      : await tx.executeRaw<ConnectorCandidateRow>(
+          `UPDATE connector_candidates
+              SET status = 'accepted', acted_by = $2, acted_at = now(),
+                  target_kind = $3, target_path = $4, artifact_hash = $5
+            WHERE id = $1 AND status = 'pending'
+            RETURNING ${CANDIDATE_COLUMNS}`,
+          [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
+        );
+    if (acceptedRows[0]) await ensurePromotionTransition(tx, acceptedRows[0]);
+    return acceptedRows;
+  });
   const row = rows[0] ? coerceCandidateRow(rows[0]) : null;
   if (!row) return { row: null, promotion: { invoked: false } };
 
   // 4. Hand to the promotion hook (build → sign → emit → reflect). Failure stays retriable.
   const hook = getPromotionHook();
-  if (!hook) return { row, promotion: { invoked: false, pending: true } };
+  if (!hook) {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_unavailable');
+    return { row, promotion: { invoked: false, pending: true, error: 'dispatch_hook_unavailable' } };
+  }
   try {
     const result = await hook(engine, row, actor, effectiveTarget);
     return { row, promotion: { invoked: true, prUrl: result.prUrl } };
-  } catch (err) {
+  } catch {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_failed');
     // Bridge failure: the row stays 'accepted' (already committed) — retriable, never lost.
-    return { row, promotion: { invoked: false, pending: true, error: err instanceof Error ? err.message : String(err) } };
+    const transition = await readPromotionTransitionByCandidate(engine, row.id);
+    return { row, promotion: { invoked: false, pending: true, error: transition?.failure_code ?? 'dispatch_failed' } };
+  }
+}
+
+/**
+ * Explicit operator retry for an already-approved candidate. Approval is not
+ * repeated, the v2 correlation identity is reused, and an UPDATE target is
+ * revalidated against current compiled truth before any external dispatch.
+ */
+export async function retryCandidatePromotion(
+  engine: BrainEngine,
+  id: number,
+  actor: string,
+): Promise<ApproveResult> {
+  const [current] = await engine.executeRaw<ConnectorCandidateRow>(
+    `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates WHERE id = $1 AND status = 'accepted'`,
+    [id],
+  );
+  if (!current) return { row: null, promotion: { invoked: false } };
+  const row = coerceCandidateRow(current);
+  const target = targetFromAcceptedCandidate(row);
+  validatePromotionTarget(target);
+  await assertPromotionRetryFresh(engine, row);
+  await preparePromotionRetry(engine, row.id);
+  const hook = getPromotionHook();
+  if (!hook) {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_unavailable');
+    return { row, promotion: { invoked: false, pending: true, error: 'dispatch_hook_unavailable' } };
+  }
+  try {
+    const result = await hook(engine, row, strip(actor), target);
+    return { row, promotion: { invoked: true, prUrl: result.prUrl } };
+  } catch {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_failed');
+    const transition = await readPromotionTransitionByCandidate(engine, row.id);
+    return { row, promotion: { invoked: false, pending: true, error: transition?.failure_code ?? 'dispatch_failed' } };
   }
 }

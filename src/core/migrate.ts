@@ -5367,6 +5367,161 @@ export const MIGRATIONS: Migration[] = [
         && indexes.some((row) => row.indexdef.includes('current_eligible_at'));
     },
   },
+  {
+    version: 112,
+    name: 'connector_promotion_monotonic_lifecycle',
+    idempotent: true,
+    sql: `
+      INSERT INTO config (key, value)
+        VALUES ('connectors.promotion_dispatch_frozen', 'true')
+        ON CONFLICT (key) DO UPDATE SET value = 'true';
+
+      CREATE TABLE IF NOT EXISTS connector_promotion_transitions (
+        candidate_id BIGINT PRIMARY KEY REFERENCES connector_candidates(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        correlation_id TEXT NOT NULL UNIQUE,
+        identity_version INTEGER NOT NULL DEFAULT 2 CHECK (identity_version = 2),
+        state TEXT NOT NULL CHECK (state IN (
+          'accepted_dispatching','dispatch_failed','pr_opened','merged_reindexing',
+          'indexing_failed','indexed','unresolved_legacy'
+        )),
+        last_durable_stage TEXT NOT NULL CHECK (last_durable_stage IN ('accepted','pr_opened','merged_reindexing','indexed')),
+        failure_code TEXT,
+        next_action TEXT NOT NULL CHECK (next_action IN (
+          'dispatch','reconcile_dispatch','await_pr_opened','await_merge','retry_indexing',
+          'review_stale_update','resolve_legacy','none'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        last_attempt_at TIMESTAMPTZ,
+        callback_received_at TIMESTAMPTZ,
+        accepted_at TIMESTAMPTZ NOT NULL,
+        pr_opened_at TIMESTAMPTZ,
+        merged_at TIMESTAMPTZ,
+        indexed_at TIMESTAMPTZ,
+        pr_url TEXT,
+        branch TEXT,
+        merge_sha TEXT,
+        workflow_run_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS connector_promotion_transitions_source_state_idx
+        ON connector_promotion_transitions (source_id, state, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS connector_promotion_attempts (
+        id BIGSERIAL PRIMARY KEY,
+        candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+        correlation_id TEXT NOT NULL,
+        attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+        outcome TEXT NOT NULL CHECK (outcome IN ('prepared','succeeded','failed','unresolved')),
+        error_code TEXT,
+        actor TEXT,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at TIMESTAMPTZ,
+        UNIQUE (candidate_id, attempt_no)
+      );
+      CREATE INDEX IF NOT EXISTS connector_promotion_attempts_correlation_idx
+        ON connector_promotion_attempts (correlation_id, attempt_no DESC);
+
+      CREATE TABLE IF NOT EXISTS connector_promotion_events (
+        id BIGSERIAL PRIMARY KEY,
+        candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+        correlation_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (event_type IN ('migration','dispatch','callback','retry')),
+        from_state TEXT,
+        requested_state TEXT,
+        resulting_state TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('applied','stale','rejected','unresolved')),
+        reason_code TEXT,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS connector_promotion_events_correlation_idx
+        ON connector_promotion_events (correlation_id, occurred_at DESC, id DESC);
+
+      DO $$
+      DECLARE has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE connector_promotion_transitions ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE connector_promotion_attempts ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE connector_promotion_events ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+
+      INSERT INTO connector_promotion_transitions (
+        candidate_id, source_id, correlation_id, state, last_durable_stage,
+        failure_code, next_action, attempt_count, last_attempt_at, callback_received_at,
+        accepted_at, pr_opened_at, indexed_at, pr_url, branch
+      )
+      SELECT c.id, c.source_id,
+             'cm-promo-v2-c' || c.id::text || '-g' || COALESCE(c.context_generation, 0)::text,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'indexed'
+               WHEN c.promotion_status = 'pr_opened' THEN 'pr_opened'
+               WHEN c.promotion_status IS NULL THEN 'dispatch_failed'
+               ELSE 'unresolved_legacy'
+             END,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'indexed'
+               WHEN c.promotion_status = 'pr_opened' THEN 'pr_opened'
+               ELSE 'accepted'
+             END,
+             CASE
+               WHEN c.promotion_status IS NULL THEN 'legacy_dispatch_outcome_unknown'
+               WHEN c.promotion_status NOT IN ('pr_opened','indexed') THEN 'legacy_stage_unresolved'
+               ELSE NULL
+             END,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'none'
+               WHEN c.promotion_status = 'pr_opened' THEN 'await_merge'
+               WHEN c.promotion_status IS NULL THEN 'reconcile_dispatch'
+               ELSE 'resolve_legacy'
+             END,
+             CASE WHEN c.artifact_hash IS NULL THEN 0 ELSE 1 END,
+             CASE WHEN c.artifact_hash IS NULL THEN NULL ELSE COALESCE(c.promoted_at, c.acted_at) END,
+             c.promoted_at,
+             COALESCE(c.acted_at, c.proposed_at),
+             CASE WHEN c.promotion_status IN ('pr_opened','indexed') THEN c.promoted_at ELSE NULL END,
+             CASE WHEN c.promotion_status = 'indexed' THEN c.promoted_at ELSE NULL END,
+             c.promotion_pr_url, c.promotion_branch
+        FROM connector_candidates c
+       WHERE c.status = 'accepted'
+      ON CONFLICT (candidate_id) DO NOTHING;
+
+      INSERT INTO connector_promotion_events (
+        candidate_id, correlation_id, event_type, requested_state, resulting_state, outcome, reason_code
+      )
+      SELECT t.candidate_id, t.correlation_id, 'migration', t.state, t.state,
+             CASE WHEN t.state = 'unresolved_legacy' THEN 'unresolved' ELSE 'applied' END,
+             t.failure_code
+        FROM connector_promotion_transitions t
+       WHERE NOT EXISTS (
+         SELECT 1 FROM connector_promotion_events e
+          WHERE e.candidate_id = t.candidate_id AND e.event_type = 'migration'
+       );
+
+      INSERT INTO connector_promotion_attempts (
+        candidate_id, correlation_id, attempt_no, outcome, error_code, actor, started_at, finished_at
+      )
+      SELECT t.candidate_id, t.correlation_id, 1, 'unresolved', 'legacy_attempt_unverified', 'migration',
+             COALESCE(t.last_attempt_at, t.accepted_at), COALESCE(t.last_attempt_at, t.accepted_at)
+        FROM connector_promotion_transitions t
+       WHERE t.attempt_count > 0
+      ON CONFLICT (candidate_id, attempt_no) DO NOTHING;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'connector_promotion_transitions','connector_promotion_attempts','connector_promotion_events'
+            )`,
+      );
+      const frozen = await engine.getConfig('connectors.promotion_dispatch_frozen');
+      return new Set(rows.map((row) => row.table_name)).size === 3 && frozen === 'true';
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

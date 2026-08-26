@@ -7,6 +7,11 @@ import {
 } from '../src/core/operations.ts';
 import { dispatchToolCall } from '../src/mcp/dispatch.ts';
 import type { ContextMirrorStatusV1 } from '../src/core/connectors/context-mirror-status.ts';
+import { toRow } from '../src/core/connectors/candidate.ts';
+import {
+  applyPromotionCallbackTransition,
+  ensurePromotionTransition,
+} from '../src/core/connectors/promotion-state.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
@@ -242,5 +247,42 @@ describe('context_mirror_status read contract', () => {
     });
     expect(forced.isError).toBe(true);
     expect(JSON.parse(forced.content[0].text)).toMatchObject({ error: 'permission_denied' });
+  });
+
+  test('reports the durable promotion ledger instead of inferring PR or index success', async () => {
+    await configureSource('default');
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_checkpoints (source_id, checkpoint_kind, cursor, completed)
+       VALUES ('default','capture_session_scan_v1','{}'::jsonb,true)`,
+    );
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'status-promotion',
+      provider: 'context_mirror',
+      proposed_markdown: '# Promotion status evidence',
+      status: 'accepted',
+      context_generation: 3,
+    });
+    const missing = await status(context(), 'default');
+    expect(missing.promotion.transition_missing).toBe(1);
+    expect(missing.overall.reason_codes).toContain('promotion_transition_missing');
+    const transition = await ensurePromotionTransition(engine, row);
+
+    const waiting = await status(context(), 'default');
+    expect(waiting.promotion.dispatch_frozen).toBe(true);
+    expect(waiting.promotion.promotion_states.accepted_dispatching).toBe(1);
+    expect(waiting.promotion.last_indexed_at).toBeNull();
+    expect(waiting.promotion.proof_state).toBe('unknown_no_indexed_transition');
+    expect(waiting.overall.reason_codes).toContain('promotion_dispatch_frozen_with_work');
+
+    await applyPromotionCallbackTransition(engine, transition.correlation_id, 'indexed', {
+      mergeSha: 'c'.repeat(40),
+      workflowRunId: '123',
+    });
+    const indexed = await status(context(), 'default');
+    expect(indexed.promotion.promotion_states.indexed).toBe(1);
+    expect(indexed.promotion.last_indexed_at).not.toBeNull();
+    expect(indexed.promotion.post_approval_indexing_latency_seconds).toBeGreaterThanOrEqual(0);
+    expect(indexed.promotion.proof_state).toBe('recorded');
   });
 });

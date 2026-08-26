@@ -6,8 +6,8 @@
  *  - the artifact has EXACTLY the 5 top-level keys + target has EXACTLY 4 keys (drift guard).
  *  - hex signature verifies against an independent node:crypto recomputation.
  *  - path validation rejects '..' / absolute / URL-scheme / backslash; existing_page needs a path.
- *  - emit failure → candidate stays accepted with NO promotion_status (injected failing http).
- *  - successful emit → promotion_status set.
+ *  - emit failure → candidate stays accepted with a durable retryable failure state.
+ *  - successful emit → dispatch remains pending until a signed callback proves PR creation.
  *  - log-capture: no secret / signature / full artifact ever logged.
  *  - duplicate approve is a guarded no-op.
  *
@@ -19,8 +19,17 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { createHmac, createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { MIGRATIONS } from '../src/core/migrate.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { toRow, approveCandidate, validatePromotionTarget, registerPromotionHook, PromotionTargetError, type PromotionHook } from '../src/core/connectors/candidate.ts';
+import {
+  toRow,
+  approveCandidate,
+  retryCandidatePromotion,
+  validatePromotionTarget,
+  registerPromotionHook,
+  PromotionTargetError,
+  type PromotionHook,
+} from '../src/core/connectors/candidate.ts';
 import {
   buildPromotionArtifact,
   canonicalizeArtifactForSigning,
@@ -36,6 +45,7 @@ import {
   type FetchFn,
 } from '../src/core/connectors/promotion.ts';
 import { makePromotionHook } from '../src/core/connectors/promotion-hook.ts';
+import { compiledTruthHash } from '../src/core/connectors/consolidate.ts';
 
 let engine: PGLiteEngine;
 
@@ -57,6 +67,7 @@ beforeEach(async () => {
   // Disable it (0) so the minimal bodies still flow. The gate itself is covered by the
   // dedicated substance-gate tests in connector-candidate.serial.test.ts.
   await engine.setConfig('connectors.min_candidate_body_chars', '0');
+  await engine.setConfig('connectors.promotion_dispatch_frozen', 'false');
 });
 
 const SECRET = 'test-promotion-hmac-secret-0123456789';
@@ -316,7 +327,7 @@ describe('approveCandidate + promotion hook (end-to-end, injected fetch)', () =>
     expect(res.row!.artifact_hash).toBe(expectedHash);
   });
 
-  test('emit failure → candidate accepted with NO promotion_status (retriable)', async () => {
+  test('emit failure keeps approval but records a durable retryable failure', async () => {
     const failing: FetchFn = async () => ({ ok: false, status: 500, text: async () => 'boom' });
     registerPromotionHook(makePromotionHook(deps(failing)));
     const { row } = await toRow(engine, { source_id: 'default', source_record_id: 'ap-fail', provider: 'crunchbase', proposed_markdown: '# X' });
@@ -324,23 +335,32 @@ describe('approveCandidate + promotion hook (end-to-end, injected fetch)', () =>
     expect(res.row!.status).toBe('accepted');         // decision committed
     expect(res.promotion.invoked).toBe(false);
     expect(res.promotion.pending).toBe(true);          // retriable
-    // Re-read: promotion_status MUST be null (never marked promoted on failure).
-    const [after] = await engine.executeRaw<{ promotion_status: string | null }>(
-      `SELECT promotion_status FROM connector_candidates WHERE id = $1`, [row.id],
+    const [after] = await engine.executeRaw<{ promotion_status: string | null; state: string; attempt_count: number }>(
+      `SELECT c.promotion_status, p.state, p.attempt_count
+         FROM connector_candidates c
+         JOIN connector_promotion_transitions p ON p.candidate_id = c.id
+        WHERE c.id = $1`, [row.id],
     );
-    expect(after.promotion_status).toBeNull();
+    expect(after.promotion_status).toBe('failed');
+    expect(after.state).toBe('dispatch_failed');
+    expect(Number(after.attempt_count)).toBe(1);
   });
 
-  test('successful emit → promotion_status set to pr_opened', async () => {
+  test('successful emit waits for a signed PR-opened callback', async () => {
     const ok: FetchFn = async () => ({ ok: true, status: 204, text: async () => '' });
     registerPromotionHook(makePromotionHook(deps(ok)));
     const { row } = await toRow(engine, { source_id: 'default', source_record_id: 'ap-ok', provider: 'crunchbase', proposed_markdown: '# X' });
     const res = await approveCandidate(engine, row.id, 'admin', INBOX);
     expect(res.promotion.invoked).toBe(true);
-    const [after] = await engine.executeRaw<{ promotion_status: string | null }>(
-      `SELECT promotion_status FROM connector_candidates WHERE id = $1`, [row.id],
+    const [after] = await engine.executeRaw<{ promotion_status: string | null; state: string; attempt_count: number }>(
+      `SELECT c.promotion_status, p.state, p.attempt_count
+         FROM connector_candidates c
+         JOIN connector_promotion_transitions p ON p.candidate_id = c.id
+        WHERE c.id = $1`, [row.id],
     );
-    expect(after.promotion_status).toBe('pr_opened');
+    expect(after.promotion_status).toBeNull();
+    expect(after.state).toBe('accepted_dispatching');
+    expect(Number(after.attempt_count)).toBe(1);
   });
 
   test('duplicate approve is an idempotent no-op (status guard → second call row null)', async () => {
@@ -725,5 +745,200 @@ describe('U4 approveCandidate: honor the stored consolidation UPDATE target (end
       [row.id],
     );
     expect(after.status).toBe('pending');
+  });
+});
+
+describe('durable promotion retry lifecycle', () => {
+  afterEach(() => registerPromotionHook(null));
+
+  const hookDeps = (fetchFn: FetchFn) => ({
+    getSecret: () => SECRET,
+    getGithubToken: () => TOKEN,
+    fetchFn,
+  });
+
+  test('migration freeze blocks outbound dispatch and leaves an explicit operator action', async () => {
+    await engine.setConfig('connectors.promotion_dispatch_frozen', 'true');
+    let fetchCalls = 0;
+    registerPromotionHook(makePromotionHook(hookDeps(async () => {
+      fetchCalls += 1;
+      return { ok: true, status: 204, text: async () => '' };
+    })));
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'freeze-block',
+      provider: 'crunchbase',
+      proposed_markdown: '# Freeze block',
+    });
+
+    const approved = await approveCandidate(engine, row.id, 'admin', INBOX);
+    expect(approved.row?.status).toBe('accepted');
+    expect(approved.promotion.pending).toBe(true);
+    expect(fetchCalls).toBe(0);
+    const [transition] = await engine.executeRaw<{ state: string; failure_code: string; next_action: string; attempt_count: number }>(
+      `SELECT state, failure_code, next_action, attempt_count
+         FROM connector_promotion_transitions WHERE candidate_id = $1`,
+      [row.id],
+    );
+    expect(transition.state).toBe('dispatch_failed');
+    expect(transition.failure_code).toBe('dispatch_frozen');
+    expect(transition.next_action).toBe('reconcile_dispatch');
+    expect(Number(transition.attempt_count)).toBe(0);
+  });
+
+  test('operator retry reuses identity, increments attempts, and does not repeat approval', async () => {
+    let fail = true;
+    registerPromotionHook(makePromotionHook(hookDeps(async () => (
+      fail
+        ? { ok: false, status: 503, text: async () => 'unavailable' }
+        : { ok: true, status: 204, text: async () => '' }
+    ))));
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'retry-once',
+      provider: 'crunchbase',
+      proposed_markdown: '# Retry once',
+      context_generation: 7,
+    });
+
+    await approveCandidate(engine, row.id, 'reviewer-a', INBOX);
+    const [before] = await engine.executeRaw<{ correlation_id: string; attempt_count: number; acted_at: Date }>(
+      `SELECT p.correlation_id, p.attempt_count, c.acted_at
+         FROM connector_promotion_transitions p
+         JOIN connector_candidates c ON c.id = p.candidate_id
+        WHERE p.candidate_id = $1`,
+      [row.id],
+    );
+    expect(before.correlation_id).toBe(`cm-promo-v2-c${row.id}-g7`);
+    expect(Number(before.attempt_count)).toBe(1);
+
+    fail = false;
+    const retried = await retryCandidatePromotion(engine, row.id, 'operator-retry');
+    expect(retried.promotion.invoked).toBe(true);
+    const [after] = await engine.executeRaw<{ correlation_id: string; attempt_count: number; state: string; acted_at: Date }>(
+      `SELECT p.correlation_id, p.attempt_count, p.state, c.acted_at
+         FROM connector_promotion_transitions p
+         JOIN connector_candidates c ON c.id = p.candidate_id
+        WHERE p.candidate_id = $1`,
+      [row.id],
+    );
+    expect(after.correlation_id).toBe(before.correlation_id);
+    expect(Number(after.attempt_count)).toBe(2);
+    expect(after.state).toBe('accepted_dispatching');
+    expect(new Date(after.acted_at).toISOString()).toBe(new Date(before.acted_at).toISOString());
+    const attempts = await engine.executeRaw<{ attempt_no: number; outcome: string }>(
+      `SELECT attempt_no, outcome FROM connector_promotion_attempts
+        WHERE candidate_id = $1 ORDER BY attempt_no`,
+      [row.id],
+    );
+    expect(attempts.map((attempt) => [Number(attempt.attempt_no), attempt.outcome])).toEqual([
+      [1, 'failed'],
+      [2, 'succeeded'],
+    ]);
+  });
+
+  test('retry of an UPDATE stops before dispatch when compiled truth changed', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ('shared','shared','{}'::jsonb)`,
+    );
+    const original = 'Original reviewed compiled truth.';
+    await engine.putPage('integrations/acme', {
+      type: 'integration',
+      title: 'Acme',
+      compiled_truth: original,
+    }, { sourceId: 'shared' });
+    registerPromotionHook(makePromotionHook(hookDeps(async () => ({
+      ok: false,
+      status: 503,
+      text: async () => 'unavailable',
+    }))));
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'stale-update-retry',
+      provider: 'context_mirror',
+      proposed_markdown: 'Updated compiled truth with enough content.',
+      classification: 'UPDATE',
+      target_kind: 'update_page',
+      target_path: 'integrations/acme.md',
+      timeline_entry: '2026-08-26 — Proposed update from reviewed evidence.',
+      base_compiled_hash: compiledTruthHash(original),
+    });
+    await approveCandidate(engine, row.id, 'reviewer-a', INBOX);
+    await engine.putPage('integrations/acme', {
+      type: 'integration',
+      title: 'Acme',
+      compiled_truth: 'A different reviewer changed this page first.',
+    }, { sourceId: 'shared' });
+
+    let fetchCalls = 0;
+    registerPromotionHook(makePromotionHook(hookDeps(async () => {
+      fetchCalls += 1;
+      return { ok: true, status: 204, text: async () => '' };
+    })));
+    await expect(retryCandidatePromotion(engine, row.id, 'operator-retry')).rejects.toThrow('stale_update_target');
+    expect(fetchCalls).toBe(0);
+    const [transition] = await engine.executeRaw<{ state: string; failure_code: string; next_action: string; attempt_count: number }>(
+      `SELECT state, failure_code, next_action, attempt_count
+         FROM connector_promotion_transitions WHERE candidate_id = $1`,
+      [row.id],
+    );
+    expect(transition).toMatchObject({
+      state: 'dispatch_failed',
+      failure_code: 'stale_update_target',
+      next_action: 'review_stale_update',
+    });
+    expect(Number(transition.attempt_count)).toBe(1);
+  });
+});
+
+describe('promotion lifecycle migration', () => {
+  test('freezes dispatch and maps every legacy accepted row or flags it unresolved, idempotently', async () => {
+    const seeds = await Promise.all([
+      toRow(engine, { source_id: 'default', source_record_id: 'legacy-unknown', proposed_markdown: '# Unknown' }),
+      toRow(engine, { source_id: 'default', source_record_id: 'legacy-opened', proposed_markdown: '# Opened' }),
+      toRow(engine, { source_id: 'default', source_record_id: 'legacy-needs-fix', proposed_markdown: '# Needs fix' }),
+    ]);
+    await engine.executeRaw(
+      `UPDATE connector_candidates
+          SET status = 'accepted', acted_at = now(), acted_by = 'legacy', artifact_hash = 'legacy-artifact'
+        WHERE id = ANY($1::bigint[])`,
+      [seeds.map(({ row }) => row.id)],
+    );
+    await engine.executeRaw(
+      `UPDATE connector_candidates SET promotion_status = 'pr_opened', promoted_at = now() WHERE id = $1`,
+      [seeds[1].row.id],
+    );
+    await engine.executeRaw(
+      `UPDATE connector_candidates SET promotion_status = 'needs_fix', promoted_at = now() WHERE id = $1`,
+      [seeds[2].row.id],
+    );
+    await engine.executeRaw('DELETE FROM connector_promotion_events');
+    await engine.executeRaw('DELETE FROM connector_promotion_attempts');
+    await engine.executeRaw('DELETE FROM connector_promotion_transitions');
+
+    const migration = MIGRATIONS.find((item) => item.version === 112);
+    expect(migration?.sql).toBeTruthy();
+    await engine.runMigration(migration!.version, migration!.sql!);
+    await engine.runMigration(migration!.version, migration!.sql!);
+
+    expect(await engine.getConfig('connectors.promotion_dispatch_frozen')).toBe('true');
+    const rows = await engine.executeRaw<{ source_record_id: string; state: string; failure_code: string | null; next_action: string }>(
+      `SELECT c.source_record_id, p.state, p.failure_code, p.next_action
+         FROM connector_promotion_transitions p
+         JOIN connector_candidates c ON c.id = p.candidate_id
+        ORDER BY c.source_record_id`,
+    );
+    expect(rows).toEqual([
+      { source_record_id: 'legacy-needs-fix', state: 'unresolved_legacy', failure_code: 'legacy_stage_unresolved', next_action: 'resolve_legacy' },
+      { source_record_id: 'legacy-opened', state: 'pr_opened', failure_code: null, next_action: 'await_merge' },
+      { source_record_id: 'legacy-unknown', state: 'dispatch_failed', failure_code: 'legacy_dispatch_outcome_unknown', next_action: 'reconcile_dispatch' },
+    ]);
+    const [counts] = await engine.executeRaw<{ events: number; attempts: number }>(
+      `SELECT
+         (SELECT count(*) FROM connector_promotion_events) AS events,
+         (SELECT count(*) FROM connector_promotion_attempts) AS attempts`,
+    );
+    expect(Number(counts.events)).toBe(3);
+    expect(Number(counts.attempts)).toBe(3);
   });
 });

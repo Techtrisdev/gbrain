@@ -481,7 +481,8 @@ INSERT INTO config (key, value) VALUES
   ('version', '1'),
   ('embedding_model', 'text-embedding-3-large'),
   ('embedding_dimensions', '1536'),
-  ('chunk_strategy', 'semantic')
+  ('chunk_strategy', 'semantic'),
+  ('connectors.promotion_dispatch_frozen', 'true')
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================
@@ -1265,6 +1266,70 @@ CREATE INDEX IF NOT EXISTS connector_candidates_context_lineage_idx
   ON connector_candidates (source_id, context_session_id, context_generation, context_partition)
   WHERE context_session_id IS NOT NULL;
 
+-- Monotonic post-approval lifecycle. These rows record dispatch and callback
+-- evidence; they never approve, merge, or write shared Brain content.
+CREATE TABLE IF NOT EXISTS connector_promotion_transitions (
+  candidate_id BIGINT PRIMARY KEY REFERENCES connector_candidates(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  correlation_id TEXT NOT NULL UNIQUE,
+  identity_version INTEGER NOT NULL DEFAULT 2 CHECK (identity_version = 2),
+  state TEXT NOT NULL CHECK (state IN (
+    'accepted_dispatching','dispatch_failed','pr_opened','merged_reindexing',
+    'indexing_failed','indexed','unresolved_legacy'
+  )),
+  last_durable_stage TEXT NOT NULL CHECK (last_durable_stage IN ('accepted','pr_opened','merged_reindexing','indexed')),
+  failure_code TEXT,
+  next_action TEXT NOT NULL CHECK (next_action IN (
+    'dispatch','reconcile_dispatch','await_pr_opened','await_merge','retry_indexing',
+    'review_stale_update','resolve_legacy','none'
+  )),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_attempt_at TIMESTAMPTZ,
+  callback_received_at TIMESTAMPTZ,
+  accepted_at TIMESTAMPTZ NOT NULL,
+  pr_opened_at TIMESTAMPTZ,
+  merged_at TIMESTAMPTZ,
+  indexed_at TIMESTAMPTZ,
+  pr_url TEXT,
+  branch TEXT,
+  merge_sha TEXT,
+  workflow_run_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS connector_promotion_transitions_source_state_idx
+  ON connector_promotion_transitions (source_id, state, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS connector_promotion_attempts (
+  id BIGSERIAL PRIMARY KEY,
+  candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+  correlation_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+  outcome TEXT NOT NULL CHECK (outcome IN ('prepared','succeeded','failed','unresolved')),
+  error_code TEXT,
+  actor TEXT,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at TIMESTAMPTZ,
+  UNIQUE (candidate_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS connector_promotion_attempts_correlation_idx
+  ON connector_promotion_attempts (correlation_id, attempt_no DESC);
+
+CREATE TABLE IF NOT EXISTS connector_promotion_events (
+  id BIGSERIAL PRIMARY KEY,
+  candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+  correlation_id TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('migration','dispatch','callback','retry')),
+  from_state TEXT,
+  requested_state TEXT,
+  resulting_state TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('applied','stale','rejected','unresolved')),
+  reason_code TEXT,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS connector_promotion_events_correlation_idx
+  ON connector_promotion_events (correlation_id, occurred_at DESC, id DESC);
+
 -- ============================================================
 -- consolidation_decisions (U6): Memory Consolidation Engine decision log.
 -- One durable row per classification, keyed on the candidate idempotency
@@ -1626,6 +1691,9 @@ BEGIN
     ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
     -- TECH-2031 connector candidates store
     ALTER TABLE connector_candidates ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE connector_promotion_transitions ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE connector_promotion_attempts ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE connector_promotion_events ENABLE ROW LEVEL SECURITY;
     -- TECH-2033 encrypted connector token custody store
     ALTER TABLE connector_tokens ENABLE ROW LEVEL SECURITY;
     ALTER TABLE context_mirror_session_heads ENABLE ROW LEVEL SECURITY;

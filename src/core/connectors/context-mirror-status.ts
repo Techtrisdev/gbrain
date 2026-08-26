@@ -131,11 +131,18 @@ export interface ContextMirrorStatusV1 {
   };
   promotion: {
     candidate_states: Record<'pending' | 'needs_review' | 'awaiting_review_capacity' | 'accepted' | 'rejected', number>;
-    promotion_states: Record<'not_dispatched' | 'pr_opened' | 'indexed' | 'promoted_to_inbox' | 'needs_fix' | 'failed', number>;
+    dispatch_frozen: boolean;
+    promotion_states: Record<
+      'accepted_dispatching' | 'dispatch_failed' | 'pr_opened' | 'merged_reindexing' |
+      'indexing_failed' | 'indexed' | 'unresolved_legacy',
+      number
+    >;
+    attempts: { total: number; last_at: string | null };
+    transition_missing: number;
     oldest_accepted_unindexed_at: string | null;
-    last_indexed_at: null;
-    post_approval_indexing_latency_seconds: null;
-    proof_state: 'unknown_timestamp_not_recorded';
+    last_indexed_at: string | null;
+    post_approval_indexing_latency_seconds: number | null;
+    proof_state: 'recorded' | 'unknown_no_indexed_transition';
   };
   progress: {
     last_downstream_at: string | null;
@@ -242,6 +249,10 @@ function classifyOverall(input: {
   reviewAgeExceeded: boolean;
   reviewCapacityBlocked: boolean;
   recoveryHold: boolean;
+  promotionIndexingFailed: number;
+  promotionTransitionMissing: number;
+  promotionUnresolvedLegacy: number;
+  promotionDispatchFrozenWithWork: boolean;
   queuesEmpty: boolean;
 }): ContextMirrorStatusV1['overall'] {
   const broken: string[] = [];
@@ -252,6 +263,8 @@ function classifyOverall(input: {
   if (input.retryableOver24h > 0 || input.partitionOver24h > 0) broken.push('retryable_work_over_24h');
   if (input.partitionFailed > 0) broken.push('consolidation_partition_failed');
   if (input.manifestGap > 0) broken.push('generation_manifest_gap');
+  if (input.promotionIndexingFailed > 0) broken.push('promotion_indexing_failed');
+  if (input.promotionTransitionMissing > 0) broken.push('promotion_transition_missing');
   if (broken.length > 0) {
     const next = broken.includes('ambiguous_provider_outcome')
       ? 'inspect_ambiguous_provider_outcomes'
@@ -270,6 +283,8 @@ function classifyOverall(input: {
   if (input.unverifiedLegacy > 0) degraded.push('unverified_legacy_evidence');
   if (input.reviewAgeExceeded) degraded.push('review_queue_age_exceeded');
   if (input.reviewCapacityBlocked) degraded.push('review_capacity_blocked');
+  if (input.promotionUnresolvedLegacy > 0) degraded.push('unresolved_legacy_promotion');
+  if (input.promotionDispatchFrozenWithWork) degraded.push('promotion_dispatch_frozen_with_work');
   if (!input.enabled && (input.raw > 0 || input.eligible > 0 || input.partitionPending > 0)) {
     degraded.push('connector_disabled_with_work');
   }
@@ -514,15 +529,12 @@ async function readContextMirrorStatus(
        count(*) FILTER (WHERE status = 'awaiting_review_capacity') AS awaiting_review_capacity,
        count(*) FILTER (WHERE status = 'accepted') AS accepted,
        count(*) FILTER (WHERE status = 'rejected') AS rejected,
-       count(*) FILTER (WHERE promotion_status IS NULL) AS not_dispatched,
-       count(*) FILTER (WHERE promotion_status = 'pr_opened') AS pr_opened,
-       count(*) FILTER (WHERE promotion_status = 'indexed') AS indexed,
-       count(*) FILTER (WHERE promotion_status = 'promoted_to_inbox') AS promoted_to_inbox,
-       count(*) FILTER (WHERE promotion_status = 'needs_fix') AS needs_fix,
-       count(*) FILTER (WHERE promotion_status = 'failed') AS promotion_failed,
-       min(acted_at) FILTER (
-         WHERE status = 'accepted' AND promotion_status IS DISTINCT FROM 'indexed'
-       ) AS oldest_accepted_unindexed_at,
+       count(*) FILTER (
+         WHERE status = 'accepted'
+           AND NOT EXISTS (
+             SELECT 1 FROM connector_promotion_transitions t WHERE t.candidate_id = connector_candidates.id
+           )
+       ) AS promotion_transition_missing,
        count(*) FILTER (
          WHERE requires_human_review = false AND proposed_at >= $2::timestamptz - INTERVAL '14 days'
        ) AS fresh_arrivals,
@@ -530,13 +542,37 @@ async function readContextMirrorStatus(
          WHERE acted_at >= $2::timestamptz - INTERVAL '14 days'
            AND status IN ('accepted','rejected')
        ) AS completed_reviews,
-       min(proposed_at) AS first_candidate_at,
-       max(promoted_at) FILTER (WHERE promotion_status = 'indexed') AS indexed_progress_at
+       min(proposed_at) AS first_candidate_at
      FROM connector_candidates
      WHERE source_id = $1 AND provider = 'context_mirror'`,
     [sourceId, now.toISOString()],
   );
   const candidates = candidateRows[0] ?? {};
+
+  const promotionRows = await engine.executeRaw<Record<string, number | string | Date | null>>(
+    `SELECT
+       count(*) FILTER (WHERE t.state = 'accepted_dispatching') AS accepted_dispatching,
+       count(*) FILTER (WHERE t.state = 'dispatch_failed') AS dispatch_failed,
+       count(*) FILTER (WHERE t.state = 'pr_opened') AS pr_opened,
+       count(*) FILTER (WHERE t.state = 'merged_reindexing') AS merged_reindexing,
+       count(*) FILTER (WHERE t.state = 'indexing_failed') AS indexing_failed,
+       count(*) FILTER (WHERE t.state = 'indexed') AS indexed,
+       count(*) FILTER (WHERE t.state = 'unresolved_legacy') AS unresolved_legacy,
+       COALESCE(sum(t.attempt_count), 0) AS attempts_total,
+       max(t.last_attempt_at) AS last_attempt_at,
+       min(t.accepted_at) FILTER (WHERE t.state <> 'indexed') AS oldest_accepted_unindexed_at,
+       max(t.indexed_at) AS last_indexed_at,
+       (array_agg(extract(epoch FROM (t.indexed_at - t.accepted_at)) ORDER BY t.indexed_at DESC)
+         FILTER (WHERE t.indexed_at IS NOT NULL))[1] AS last_indexing_latency_seconds
+     FROM connector_promotion_transitions t
+     JOIN connector_candidates c ON c.id = t.candidate_id
+     WHERE t.source_id = $1 AND c.provider = 'context_mirror'`,
+    [sourceId],
+  );
+  const promotions = promotionRows[0] ?? {};
+  const dispatchFrozen = !['false', '0'].includes(
+    ((await engine.getConfig('connectors.promotion_dispatch_frozen')) ?? 'true').trim().toLowerCase(),
+  );
 
   const review = await reviewCapacitySnapshot(engine, sourceId);
   const recovery = await readContextMirrorRecoveryHold(engine, sourceId);
@@ -582,6 +618,12 @@ async function readContextMirrorStatus(
     reviewAgeExceeded: review.humanAgeExceeded || review.stagingAgeExceeded,
     reviewCapacityBlocked,
     recoveryHold: recovery.active,
+    promotionIndexingFailed: numberValue(promotions.indexing_failed),
+    promotionTransitionMissing: numberValue(candidates.promotion_transition_missing),
+    promotionUnresolvedLegacy: numberValue(promotions.unresolved_legacy),
+    promotionDispatchFrozenWithWork: dispatchFrozen && (
+      numberValue(promotions.accepted_dispatching) + numberValue(promotions.dispatch_failed) > 0
+    ),
     queuesEmpty,
   });
 
@@ -600,7 +642,7 @@ async function readContextMirrorStatus(
   const lastGenerationAt = iso(generations.last_completed_at as Date | string | null);
   const lastDecisionAt = iso(partitions.last_decided_at as Date | string | null);
   const lastCandidateDecisionAt = iso(decisions.last_at as Date | string | null);
-  const indexedProgressAt = iso(candidates.indexed_progress_at as Date | string | null);
+  const indexedProgressAt = iso(promotions.last_indexed_at as Date | string | null);
 
   return {
     schema_version: 1,
@@ -758,18 +800,27 @@ async function readContextMirrorStatus(
         accepted: numberValue(candidates.accepted),
         rejected: numberValue(candidates.rejected),
       },
+      dispatch_frozen: dispatchFrozen,
       promotion_states: {
-        not_dispatched: numberValue(candidates.not_dispatched),
-        pr_opened: numberValue(candidates.pr_opened),
-        indexed: numberValue(candidates.indexed),
-        promoted_to_inbox: numberValue(candidates.promoted_to_inbox),
-        needs_fix: numberValue(candidates.needs_fix),
-        failed: numberValue(candidates.promotion_failed),
+        accepted_dispatching: numberValue(promotions.accepted_dispatching),
+        dispatch_failed: numberValue(promotions.dispatch_failed),
+        pr_opened: numberValue(promotions.pr_opened),
+        merged_reindexing: numberValue(promotions.merged_reindexing),
+        indexing_failed: numberValue(promotions.indexing_failed),
+        indexed: numberValue(promotions.indexed),
+        unresolved_legacy: numberValue(promotions.unresolved_legacy),
       },
-      oldest_accepted_unindexed_at: iso(candidates.oldest_accepted_unindexed_at as Date | string | null),
-      last_indexed_at: null,
-      post_approval_indexing_latency_seconds: null,
-      proof_state: 'unknown_timestamp_not_recorded',
+      attempts: {
+        total: numberValue(promotions.attempts_total),
+        last_at: iso(promotions.last_attempt_at as Date | string | null),
+      },
+      transition_missing: numberValue(candidates.promotion_transition_missing),
+      oldest_accepted_unindexed_at: iso(promotions.oldest_accepted_unindexed_at as Date | string | null),
+      last_indexed_at: indexedProgressAt,
+      post_approval_indexing_latency_seconds: promotions.last_indexing_latency_seconds == null
+        ? null
+        : numberValue(promotions.last_indexing_latency_seconds),
+      proof_state: indexedProgressAt == null ? 'unknown_no_indexed_transition' : 'recorded',
     },
     progress: {
       last_downstream_at: latestIso([lastGenerationAt, lastDecisionAt, lastCandidateDecisionAt, indexedProgressAt]),

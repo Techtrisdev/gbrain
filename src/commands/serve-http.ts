@@ -45,9 +45,16 @@ import {
 } from '../core/ingestion/types.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
-import { listCandidates, approveCandidate, rejectCandidate, PromotionTargetError } from '../core/connectors/candidate.ts';
+import {
+  listCandidates,
+  approveCandidate,
+  rejectCandidate,
+  retryCandidatePromotion,
+  PromotionTargetError,
+} from '../core/connectors/candidate.ts';
 import type { PromotionTarget } from '../core/connectors/promotion.ts';
 import { handlePromotionCallback } from '../core/connectors/promotion.ts';
+import { PromotionRetryError } from '../core/connectors/promotion-state.ts';
 import {
   calendarConnector,
   incrementalSync,
@@ -2811,6 +2818,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.json({ candidate: row });
     } catch (err) {
       res.status(500).json({ error: 'reject_failed', message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/admin/api/candidates/:id/retry-promotion', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const id = parseCandidateId(req, res);
+    if (id === null) return;
+    try {
+      const result = await retryCandidatePromotion(engine, id, adminActor(req));
+      if (!result.row) {
+        res.status(404).json({ error: 'candidate_not_found' });
+        return;
+      }
+      res.json({ candidate: result.row, promotion: result.promotion });
+    } catch (err) {
+      if (err instanceof PromotionRetryError) {
+        res.status(409).json({ error: err.code, message: err.message });
+        return;
+      }
+      if (err instanceof PromotionTargetError) {
+        res.status(400).json({ error: 'invalid_target', message: err.message });
+        return;
+      }
+      res.status(500).json({ error: 'promotion_retry_failed', message: err instanceof Error ? err.message : String(err) });
     }
   });
 
