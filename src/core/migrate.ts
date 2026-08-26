@@ -5326,6 +5326,47 @@ export const MIGRATIONS: Migration[] = [
         && new Set(columns.map((row) => `${row.table_name}.${row.column_name}`)).size === 11;
     },
   },
+  {
+    version: 111,
+    name: 'context_mirror_current_generation_eligibility',
+    // Preserve first-ever eligibility/cohort timestamps as immutable cohort
+    // evidence while tracking the retryable eligibility of the current
+    // generation separately. Late evidence may reopen a completed session,
+    // but it must not rewrite the historical denominator.
+    idempotent: true,
+    sql: `
+      ALTER TABLE context_mirror_session_heads
+        ADD COLUMN IF NOT EXISTS current_eligible_at TIMESTAMPTZ;
+      ALTER TABLE context_mirror_session_heads
+        ADD COLUMN IF NOT EXISTS current_cohort_at TIMESTAMPTZ;
+
+      UPDATE context_mirror_session_heads
+         SET current_eligible_at = COALESCE(current_eligible_at, first_eligible_at),
+             current_cohort_at = COALESCE(current_cohort_at, cohort_at)
+       WHERE current_eligible_at IS NULL AND first_eligible_at IS NOT NULL;
+
+      DROP INDEX IF EXISTS context_mirror_session_heads_pending_idx;
+      CREATE INDEX context_mirror_session_heads_pending_idx
+        ON context_mirror_session_heads (source_id, current_eligible_at, session_id)
+        WHERE state = 'pending' AND current_eligible_at IS NOT NULL;
+    `,
+    verify: async (engine) => {
+      const columns = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'context_mirror_session_heads'
+            AND column_name IN ('current_eligible_at','current_cohort_at')`,
+      );
+      const indexes = await engine.executeRaw<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public'
+            AND tablename = 'context_mirror_session_heads'
+            AND indexname = 'context_mirror_session_heads_pending_idx'`,
+      );
+      return new Set(columns.map((row) => row.column_name)).size === 2
+        && indexes.some((row) => row.indexdef.includes('current_eligible_at'));
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

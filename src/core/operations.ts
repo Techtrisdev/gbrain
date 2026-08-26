@@ -3746,6 +3746,52 @@ const sources_status: Operation = {
   cliHints: { name: 'sources_status', hidden: true },
 };
 
+function assertContextMirrorStatusSource(ctx: OperationContext, sourceId: string): string {
+  if (sourceId === '__all__' || !isValidSourceId(sourceId)) {
+    throw new OperationError(
+      'invalid_params',
+      'context_mirror_status requires one concrete valid source_id',
+    );
+  }
+  if (ctx.remote === true) {
+    const readable = getReadableSourceIds(ctx) ?? [];
+    if (!readable.includes(sourceId)) {
+      throw new OperationError(
+        'permission_denied',
+        `context_mirror_status source_id '${sourceId}' is outside the authenticated read scope`,
+      );
+    }
+  }
+  return sourceId;
+}
+
+const context_mirror_status: Operation = {
+  name: 'context_mirror_status',
+  description:
+    'Read-only, source-confined Context Mirror pipeline status. Returns exact aggregate ' +
+    'counts, bounded queue/circuit/promotion state, and explicit unknown external proof. ' +
+    'Never returns transcript bodies, messages, page slugs, error text, secrets, or URLs.',
+  params: {
+    source_id: {
+      type: 'string',
+      required: true,
+      description: 'One concrete source inside the authenticated read allowlist; federation is never implicit.',
+    },
+  },
+  scope: 'read',
+  mutating: false,
+  handler: async (ctx, p) => {
+    const sourceId = assertContextMirrorStatusSource(ctx, p.source_id as string);
+    const { getContextMirrorStatus } = await import('./connectors/context-mirror-status.ts');
+    const status = await getContextMirrorStatus(ctx.engine, sourceId);
+    if (!status) {
+      throw new OperationError('source_not_found', `Source not found: ${sourceId}`);
+    }
+    return status;
+  },
+  cliHints: { name: 'context_mirror_status', hidden: true },
+};
+
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
 // ============================================================
@@ -4729,7 +4775,7 @@ export const operations: Operation[] = [
   // v0.30: calibration aggregates over takes
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
-  whoami, sources_add, sources_list, sources_remove, sources_status,
+  whoami, sources_add, sources_list, sources_remove, sources_status, context_mirror_status,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.31: hot memory (facts table)

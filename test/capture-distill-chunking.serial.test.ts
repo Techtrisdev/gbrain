@@ -286,11 +286,21 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
 
     const first = await distillCaptureSessions(engine, { now, sourceId: CAPTURE_SOURCE });
     expect(first.distilled).toBe(1);
+    const [firstHead] = await engine.executeRaw<{
+      first_eligible_at: Date | string;
+      current_eligible_at: Date | string;
+    }>(
+      `SELECT first_eligible_at, current_eligible_at
+         FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
 
     await seedCapture('capture/chunkgap-sess-1/reply-2', 'Late evidence changes the decision.', 3);
     memory = 'generation two corrected memory';
     stubChat(JSON.stringify([memory]));
-    const second = await distillCaptureSessions(engine, { now, sourceId: CAPTURE_SOURCE });
+    const secondNow = new Date(now.getTime() + 60 * 60 * 1000);
+    const second = await distillCaptureSessions(engine, { now: secondNow, sourceId: CAPTURE_SOURCE });
 
     expect(second.distilled).toBe(1);
     const page = await engine.getPage('distilled/chunkgap-sess-1/mem-1', { sourceId: CAPTURE_SOURCE });
@@ -303,5 +313,18 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       [CAPTURE_SOURCE, SESSION_ID],
     );
     expect(calls.map((row) => Number(row.generation))).toEqual([1, 2]);
+    const [secondHead] = await engine.executeRaw<{
+      first_eligible_at: Date | string;
+      current_eligible_at: Date | string;
+    }>(
+      `SELECT first_eligible_at, current_eligible_at
+         FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
+    expect(new Date(secondHead.first_eligible_at).toISOString())
+      .toBe(new Date(firstHead.first_eligible_at).toISOString());
+    expect(new Date(secondHead.current_eligible_at).toISOString())
+      .toBe(secondNow.toISOString());
   });
 });

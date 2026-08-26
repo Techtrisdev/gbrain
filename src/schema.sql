@@ -1371,6 +1371,9 @@ CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
   first_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   first_eligible_at     TIMESTAMPTZ,
   cohort_at             TIMESTAMPTZ,
+  -- Immutable first-ever eligibility above; current generation readiness below.
+  current_eligible_at   TIMESTAMPTZ,
+  current_cohort_at     TIMESTAMPTZ,
   state                 TEXT        NOT NULL DEFAULT 'pending'
                                     CHECK (state IN ('pending','claimed','result_persisted','complete','quarantined','ambiguous')),
   disposition           TEXT,
@@ -1388,8 +1391,8 @@ CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
 );
 
 CREATE INDEX IF NOT EXISTS context_mirror_session_heads_pending_idx
-  ON context_mirror_session_heads (source_id, first_eligible_at, session_id)
-  WHERE state = 'pending' AND first_eligible_at IS NOT NULL;
+  ON context_mirror_session_heads (source_id, current_eligible_at, session_id)
+  WHERE state = 'pending' AND current_eligible_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS context_mirror_distill_runs (
   run_id                TEXT        PRIMARY KEY,

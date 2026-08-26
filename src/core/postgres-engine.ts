@@ -359,6 +359,10 @@ export class PostgresEngine implements BrainEngine {
       sources_archived_exists: boolean;
       sources_archived_at_exists: boolean;
       sources_archive_expires_at_exists: boolean;
+      connector_candidates_exists: boolean;
+      candidate_context_session_id_exists: boolean;
+      context_session_heads_exists: boolean;
+      current_eligible_at_exists: boolean;
     }[]>`
       SELECT
         EXISTS (SELECT 1 FROM information_schema.tables
@@ -439,6 +443,14 @@ export class PostgresEngine implements BrainEngine {
                 WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'trust_frontmatter_overrides') AS sources_trust_fm_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'generation') AS pages_generation_exists
+        , EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'connector_candidates') AS connector_candidates_exists
+        , EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'connector_candidates' AND column_name = 'context_session_id') AS candidate_context_session_id_exists
+        , EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'context_mirror_session_heads') AS context_session_heads_exists
+        , EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'context_mirror_session_heads' AND column_name = 'current_eligible_at') AS current_eligible_at_exists
     `;
     const probe = probeRows[0]!;
 
@@ -529,6 +541,10 @@ export class PostgresEngine implements BrainEngine {
     // it. Pre-v91 brains crash without the column; bootstrap adds it before
     // SCHEMA_SQL replay creates the index.
     const needsPagesGeneration = probe.pages_exists && !probeCr.pages_generation_exists;
+    const needsCandidateLineage = probe.connector_candidates_exists
+      && !probe.candidate_context_session_id_exists;
+    const needsCurrentEligibility = probe.context_session_heads_exists
+      && !probe.current_eligible_at_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -538,7 +554,8 @@ export class PostgresEngine implements BrainEngine {
         && !needsOauthClientsBootstrap && !needsSourcesArchive
         && !needsPagesLastRetrievedAt
         && !needsPagesProvenance
-        && !needsContextualRetrievalColumns && !needsPagesGeneration) return;
+        && !needsContextualRetrievalColumns && !needsPagesGeneration
+        && !needsCandidateLineage && !needsCurrentEligibility) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
@@ -774,6 +791,21 @@ export class PostgresEngine implements BrainEngine {
       // later; bootstrap only adds the column. v91 is idempotent.
       await conn.unsafe(`
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
+      `);
+    }
+
+    if (needsCandidateLineage) {
+      await conn.unsafe(`
+        ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_session_id TEXT;
+        ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_generation INTEGER;
+        ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_partition TEXT;
+      `);
+    }
+
+    if (needsCurrentEligibility) {
+      await conn.unsafe(`
+        ALTER TABLE context_mirror_session_heads ADD COLUMN IF NOT EXISTS current_eligible_at TIMESTAMPTZ;
+        ALTER TABLE context_mirror_session_heads ADD COLUMN IF NOT EXISTS current_cohort_at TIMESTAMPTZ;
       `);
     }
   }

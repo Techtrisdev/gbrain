@@ -1,0 +1,246 @@
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import {
+  OperationError,
+  operationsByName,
+  type OperationContext,
+} from '../src/core/operations.ts';
+import { dispatchToolCall } from '../src/mcp/dispatch.ts';
+import type { ContextMirrorStatusV1 } from '../src/core/connectors/context-mirror-status.ts';
+import { resetPgliteState } from './helpers/reset-pglite.ts';
+
+let engine: PGLiteEngine;
+
+beforeAll(async () => {
+  engine = new PGLiteEngine();
+  await engine.connect({});
+  await engine.initSchema();
+}, 60_000);
+
+afterAll(async () => {
+  await engine.disconnect();
+});
+
+beforeEach(async () => {
+  await resetPgliteState(engine);
+});
+
+function context(sourceId = 'default', allowedSources: string[] = [sourceId]): OperationContext {
+  return {
+    engine,
+    config: {} as OperationContext['config'],
+    logger: console,
+    dryRun: false,
+    remote: true,
+    sourceId,
+    auth: {
+      token: 'redacted-test-token',
+      clientId: 'status-reader',
+      scopes: ['read'],
+      sourceId,
+      allowedSources,
+    },
+  };
+}
+
+async function configureSource(sourceId: string, extra: Record<string, unknown> = {}): Promise<void> {
+  await engine.executeRaw(
+    `UPDATE sources SET config = $2::jsonb WHERE id = $1`,
+    [sourceId, JSON.stringify({
+      connectors: {
+        context_mirror: {
+          enabled: true,
+          distill_before_poll: true,
+          consolidation_enabled: true,
+          ...extra,
+        },
+      },
+    })],
+  );
+}
+
+async function status(ctx: OperationContext, sourceId: string): Promise<ContextMirrorStatusV1> {
+  return await operationsByName.context_mirror_status.handler(ctx, { source_id: sourceId }) as ContextMirrorStatusV1;
+}
+
+describe('context_mirror_status read contract', () => {
+  test('is an HTTP-visible, non-mutating read operation with an explicit source', () => {
+    const op = operationsByName.context_mirror_status;
+    expect(op).toBeDefined();
+    expect(op.scope).toBe('read');
+    expect(op.mutating).toBe(false);
+    expect(op.localOnly).not.toBe(true);
+    expect(op.params.source_id).toMatchObject({ type: 'string', required: true });
+  });
+
+  test('returns exact 501-row aggregates without list_pages and leaks no stored content or free-form errors', async () => {
+    await configureSource('default');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('other-source','other-source',$1::jsonb)`,
+      [JSON.stringify({ connectors: { context_mirror: { enabled: true } } })],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (
+         source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at
+       )
+       SELECT 'default',
+              'capture/session-' || lpad(i::text, 3, '0') || '/turn-1',
+              'note', 'private title',
+              'RAW_PROMPT_SECRET_SENTINEL_' || i::text,
+              'RAW_REPLY_SECRET_SENTINEL',
+              jsonb_build_object('session_id','PRIVATE_SESSION_SENTINEL_' || i::text),
+              'default-hash-' || i::text,
+              now()
+         FROM generate_series(1,501) AS i`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (
+         source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, updated_at
+       )
+       SELECT 'other-source',
+              'capture/foreign-' || i::text || '/turn-1',
+              'note', 'foreign', 'FOREIGN_BODY_SENTINEL', '', '{}'::jsonb,
+              'other-hash-' || i::text, now()
+         FROM generate_series(1,17) AS i`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_checkpoints (source_id, checkpoint_kind, cursor, completed)
+       VALUES ('default','capture_session_scan_v1','{}'::jsonb,true)`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_circuits (
+         source_id, provider, state, reason, error_fingerprint, consecutive_failures
+       ) VALUES (
+         'default','chat','open','API key RAW_CIRCUIT_SECRET_SENTINEL','opaque',1
+       )`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id, active, reason, held_at
+       ) VALUES ('default',true,'RAW_HOLD_SECRET_SENTINEL',now())`,
+    );
+
+    const result = await status(context('default', ['default', 'other-source']), 'default');
+
+    expect(result.schema_version).toBe(1);
+    expect(result.source_id).toBe('default');
+    expect(result.capture.active_records).toBe(501);
+    expect(result.external_proof).toEqual({
+      runtime_coverage: 'unknown',
+      outbox_delivery: 'unknown',
+      retrieval_consumers: 'unknown',
+      reason: 'not_recorded_in_gbrain_v1',
+    });
+    expect(result.recovery_hold.reason_code).toBe('operator_recovery_hold');
+    expect(result.distillation.provider.circuit_reason_code).toBe('authentication');
+    const serialized = JSON.stringify(result);
+    for (const forbidden of [
+      'RAW_PROMPT_SECRET_SENTINEL',
+      'RAW_REPLY_SECRET_SENTINEL',
+      'PRIVATE_SESSION_SENTINEL',
+      'FOREIGN_BODY_SENTINEL',
+      'RAW_CIRCUIT_SECRET_SENTINEL',
+      'RAW_HOLD_SECRET_SENTINEL',
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+
+  test('distinguishes healthy idle from a broken, aged, provider-blocked backlog', async () => {
+    await configureSource('default');
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_checkpoints (source_id, checkpoint_kind, cursor, completed)
+       VALUES ('default','capture_session_scan_v1','{}'::jsonb,true)`,
+    );
+    const idle = await status(context(), 'default');
+    expect(idle.overall).toEqual({ state: 'idle', reason_codes: ['no_eligible_work'], next_action: null });
+    expect(idle.review.service_window.margin_state).toBe('idle');
+
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_session_heads (
+         source_id, session_id, session_slug, capture_slug_prefix, newest_capture_at,
+         turn_count, first_eligible_at, cohort_at, current_eligible_at, current_cohort_at, state
+       ) VALUES (
+         'default','PRIVATE_SESSION_SECRET','private-session','capture/private-session/',
+         now() - INTERVAL '3 days',2,now() - INTERVAL '2 days',now() - INTERVAL '2 days',
+         now() - INTERVAL '2 days',now() - INTERVAL '2 days','pending'
+       )`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_distill_runs (
+         run_id, source_id, status, stop_reason, selected_count, failed_count, started_at, finished_at
+       ) VALUES (
+         'run-secret','default','failed','systemic_failure',1,1,now() - INTERVAL '1 hour',now() - INTERVAL '1 hour'
+       )`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_provider_calls (
+         correlation_id, run_id, source_id, session_id, generation, state,
+         request_fingerprint, error_class, error_message
+       ) VALUES (
+         'correlation-secret','run-secret','default','PRIVATE_SESSION_SECRET',1,'failed',
+         'fingerprint-secret','RAW_ERROR_CLASS_SECRET','RAW_PROVIDER_MESSAGE_SECRET'
+       )`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_circuits (
+         source_id, provider, state, reason, error_fingerprint,
+         consecutive_failures, opened_at, next_probe_at
+       ) VALUES (
+         'default','chat','open','insufficient credits RAW_PROVIDER_SECRET','fingerprint',
+         1,now(),now() + INTERVAL '1 hour'
+       )`,
+    );
+
+    const broken = await status(context(), 'default');
+    expect(broken.overall.state).toBe('broken');
+    expect(broken.overall.reason_codes).toContain('provider_circuit_open');
+    expect(broken.overall.reason_codes).toContain('retryable_work_over_24h');
+    expect(broken.eligibility.retryable_over_24h).toBe(1);
+    expect(broken.distillation.provider.last_error_class).toBe('other');
+    expect(broken.distillation.provider.circuit_reason_code).toBe('billing');
+    const serialized = JSON.stringify(broken);
+    expect(serialized).not.toContain('PRIVATE_SESSION_SECRET');
+    expect(serialized).not.toContain('RAW_ERROR_CLASS_SECRET');
+    expect(serialized).not.toContain('RAW_PROVIDER_MESSAGE_SECRET');
+    expect(serialized).not.toContain('RAW_PROVIDER_SECRET');
+  });
+
+  test('requires one allowed source and never returns an unlabeled federated aggregate', async () => {
+    await configureSource('default');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('other-source','other-source',$1::jsonb)`,
+      [JSON.stringify({ connectors: { context_mirror: { enabled: true } } })],
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash)
+       SELECT 'other-source','capture/other/' || i::text,'note','x','x','','{}'::jsonb,'h-' || i::text
+         FROM generate_series(1,17) AS i`,
+    );
+
+    const federatedCredential = context('default', ['default', 'other-source']);
+    const other = await status(federatedCredential, 'other-source');
+    expect(other.source_id).toBe('other-source');
+    expect(other.capture.active_records).toBe(17);
+
+    await expect(status(context('default', ['default']), 'other-source')).rejects.toBeInstanceOf(OperationError);
+
+    const missing = await dispatchToolCall(engine, 'context_mirror_status', {}, {
+      remote: true,
+      sourceId: 'default',
+      auth: context().auth,
+    });
+    expect(missing.isError).toBe(true);
+    expect(JSON.parse(missing.content[0].text)).toMatchObject({ error: 'invalid_params' });
+
+    const forced = await dispatchToolCall(engine, 'context_mirror_status', { source_id: 'other-source' }, {
+      remote: true,
+      sourceId: 'default',
+      auth: context('default', ['default']).auth,
+    });
+    expect(forced.isError).toBe(true);
+    expect(JSON.parse(forced.content[0].text)).toMatchObject({ error: 'permission_denied' });
+  });
+});

@@ -73,6 +73,7 @@ export interface ReviewCapacitySnapshot {
   stagingLimit: number;
   stagingBytesLimit: number;
   humanPending: number;
+  humanBytes: number;
   staged: number;
   stagedBytes: number;
   reservedSlots: number;
@@ -300,17 +301,17 @@ export async function advanceSessionHeadBootstrap(
                THEN NULL
              ELSE context_mirror_session_heads.disposition
            END,
-           first_eligible_at = CASE
+           current_eligible_at = CASE
              WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
               AND context_mirror_session_heads.state IN ('complete','quarantined')
                THEN NULL
-             ELSE context_mirror_session_heads.first_eligible_at
+             ELSE context_mirror_session_heads.current_eligible_at
            END,
-           cohort_at = CASE
+           current_cohort_at = CASE
              WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
               AND context_mirror_session_heads.state IN ('complete','quarantined')
                THEN NULL
-             ELSE context_mirror_session_heads.cohort_at
+             ELSE context_mirror_session_heads.current_cohort_at
            END,
            current_generation = CASE
              WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
@@ -342,6 +343,8 @@ export async function advanceSessionHeadBootstrap(
         `UPDATE context_mirror_session_heads
             SET first_eligible_at = COALESCE(first_eligible_at, $2::timestamptz),
                 cohort_at = COALESCE(cohort_at, $2::timestamptz),
+                current_eligible_at = COALESCE(current_eligible_at, $2::timestamptz),
+                current_cohort_at = COALESCE(current_cohort_at, $2::timestamptz),
                 updated_at = now()
           WHERE source_id = $1
             AND state = 'pending'
@@ -371,7 +374,7 @@ export async function advanceSessionHeadBootstrap(
 
   const counts = await engine.executeRaw<{ total: number | string; pending: number | string }>(
     `SELECT count(*) AS total,
-            count(*) FILTER (WHERE state = 'pending' AND first_eligible_at IS NOT NULL) AS pending
+            count(*) FILTER (WHERE state = 'pending' AND current_eligible_at IS NOT NULL) AS pending
        FROM context_mirror_session_heads WHERE source_id = $1`,
     [opts.sourceId],
   );
@@ -423,14 +426,14 @@ export async function claimPendingSessionHeads(
     capture_slug_prefix: string;
     turn_count: number | string;
     newest_capture_at: Date | string;
-    first_eligible_at: Date | string;
+    current_eligible_at: Date | string;
     current_generation: number | string;
   }>(
     `SELECT session_id, session_slug, capture_slug_prefix, turn_count,
-            newest_capture_at, first_eligible_at, current_generation
+            newest_capture_at, current_eligible_at, current_generation
        FROM context_mirror_session_heads
-      WHERE source_id = $1 AND state = 'pending' AND first_eligible_at IS NOT NULL
-      ORDER BY first_eligible_at ASC, session_id ASC
+      WHERE source_id = $1 AND state = 'pending' AND current_eligible_at IS NOT NULL
+      ORDER BY current_eligible_at ASC, session_id ASC
       LIMIT $2`,
     [sourceId, limit],
   );
@@ -452,7 +455,7 @@ export async function claimPendingSessionHeads(
       captureSlugPrefix: candidate.capture_slug_prefix,
       turns: Number(candidate.turn_count),
       newestMs: new Date(candidate.newest_capture_at).getTime(),
-      firstEligibleMs: new Date(candidate.first_eligible_at).getTime(),
+      firstEligibleMs: new Date(candidate.current_eligible_at).getTime(),
       claimId,
       generation: Number(candidate.current_generation),
     });
@@ -918,6 +921,7 @@ export async function reviewCapacitySnapshot(
   );
   const rows = await engine.executeRaw<{
     human_pending: number | string;
+    human_bytes: number | string;
     staged: number | string;
     staged_bytes: number | string;
     reserved_slots: number | string;
@@ -931,6 +935,8 @@ export async function reviewCapacitySnapshot(
     `SELECT
        (SELECT count(*) FROM connector_candidates
          WHERE source_id = $1 AND status IN ('pending','needs_review')) AS human_pending,
+       (SELECT COALESCE(sum(octet_length(COALESCE(proposed_markdown,''))),0) FROM connector_candidates
+         WHERE source_id = $1 AND status IN ('pending','needs_review')) AS human_bytes,
        (SELECT count(*) FROM connector_candidates
          WHERE source_id = $1 AND status = 'awaiting_review_capacity') AS staged,
        (SELECT COALESCE(sum(octet_length(COALESCE(proposed_markdown,''))),0) FROM connector_candidates
@@ -961,6 +967,7 @@ export async function reviewCapacitySnapshot(
     stagingLimit,
     stagingBytesLimit,
     humanPending: Number(row?.human_pending ?? 0),
+    humanBytes: Number(row?.human_bytes ?? 0),
     staged: Number(row?.staged ?? 0),
     stagedBytes: Number(row?.staged_bytes ?? 0),
     reservedSlots: Number(row?.reserved_slots ?? 0),
