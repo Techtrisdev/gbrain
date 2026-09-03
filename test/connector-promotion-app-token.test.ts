@@ -19,7 +19,7 @@ const { privateKey: APP_KEY } = generateKeyPairSync('rsa', {
 });
 const APP_ID = '123456';
 
-interface Call { url: string; method: string; auth: string; contentType?: string; body?: string }
+interface Call { url: string; method: string; auth: string; contentType?: string; body?: string; signal?: AbortSignal }
 function makeAppFetch(opts: { installationId?: string; token?: string; expiresAt?: string; failInstall?: boolean; failToken?: boolean } = {}): {
   fetchImpl: AppAuthFetch;
   calls: Call[];
@@ -29,7 +29,14 @@ function makeAppFetch(opts: { installationId?: string; token?: string; expiresAt
   const token = opts.token ?? 'ghs_minted_install_token';
   const expiresAt = opts.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString();
   const fetchImpl: AppAuthFetch = async (url, init) => {
-    calls.push({ url, method: init.method, auth: init.headers.authorization, contentType: init.headers['content-type'], body: init.body });
+    calls.push({
+      url,
+      method: init.method,
+      auth: init.headers.authorization,
+      contentType: init.headers['content-type'],
+      body: init.body,
+      signal: init.signal,
+    });
     if (url.endsWith('/installation')) {
       if (opts.failInstall) return { ok: false, status: 404, text: async () => 'not found' };
       return { ok: true, status: 200, text: async () => JSON.stringify({ id: Number(installationId) }) };
@@ -64,6 +71,7 @@ describe('getPromotionDispatchToken — GitHub App installation-token minting', 
     expect(calls[1].method).toBe('POST');
     expect(calls[1].url).toContain('/app/installations/5550/access_tokens');
     expect(calls[1].auth.startsWith('Bearer ')).toBe(true);
+    expect(calls.every((call) => call.signal instanceof AbortSignal)).toBe(true);
     // The exchange POST is SCOPED: restricted to the target repo NAME + Contents:write only,
     // sent as an application/json body — never a default (all-repos, all-permissions) token.
     expect(calls[1].contentType).toBe('application/json');
@@ -118,6 +126,41 @@ describe('getPromotionDispatchToken — GitHub App installation-token minting', 
     const { fetchImpl, calls } = makeAppFetch({ installationId: '8100', failInstall: true });
     await expect(getPromotionDispatchToken('Owner/r-noinstall', { getEnv: env(), fetchImpl })).rejects.toThrow(/installation/i);
     expect(calls.some((c) => c.url.includes('/access_tokens'))).toBe(false); // never reached the exchange
+  });
+
+  test('aborts a hung installation lookup at the finite request deadline', async () => {
+    let signal: AbortSignal | undefined;
+    const fetchImpl: AppAuthFetch = async (_url, init) => {
+      signal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    };
+    await expect(getPromotionDispatchToken('Owner/repo-install-timeout', {
+      getEnv: env(),
+      fetchImpl,
+      timeoutMs: 10,
+    })).rejects.toThrow(/GitHub request timeout/);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  test('aborts a hung installation-token exchange at the finite request deadline', async () => {
+    let exchangeSignal: AbortSignal | undefined;
+    const fetchImpl: AppAuthFetch = async (url, init) => {
+      if (url.endsWith('/installation')) {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ id: 99001 }) };
+      }
+      exchangeSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    };
+    await expect(getPromotionDispatchToken('Owner/repo-exchange-timeout', {
+      getEnv: env(),
+      fetchImpl,
+      timeoutMs: 10,
+    })).rejects.toThrow(/GitHub request timeout/);
+    expect(exchangeSignal?.aborted).toBe(true);
   });
 
   test('never logs the private key, App JWT, or minted token', async () => {

@@ -481,7 +481,8 @@ INSERT INTO config (key, value) VALUES
   ('version', '1'),
   ('embedding_model', 'text-embedding-3-large'),
   ('embedding_dimensions', '1536'),
-  ('chunk_strategy', 'semantic')
+  ('chunk_strategy', 'semantic'),
+  ('connectors.promotion_dispatch_frozen', 'true')
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================
@@ -1216,7 +1217,7 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   -- as opposed to 'rejected' (off-queue de-flood for NOOP / low-confidence / a
   -- single-writer hold). Relaxed on existing DBs by migration v99.
   status             TEXT          NOT NULL DEFAULT 'pending'
-                                   CHECK (status IN ('pending','accepted','rejected','needs_review')),
+                                   CHECK (status IN ('pending','accepted','rejected','needs_review','awaiting_review_capacity')),
   status_reason      TEXT,
   acted_by           TEXT,
   acted_at           TIMESTAMPTZ,
@@ -1242,6 +1243,14 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
   base_compiled_hash TEXT,
   timeline_entry     TEXT,
   classification     TEXT,
+  -- Context Mirror generation lineage. NULL for ordinary connector candidates.
+  context_session_id TEXT,
+  context_generation INTEGER       CHECK (context_generation IS NULL OR context_generation >= 1),
+  context_partition  TEXT,
+  correlation_id     TEXT,
+  requires_human_review BOOLEAN    NOT NULL DEFAULT false,
+  evidence_trust     TEXT          CHECK (evidence_trust IS NULL OR evidence_trust = 'untrusted_transcript'),
+  review_warning     TEXT,
   -- audit
   proposed_at        TIMESTAMPTZ   NOT NULL DEFAULT now(),
   -- idempotency key: same upstream record + version never produces two rows
@@ -1252,6 +1261,76 @@ CREATE TABLE IF NOT EXISTS connector_candidates (
 -- hot path: list pending candidates for a source, newest first
 CREATE INDEX IF NOT EXISTS connector_candidates_source_status_proposed_idx
   ON connector_candidates (source_id, status, proposed_at DESC);
+
+CREATE INDEX IF NOT EXISTS connector_candidates_context_lineage_idx
+  ON connector_candidates (source_id, context_session_id, context_generation, context_partition)
+  WHERE context_session_id IS NOT NULL;
+
+-- Monotonic post-approval lifecycle. These rows record dispatch and callback
+-- evidence; they never approve, merge, or write shared Brain content.
+CREATE TABLE IF NOT EXISTS connector_promotion_transitions (
+  candidate_id BIGINT PRIMARY KEY REFERENCES connector_candidates(id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  correlation_id TEXT NOT NULL UNIQUE,
+  identity_version INTEGER NOT NULL DEFAULT 2 CHECK (identity_version = 2),
+  state TEXT NOT NULL CHECK (state IN (
+    'accepted_dispatching','dispatch_failed','pr_opened','merged_reindexing',
+    'indexing_failed','indexed','unresolved_legacy'
+  )),
+  last_durable_stage TEXT NOT NULL CHECK (last_durable_stage IN ('accepted','pr_opened','merged_reindexing','indexed')),
+  failure_code TEXT,
+  next_action TEXT NOT NULL CHECK (next_action IN (
+    'dispatch','reconcile_dispatch','await_pr_opened','await_merge','retry_indexing',
+    'review_stale_update','resolve_legacy','none'
+  )),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_attempt_at TIMESTAMPTZ,
+  callback_received_at TIMESTAMPTZ,
+  accepted_at TIMESTAMPTZ NOT NULL,
+  pr_opened_at TIMESTAMPTZ,
+  merged_at TIMESTAMPTZ,
+  indexed_at TIMESTAMPTZ,
+  pr_url TEXT,
+  branch TEXT,
+  merge_sha TEXT,
+  workflow_run_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS connector_promotion_transitions_source_state_idx
+  ON connector_promotion_transitions (source_id, state, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS connector_promotion_attempts (
+  id BIGSERIAL PRIMARY KEY,
+  candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+  correlation_id TEXT NOT NULL,
+  attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+  outcome TEXT NOT NULL CHECK (outcome IN ('prepared','succeeded','failed','unresolved')),
+  error_code TEXT,
+  actor TEXT,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at TIMESTAMPTZ,
+  UNIQUE (candidate_id, attempt_no)
+);
+CREATE INDEX IF NOT EXISTS connector_promotion_attempts_correlation_idx
+  ON connector_promotion_attempts (correlation_id, attempt_no DESC);
+
+CREATE TABLE IF NOT EXISTS connector_promotion_events (
+  id BIGSERIAL PRIMARY KEY,
+  candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+  correlation_id TEXT NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('migration','dispatch','callback','retry')),
+  from_state TEXT,
+  requested_state TEXT,
+  resulting_state TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (outcome IN ('applied','stale','rejected','unresolved')),
+  reason_code TEXT,
+  actor TEXT,
+  reason TEXT,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS connector_promotion_events_correlation_idx
+  ON connector_promotion_events (correlation_id, occurred_at DESC, id DESC);
 
 -- ============================================================
 -- consolidation_decisions (U6): Memory Consolidation Engine decision log.
@@ -1286,6 +1365,11 @@ CREATE TABLE IF NOT EXISTS consolidation_decisions (
   tier1_cosine      REAL,
   -- the model that produced the decision (nullable)
   model             TEXT,
+  -- Context Mirror lineage/trust (nullable for ordinary connectors)
+  correlation_id    TEXT,
+  evidence_trust    TEXT         CHECK (evidence_trust IS NULL OR evidence_trust = 'untrusted_transcript'),
+  review_warning    TEXT,
+  requires_human_review BOOLEAN  NOT NULL DEFAULT false,
   decided_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
   CONSTRAINT consolidation_decisions_tuple_unique
     UNIQUE (source_id, source_record_id, version, classification)
@@ -1337,6 +1421,215 @@ CREATE TABLE IF NOT EXISTS connector_tokens (
 -- hot path: getValidAccessToken resolves a single (source, provider) row.
 CREATE INDEX IF NOT EXISTS connector_tokens_source_provider_idx
   ON connector_tokens (source_id, provider);
+
+-- ============================================================
+-- Context Mirror operational state (v109).
+-- Content pages remain evidence; these source-scoped tables are the durable
+-- work ledger used for bounded discovery, claims, provider-call recovery, and
+-- restart-safe circuit breaking.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  session_id            TEXT        NOT NULL,
+  session_slug          TEXT        NOT NULL,
+  capture_slug_prefix   TEXT        NOT NULL,
+  newest_capture_at     TIMESTAMPTZ NOT NULL,
+  turn_count            INTEGER     NOT NULL CHECK (turn_count >= 0),
+  first_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  first_eligible_at     TIMESTAMPTZ,
+  cohort_at             TIMESTAMPTZ,
+  -- Immutable first-ever eligibility above; current generation readiness below.
+  current_eligible_at   TIMESTAMPTZ,
+  current_cohort_at     TIMESTAMPTZ,
+  state                 TEXT        NOT NULL DEFAULT 'pending'
+                                    CHECK (state IN ('pending','claimed','result_persisted','complete','quarantined','ambiguous')),
+  disposition           TEXT,
+  claim_id              TEXT,
+  lease_expires_at      TIMESTAMPTZ,
+  attempt_count         INTEGER     NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  current_generation    INTEGER     NOT NULL DEFAULT 1 CHECK (current_generation >= 1),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, session_id),
+  CONSTRAINT context_mirror_session_heads_slug_unique UNIQUE (source_id, session_slug),
+  CONSTRAINT context_mirror_session_heads_claim_shape CHECK (
+    (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+    OR state <> 'claimed'
+  )
+);
+
+CREATE INDEX IF NOT EXISTS context_mirror_session_heads_pending_idx
+  ON context_mirror_session_heads (source_id, current_eligible_at, session_id)
+  WHERE state = 'pending' AND current_eligible_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS context_mirror_distill_runs (
+  run_id                TEXT        PRIMARY KEY,
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  status                TEXT        NOT NULL CHECK (status IN ('running','ok','partial','failed','aborted')),
+  stop_reason           TEXT,
+  limits                JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  selected_count        INTEGER     NOT NULL DEFAULT 0 CHECK (selected_count >= 0),
+  completed_count       INTEGER     NOT NULL DEFAULT 0 CHECK (completed_count >= 0),
+  failed_count          INTEGER     NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+  deferred_count        INTEGER     NOT NULL DEFAULT 0 CHECK (deferred_count >= 0),
+  started_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  finished_at           TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS context_mirror_distill_runs_source_started_idx
+  ON context_mirror_distill_runs (source_id, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS context_mirror_generations (
+  source_id             TEXT        NOT NULL,
+  session_id            TEXT        NOT NULL,
+  generation            INTEGER     NOT NULL CHECK (generation >= 1),
+  input_hash            TEXT        NOT NULL,
+  originator            TEXT,
+  runtime               TEXT,
+  transform_version     TEXT        NOT NULL,
+  model                 TEXT        NOT NULL,
+  expected_manifest     JSONB       NOT NULL DEFAULT '[]'::jsonb,
+  expected_partitions   INTEGER     NOT NULL DEFAULT 0 CHECK (expected_partitions >= 0),
+  materialized_partitions INTEGER   NOT NULL DEFAULT 0 CHECK (materialized_partitions >= 0),
+  state                 TEXT        NOT NULL DEFAULT 'building'
+                                    CHECK (state IN ('building','complete','superseded','quarantined','unverified_legacy')),
+  is_current            BOOLEAN     NOT NULL DEFAULT true,
+  requires_human_review BOOLEAN     NOT NULL DEFAULT false,
+  recovery_hold         BOOLEAN     NOT NULL DEFAULT false,
+  rollback_actor        TEXT,
+  rollback_reason       TEXT,
+  rollback_rejected_candidates INTEGER,
+  rolled_back_at        TIMESTAMPTZ,
+  completed_at          TIMESTAMPTZ,
+  superseded_at         TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, session_id, generation),
+  FOREIGN KEY (source_id, session_id)
+    REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_generations_current_idx
+  ON context_mirror_generations (source_id, session_id)
+  WHERE is_current;
+
+CREATE INDEX IF NOT EXISTS context_mirror_generations_ready_idx
+  ON context_mirror_generations (source_id, state, completed_at, session_id, generation)
+  WHERE is_current AND state = 'complete';
+
+CREATE TABLE IF NOT EXISTS context_mirror_partitions (
+  source_id             TEXT        NOT NULL,
+  session_id            TEXT        NOT NULL,
+  generation            INTEGER     NOT NULL,
+  partition_key         TEXT        NOT NULL,
+  distilled_slug        TEXT        NOT NULL,
+  content_hash          TEXT        NOT NULL,
+  state                 TEXT        NOT NULL DEFAULT 'pending'
+                                    CHECK (state IN ('pending','claimed','decided','degraded','failed','superseded','unverified_legacy')),
+  claim_id              TEXT,
+  lease_expires_at      TIMESTAMPTZ,
+  attempt_count         INTEGER     NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  candidate_id          BIGINT      REFERENCES connector_candidates(id) ON DELETE SET NULL,
+  decision_classification TEXT,
+  last_error_code       TEXT,
+  last_error_message    TEXT,
+  decided_at            TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, session_id, generation, partition_key),
+  FOREIGN KEY (source_id, session_id, generation)
+    REFERENCES context_mirror_generations(source_id, session_id, generation) ON DELETE CASCADE,
+  CONSTRAINT context_mirror_partitions_claim_shape CHECK (
+    (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+    OR state <> 'claimed'
+  )
+);
+
+CREATE INDEX IF NOT EXISTS context_mirror_partitions_pending_idx
+  ON context_mirror_partitions (source_id, created_at, session_id, generation, partition_key)
+  WHERE state = 'pending';
+
+CREATE TABLE IF NOT EXISTS context_mirror_review_reservations (
+  reservation_id        TEXT        PRIMARY KEY,
+  source_id             TEXT        NOT NULL,
+  session_id            TEXT        NOT NULL,
+  generation            INTEGER     NOT NULL,
+  cohort_kind           TEXT        NOT NULL DEFAULT 'fresh' CHECK (cohort_kind IN ('fresh','historical')),
+  reserved_slots        INTEGER     NOT NULL CHECK (reserved_slots >= 0),
+  reserved_bytes        BIGINT      NOT NULL CHECK (reserved_bytes >= 0),
+  state                 TEXT        NOT NULL DEFAULT 'active' CHECK (state IN ('active','consumed','released','expired')),
+  expires_at            TIMESTAMPTZ NOT NULL,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (source_id, session_id, generation),
+  FOREIGN KEY (source_id, session_id, generation)
+    REFERENCES context_mirror_generations(source_id, session_id, generation) ON DELETE CASCADE,
+  CONSTRAINT context_mirror_review_reservation_active_shape CHECK (
+    state <> 'active' OR (reserved_slots > 0 AND reserved_bytes > 0)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS context_mirror_recovery_holds (
+  source_id             TEXT        PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  active                BOOLEAN     NOT NULL DEFAULT false,
+  reason                TEXT        NOT NULL DEFAULT '',
+  acted_by              TEXT        NOT NULL DEFAULT 'system',
+  held_at               TIMESTAMPTZ,
+  released_at           TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT context_mirror_recovery_hold_shape CHECK (
+    (active AND held_at IS NOT NULL AND released_at IS NULL) OR NOT active
+  )
+);
+
+CREATE TABLE IF NOT EXISTS context_mirror_provider_calls (
+  correlation_id        TEXT        PRIMARY KEY,
+  run_id                TEXT        NOT NULL REFERENCES context_mirror_distill_runs(run_id) ON DELETE CASCADE,
+  source_id             TEXT        NOT NULL,
+  session_id            TEXT        NOT NULL,
+  generation            INTEGER     NOT NULL CHECK (generation >= 1),
+  state                 TEXT        NOT NULL CHECK (state IN ('prepared','inflight','result_persisted','failed','ambiguous_provider_outcome')),
+  request_fingerprint   TEXT        NOT NULL,
+  result_json           JSONB,
+  usage_json            JSONB,
+  error_class           TEXT,
+  error_message         TEXT,
+  prepared_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  sent_at               TIMESTAMPTZ,
+  result_persisted_at   TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  FOREIGN KEY (source_id, session_id)
+    REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_provider_calls_recoverable_result_idx
+  ON context_mirror_provider_calls (source_id, session_id, generation)
+  WHERE state = 'result_persisted';
+
+CREATE INDEX IF NOT EXISTS context_mirror_provider_calls_session_idx
+  ON context_mirror_provider_calls (source_id, session_id, generation, prepared_at DESC);
+
+CREATE TABLE IF NOT EXISTS context_mirror_circuits (
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  provider              TEXT        NOT NULL,
+  state                 TEXT        NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open','half_open')),
+  reason                TEXT,
+  error_fingerprint     TEXT,
+  consecutive_failures  INTEGER     NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+  opened_at             TIMESTAMPTZ,
+  next_probe_at         TIMESTAMPTZ,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, provider)
+);
+
+CREATE TABLE IF NOT EXISTS context_mirror_checkpoints (
+  source_id             TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  checkpoint_kind       TEXT        NOT NULL,
+  cursor                JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  completed             BOOLEAN     NOT NULL DEFAULT false,
+  updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, checkpoint_kind)
+);
 
 -- NOTIFY trigger for real-time job events (Postgres only, not PGLite)
 CREATE OR REPLACE FUNCTION notify_minion_job_change() RETURNS trigger AS $$
@@ -1405,8 +1698,20 @@ BEGIN
     ALTER TABLE oauth_codes ENABLE ROW LEVEL SECURITY;
     -- TECH-2031 connector candidates store
     ALTER TABLE connector_candidates ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE connector_promotion_transitions ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE connector_promotion_attempts ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE connector_promotion_events ENABLE ROW LEVEL SECURITY;
     -- TECH-2033 encrypted connector token custody store
     ALTER TABLE connector_tokens ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_session_heads ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_generations ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_partitions ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_review_reservations ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_recovery_holds ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_distill_runs ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_provider_calls ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_circuits ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE context_mirror_checkpoints ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;

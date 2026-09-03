@@ -175,6 +175,15 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // pages_generation_idx (CREATE INDEX ON pages (generation)) so bootstrap
   // probes guard pre-v91 brains.
   { kind: 'column', table: 'pages', column: 'generation' },
+  // v110: latest schema creates the Context Mirror lineage index before
+  // incremental migrations run on an older candidate table.
+  { kind: 'column', table: 'connector_candidates', column: 'context_session_id' },
+  { kind: 'column', table: 'connector_candidates', column: 'context_generation' },
+  { kind: 'column', table: 'connector_candidates', column: 'context_partition' },
+  // v111: pending work is ordered by current-generation eligibility while
+  // first_eligible_at remains immutable cohort evidence.
+  { kind: 'column', table: 'context_mirror_session_heads', column: 'current_eligible_at' },
+  { kind: 'column', table: 'context_mirror_session_heads', column: 'current_cohort_at' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -263,6 +272,15 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE pages DROP COLUMN IF EXISTS generation;
       ALTER TABLE pages DROP COLUMN IF EXISTS contextual_retrieval_mode;
       ALTER TABLE pages DROP COLUMN IF EXISTS corpus_generation;
+
+      DROP INDEX IF EXISTS connector_candidates_context_lineage_idx;
+      ALTER TABLE connector_candidates DROP COLUMN IF EXISTS context_session_id;
+      ALTER TABLE connector_candidates DROP COLUMN IF EXISTS context_generation;
+      ALTER TABLE connector_candidates DROP COLUMN IF EXISTS context_partition;
+
+      DROP INDEX IF EXISTS context_mirror_session_heads_pending_idx;
+      ALTER TABLE context_mirror_session_heads DROP COLUMN IF EXISTS current_eligible_at;
+      ALTER TABLE context_mirror_session_heads DROP COLUMN IF EXISTS current_cohort_at;
     `);
 
     // Note: we don't strip sources.archived* here because they're inline in the
@@ -338,6 +356,15 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE pages DROP COLUMN IF EXISTS import_filename;
       ALTER TABLE pages DROP COLUMN IF EXISTS salience_touched_at;
       ALTER TABLE pages DROP COLUMN IF EXISTS emotional_weight;
+
+      DROP INDEX IF EXISTS connector_candidates_context_lineage_idx;
+      ALTER TABLE connector_candidates DROP COLUMN IF EXISTS context_session_id;
+      ALTER TABLE connector_candidates DROP COLUMN IF EXISTS context_generation;
+      ALTER TABLE connector_candidates DROP COLUMN IF EXISTS context_partition;
+
+      DROP INDEX IF EXISTS context_mirror_session_heads_pending_idx;
+      ALTER TABLE context_mirror_session_heads DROP COLUMN IF EXISTS current_eligible_at;
+      ALTER TABLE context_mirror_session_heads DROP COLUMN IF EXISTS current_cohort_at;
     `);
 
     // Bootstrap, then schema replay. Either step crashing fails the test.

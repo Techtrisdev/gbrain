@@ -5030,6 +5030,534 @@ export const MIGRATIONS: Migration[] = [
     },
     sql: '', // engine-specific via sqlFor
   },
+  {
+    version: 109,
+    name: 'context_mirror_operational_state',
+    // Source-scoped durable state for bounded capture discovery, session
+    // claims, restart-safe provider calls, and persistent circuit breaking.
+    // Additive and idempotent on both Postgres and PGLite.
+    idempotent: true,
+    sql: `
+      CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
+        session_slug TEXT NOT NULL,
+        capture_slug_prefix TEXT NOT NULL,
+        newest_capture_at TIMESTAMPTZ NOT NULL,
+        turn_count INTEGER NOT NULL CHECK (turn_count >= 0),
+        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        first_eligible_at TIMESTAMPTZ,
+        cohort_at TIMESTAMPTZ,
+        state TEXT NOT NULL DEFAULT 'pending'
+          CHECK (state IN ('pending','claimed','result_persisted','complete','quarantined','ambiguous')),
+        disposition TEXT,
+        claim_id TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        current_generation INTEGER NOT NULL DEFAULT 1 CHECK (current_generation >= 1),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, session_id),
+        CONSTRAINT context_mirror_session_heads_slug_unique UNIQUE (source_id, session_slug),
+        CONSTRAINT context_mirror_session_heads_claim_shape CHECK (
+          (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+          OR state <> 'claimed'
+        )
+      );
+      CREATE INDEX IF NOT EXISTS context_mirror_session_heads_pending_idx
+        ON context_mirror_session_heads (source_id, first_eligible_at, session_id)
+        WHERE state = 'pending' AND first_eligible_at IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS context_mirror_distill_runs (
+        run_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('running','ok','partial','failed','aborted')),
+        stop_reason TEXT,
+        limits JSONB NOT NULL DEFAULT '{}'::jsonb,
+        selected_count INTEGER NOT NULL DEFAULT 0 CHECK (selected_count >= 0),
+        completed_count INTEGER NOT NULL DEFAULT 0 CHECK (completed_count >= 0),
+        failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+        deferred_count INTEGER NOT NULL DEFAULT 0 CHECK (deferred_count >= 0),
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS context_mirror_distill_runs_source_started_idx
+        ON context_mirror_distill_runs (source_id, started_at DESC);
+
+      CREATE TABLE IF NOT EXISTS context_mirror_provider_calls (
+        correlation_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES context_mirror_distill_runs(run_id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        state TEXT NOT NULL CHECK (state IN ('prepared','inflight','result_persisted','failed','ambiguous_provider_outcome')),
+        request_fingerprint TEXT NOT NULL,
+        result_json JSONB,
+        usage_json JSONB,
+        error_class TEXT,
+        error_message TEXT,
+        prepared_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        sent_at TIMESTAMPTZ,
+        result_persisted_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        FOREIGN KEY (source_id, session_id)
+          REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_provider_calls_recoverable_result_idx
+        ON context_mirror_provider_calls (source_id, session_id, generation)
+        WHERE state = 'result_persisted';
+      CREATE INDEX IF NOT EXISTS context_mirror_provider_calls_session_idx
+        ON context_mirror_provider_calls (source_id, session_id, generation, prepared_at DESC);
+
+      CREATE TABLE IF NOT EXISTS context_mirror_circuits (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open','half_open')),
+        reason TEXT,
+        error_fingerprint TEXT,
+        consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+        opened_at TIMESTAMPTZ,
+        next_probe_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, provider)
+      );
+
+      CREATE TABLE IF NOT EXISTS context_mirror_checkpoints (
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        checkpoint_kind TEXT NOT NULL,
+        cursor JSONB NOT NULL DEFAULT '{}'::jsonb,
+        completed BOOLEAN NOT NULL DEFAULT false,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, checkpoint_kind)
+      );
+    `,
+    verify: async (engine) => {
+      const tables = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'context_mirror_session_heads',
+              'context_mirror_distill_runs',
+              'context_mirror_provider_calls',
+              'context_mirror_circuits',
+              'context_mirror_checkpoints'
+            )`,
+      );
+      return new Set(tables.map((row) => row.table_name)).size === 5;
+    },
+  },
+  {
+    version: 110,
+    name: 'context_mirror_generation_and_review_ledger',
+    idempotent: true,
+    sql: `
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_session_id TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_generation INTEGER;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_partition TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS requires_human_review BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS evidence_trust TEXT;
+      ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS review_warning TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS evidence_trust TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS review_warning TEXT;
+      ALTER TABLE consolidation_decisions ADD COLUMN IF NOT EXISTS requires_human_review BOOLEAN NOT NULL DEFAULT false;
+
+      DO $$
+      DECLARE r record;
+      BEGIN
+        FOR r IN
+          SELECT con.conname
+            FROM pg_constraint con
+            JOIN pg_attribute att
+              ON att.attrelid = con.conrelid
+             AND att.attnum = ANY (con.conkey)
+           WHERE con.conrelid = 'connector_candidates'::regclass
+             AND con.contype = 'c'
+             AND att.attname = 'status'
+        LOOP
+          EXECUTE format('ALTER TABLE connector_candidates DROP CONSTRAINT %I', r.conname);
+        END LOOP;
+      END $$;
+      ALTER TABLE connector_candidates
+        ADD CONSTRAINT connector_candidates_status_check
+        CHECK (status IN ('pending','accepted','rejected','needs_review','awaiting_review_capacity'));
+
+      DO $$ BEGIN
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_context_generation_check
+          CHECK (context_generation IS NULL OR context_generation >= 1);
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+      DO $$ BEGIN
+        ALTER TABLE connector_candidates
+          ADD CONSTRAINT connector_candidates_evidence_trust_check
+          CHECK (evidence_trust IS NULL OR evidence_trust = 'untrusted_transcript');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+      DO $$ BEGIN
+        ALTER TABLE consolidation_decisions
+          ADD CONSTRAINT consolidation_decisions_evidence_trust_check
+          CHECK (evidence_trust IS NULL OR evidence_trust = 'untrusted_transcript');
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+      CREATE INDEX IF NOT EXISTS connector_candidates_context_lineage_idx
+        ON connector_candidates (source_id, context_session_id, context_generation, context_partition)
+        WHERE context_session_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS context_mirror_generations (
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        input_hash TEXT NOT NULL,
+        originator TEXT,
+        runtime TEXT,
+        transform_version TEXT NOT NULL,
+        model TEXT NOT NULL,
+        expected_manifest JSONB NOT NULL DEFAULT '[]'::jsonb,
+        expected_partitions INTEGER NOT NULL DEFAULT 0 CHECK (expected_partitions >= 0),
+        materialized_partitions INTEGER NOT NULL DEFAULT 0 CHECK (materialized_partitions >= 0),
+        state TEXT NOT NULL DEFAULT 'building'
+          CHECK (state IN ('building','complete','superseded','quarantined','unverified_legacy')),
+        is_current BOOLEAN NOT NULL DEFAULT true,
+        requires_human_review BOOLEAN NOT NULL DEFAULT false,
+        recovery_hold BOOLEAN NOT NULL DEFAULT false,
+        completed_at TIMESTAMPTZ,
+        superseded_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, session_id, generation),
+        FOREIGN KEY (source_id, session_id)
+          REFERENCES context_mirror_session_heads(source_id, session_id) ON DELETE CASCADE
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS context_mirror_generations_current_idx
+        ON context_mirror_generations (source_id, session_id) WHERE is_current;
+      CREATE INDEX IF NOT EXISTS context_mirror_generations_ready_idx
+        ON context_mirror_generations (source_id, state, completed_at, session_id, generation)
+        WHERE is_current AND state = 'complete';
+
+      CREATE TABLE IF NOT EXISTS context_mirror_partitions (
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        partition_key TEXT NOT NULL,
+        distilled_slug TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending'
+          CHECK (state IN ('pending','claimed','decided','degraded','failed','superseded','unverified_legacy')),
+        claim_id TEXT,
+        lease_expires_at TIMESTAMPTZ,
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        candidate_id BIGINT REFERENCES connector_candidates(id) ON DELETE SET NULL,
+        decision_classification TEXT,
+        last_error_code TEXT,
+        last_error_message TEXT,
+        decided_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (source_id, session_id, generation, partition_key),
+        FOREIGN KEY (source_id, session_id, generation)
+          REFERENCES context_mirror_generations(source_id, session_id, generation) ON DELETE CASCADE,
+        CONSTRAINT context_mirror_partitions_claim_shape CHECK (
+          (state = 'claimed' AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)
+          OR state <> 'claimed'
+        )
+      );
+      CREATE INDEX IF NOT EXISTS context_mirror_partitions_pending_idx
+        ON context_mirror_partitions (source_id, created_at, session_id, generation, partition_key)
+        WHERE state = 'pending';
+
+      CREATE TABLE IF NOT EXISTS context_mirror_review_reservations (
+        reservation_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        cohort_kind TEXT NOT NULL DEFAULT 'fresh' CHECK (cohort_kind IN ('fresh','historical')),
+        reserved_slots INTEGER NOT NULL CHECK (reserved_slots >= 0),
+        reserved_bytes BIGINT NOT NULL CHECK (reserved_bytes >= 0),
+        state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','consumed','released','expired')),
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (source_id, session_id, generation),
+        FOREIGN KEY (source_id, session_id, generation)
+          REFERENCES context_mirror_generations(source_id, session_id, generation) ON DELETE CASCADE,
+        CONSTRAINT context_mirror_review_reservation_active_shape CHECK (
+          state <> 'active' OR (reserved_slots > 0 AND reserved_bytes > 0)
+        )
+      );
+
+      CREATE TABLE IF NOT EXISTS context_mirror_recovery_holds (
+        source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+        active BOOLEAN NOT NULL DEFAULT false,
+        reason TEXT NOT NULL DEFAULT '',
+        held_at TIMESTAMPTZ,
+        released_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT context_mirror_recovery_hold_shape CHECK (
+          (active AND held_at IS NOT NULL AND released_at IS NULL) OR NOT active
+        )
+      );
+    `,
+    verify: async (engine) => {
+      const tables = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'context_mirror_generations',
+              'context_mirror_partitions',
+              'context_mirror_review_reservations',
+              'context_mirror_recovery_holds'
+            )`,
+      );
+      const columns = await engine.executeRaw<{ table_name: string; column_name: string }>(
+        `SELECT table_name, column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND (
+              (table_name = 'connector_candidates' AND column_name IN (
+                'context_session_id','context_generation','context_partition','correlation_id',
+                'requires_human_review','evidence_trust','review_warning'
+              ))
+              OR
+              (table_name = 'consolidation_decisions' AND column_name IN (
+                'correlation_id','requires_human_review','evidence_trust','review_warning'
+              ))
+            )`,
+      );
+      return new Set(tables.map((row) => row.table_name)).size === 4
+        && new Set(columns.map((row) => `${row.table_name}.${row.column_name}`)).size === 11;
+    },
+  },
+  {
+    version: 111,
+    name: 'context_mirror_current_generation_eligibility',
+    // Preserve first-ever eligibility/cohort timestamps as immutable cohort
+    // evidence while tracking the retryable eligibility of the current
+    // generation separately. Late evidence may reopen a completed session,
+    // but it must not rewrite the historical denominator.
+    idempotent: true,
+    sql: `
+      ALTER TABLE context_mirror_session_heads
+        ADD COLUMN IF NOT EXISTS current_eligible_at TIMESTAMPTZ;
+      ALTER TABLE context_mirror_session_heads
+        ADD COLUMN IF NOT EXISTS current_cohort_at TIMESTAMPTZ;
+
+      UPDATE context_mirror_session_heads
+         SET current_eligible_at = COALESCE(current_eligible_at, first_eligible_at),
+             current_cohort_at = COALESCE(current_cohort_at, cohort_at)
+       WHERE current_eligible_at IS NULL AND first_eligible_at IS NOT NULL;
+
+      DROP INDEX IF EXISTS context_mirror_session_heads_pending_idx;
+      CREATE INDEX context_mirror_session_heads_pending_idx
+        ON context_mirror_session_heads (source_id, current_eligible_at, session_id)
+        WHERE state = 'pending' AND current_eligible_at IS NOT NULL;
+    `,
+    verify: async (engine) => {
+      const columns = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'context_mirror_session_heads'
+            AND column_name IN ('current_eligible_at','current_cohort_at')`,
+      );
+      const indexes = await engine.executeRaw<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+          WHERE schemaname = 'public'
+            AND tablename = 'context_mirror_session_heads'
+            AND indexname = 'context_mirror_session_heads_pending_idx'`,
+      );
+      return new Set(columns.map((row) => row.column_name)).size === 2
+        && indexes.some((row) => row.indexdef.includes('current_eligible_at'));
+    },
+  },
+  {
+    version: 112,
+    name: 'connector_promotion_monotonic_lifecycle',
+    idempotent: true,
+    sql: `
+      INSERT INTO config (key, value)
+        VALUES ('connectors.promotion_dispatch_frozen', 'true')
+        ON CONFLICT (key) DO UPDATE SET value = 'true';
+
+      CREATE TABLE IF NOT EXISTS connector_promotion_transitions (
+        candidate_id BIGINT PRIMARY KEY REFERENCES connector_candidates(id) ON DELETE CASCADE,
+        source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+        correlation_id TEXT NOT NULL UNIQUE,
+        identity_version INTEGER NOT NULL DEFAULT 2 CHECK (identity_version = 2),
+        state TEXT NOT NULL CHECK (state IN (
+          'accepted_dispatching','dispatch_failed','pr_opened','merged_reindexing',
+          'indexing_failed','indexed','unresolved_legacy'
+        )),
+        last_durable_stage TEXT NOT NULL CHECK (last_durable_stage IN ('accepted','pr_opened','merged_reindexing','indexed')),
+        failure_code TEXT,
+        next_action TEXT NOT NULL CHECK (next_action IN (
+          'dispatch','reconcile_dispatch','await_pr_opened','await_merge','retry_indexing',
+          'review_stale_update','resolve_legacy','none'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        last_attempt_at TIMESTAMPTZ,
+        callback_received_at TIMESTAMPTZ,
+        accepted_at TIMESTAMPTZ NOT NULL,
+        pr_opened_at TIMESTAMPTZ,
+        merged_at TIMESTAMPTZ,
+        indexed_at TIMESTAMPTZ,
+        pr_url TEXT,
+        branch TEXT,
+        merge_sha TEXT,
+        workflow_run_id TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS connector_promotion_transitions_source_state_idx
+        ON connector_promotion_transitions (source_id, state, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS connector_promotion_attempts (
+        id BIGSERIAL PRIMARY KEY,
+        candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+        correlation_id TEXT NOT NULL,
+        attempt_no INTEGER NOT NULL CHECK (attempt_no >= 1),
+        outcome TEXT NOT NULL CHECK (outcome IN ('prepared','succeeded','failed','unresolved')),
+        error_code TEXT,
+        actor TEXT,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at TIMESTAMPTZ,
+        UNIQUE (candidate_id, attempt_no)
+      );
+      CREATE INDEX IF NOT EXISTS connector_promotion_attempts_correlation_idx
+        ON connector_promotion_attempts (correlation_id, attempt_no DESC);
+
+      CREATE TABLE IF NOT EXISTS connector_promotion_events (
+        id BIGSERIAL PRIMARY KEY,
+        candidate_id BIGINT NOT NULL REFERENCES connector_candidates(id) ON DELETE CASCADE,
+        correlation_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (event_type IN ('migration','dispatch','callback','retry')),
+        from_state TEXT,
+        requested_state TEXT,
+        resulting_state TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('applied','stale','rejected','unresolved')),
+        reason_code TEXT,
+        occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS connector_promotion_events_correlation_idx
+        ON connector_promotion_events (correlation_id, occurred_at DESC, id DESC);
+
+      DO $$
+      DECLARE has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE connector_promotion_transitions ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE connector_promotion_attempts ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE connector_promotion_events ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+
+      INSERT INTO connector_promotion_transitions (
+        candidate_id, source_id, correlation_id, state, last_durable_stage,
+        failure_code, next_action, attempt_count, last_attempt_at, callback_received_at,
+        accepted_at, pr_opened_at, indexed_at, pr_url, branch
+      )
+      SELECT c.id, c.source_id,
+             'cm-promo-v2-c' || c.id::text || '-g' || COALESCE(c.context_generation, 0)::text,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'unresolved_legacy'
+               WHEN c.promotion_status = 'pr_opened' THEN 'pr_opened'
+               WHEN c.promotion_status IS NULL THEN 'dispatch_failed'
+               ELSE 'unresolved_legacy'
+             END,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'accepted'
+               WHEN c.promotion_status = 'pr_opened' THEN 'pr_opened'
+               ELSE 'accepted'
+             END,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'legacy_index_proof_unverified'
+               WHEN c.promotion_status IS NULL THEN 'legacy_dispatch_outcome_unknown'
+               WHEN c.promotion_status NOT IN ('pr_opened','indexed') THEN 'legacy_stage_unresolved'
+               ELSE NULL
+             END,
+             CASE
+               WHEN c.promotion_status = 'indexed' THEN 'resolve_legacy'
+               WHEN c.promotion_status = 'pr_opened' THEN 'await_merge'
+               WHEN c.promotion_status IS NULL THEN 'reconcile_dispatch'
+               ELSE 'resolve_legacy'
+             END,
+             CASE WHEN c.artifact_hash IS NULL THEN 0 ELSE 1 END,
+             CASE WHEN c.artifact_hash IS NULL THEN NULL ELSE COALESCE(c.promoted_at, c.acted_at) END,
+             c.promoted_at,
+             COALESCE(c.acted_at, c.proposed_at),
+             CASE WHEN c.promotion_status IN ('pr_opened','indexed') THEN c.promoted_at ELSE NULL END,
+             NULL,
+             c.promotion_pr_url, c.promotion_branch
+        FROM connector_candidates c
+       WHERE c.status = 'accepted'
+      ON CONFLICT (candidate_id) DO NOTHING;
+
+      INSERT INTO connector_promotion_events (
+        candidate_id, correlation_id, event_type, requested_state, resulting_state, outcome, reason_code
+      )
+      SELECT t.candidate_id, t.correlation_id, 'migration', t.state, t.state,
+             CASE WHEN t.state = 'unresolved_legacy' THEN 'unresolved' ELSE 'applied' END,
+             t.failure_code
+        FROM connector_promotion_transitions t
+       WHERE NOT EXISTS (
+         SELECT 1 FROM connector_promotion_events e
+          WHERE e.candidate_id = t.candidate_id AND e.event_type = 'migration'
+       );
+
+      INSERT INTO connector_promotion_attempts (
+        candidate_id, correlation_id, attempt_no, outcome, error_code, actor, started_at, finished_at
+      )
+      SELECT t.candidate_id, t.correlation_id, 1, 'unresolved', 'legacy_attempt_unverified', 'migration',
+             COALESCE(t.last_attempt_at, t.accepted_at), COALESCE(t.last_attempt_at, t.accepted_at)
+        FROM connector_promotion_transitions t
+       WHERE t.attempt_count > 0
+      ON CONFLICT (candidate_id, attempt_no) DO NOTHING;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_name: string }>(
+        `SELECT table_name FROM information_schema.tables
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'connector_promotion_transitions','connector_promotion_attempts','connector_promotion_events'
+            )`,
+      );
+      const frozen = await engine.getConfig('connectors.promotion_dispatch_frozen');
+      return new Set(rows.map((row) => row.table_name)).size === 3 && frozen === 'true';
+    },
+  },
+  {
+    version: 113,
+    name: 'context_mirror_admin_control_audit',
+    // Durable operator attribution for the source-confined recovery MCP
+    // controls. The state-machine mutations remain in their owning helpers;
+    // these columns make the reason/actor and idempotent rollback result
+    // verifiable after process restarts.
+    idempotent: true,
+    sql: `
+      ALTER TABLE connector_promotion_events ADD COLUMN IF NOT EXISTS actor TEXT;
+      ALTER TABLE connector_promotion_events ADD COLUMN IF NOT EXISTS reason TEXT;
+
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rollback_actor TEXT;
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rollback_reason TEXT;
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rollback_rejected_candidates INTEGER;
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rolled_back_at TIMESTAMPTZ;
+
+      ALTER TABLE context_mirror_recovery_holds
+        ADD COLUMN IF NOT EXISTS acted_by TEXT NOT NULL DEFAULT 'system';
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_name: string; column_name: string }>(
+        `SELECT table_name, column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND (
+              (table_name = 'connector_promotion_events' AND column_name IN ('actor','reason'))
+              OR (table_name = 'context_mirror_generations' AND column_name IN (
+                'rollback_actor','rollback_reason','rollback_rejected_candidates','rolled_back_at'
+              ))
+              OR (table_name = 'context_mirror_recovery_holds' AND column_name = 'acted_by')
+            )`,
+      );
+      return new Set(rows.map((row) => `${row.table_name}.${row.column_name}`)).size === 7;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

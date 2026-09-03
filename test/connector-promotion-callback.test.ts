@@ -32,6 +32,10 @@ import {
   sourceRecordIdHash16,
   type PromotionCallbackResult,
 } from '../src/core/connectors/promotion.ts';
+import {
+  ensurePromotionTransition,
+  readPromotionTransitionByCandidate,
+} from '../src/core/connectors/promotion-state.ts';
 
 let engine: PGLiteEngine;
 
@@ -82,15 +86,21 @@ function signedBody(body: {
  * status='accepted' AND artifact_hash IS NOT NULL (the exact set the handler's SELECT scopes
  * to). Returns the row id + the wire hash the Brain would send for it.
  */
-async function seedDispatched(sourceRecordId: string, opts?: { provider?: string }): Promise<{
+async function seedDispatched(sourceRecordId: string, opts?: {
+  provider?: string;
+  version?: string;
+  contextGeneration?: number;
+}): Promise<{
   id: number;
   hash16: string;
 }> {
   const { row } = await toRow(engine, {
     source_id: 'default',
     source_record_id: sourceRecordId,
+    version: opts?.version,
     provider: opts?.provider ?? 'crunchbase',
     proposed_markdown: `# ${sourceRecordId}`,
+    context_generation: opts?.contextGeneration,
   });
   await engine.executeRaw(
     `UPDATE connector_candidates
@@ -104,6 +114,16 @@ async function seedDispatched(sourceRecordId: string, opts?: { provider?: string
     [row.id, `hash-${sourceRecordId}`],
   );
   return { id: row.id, hash16: sourceRecordIdHash16(sourceRecordId) };
+}
+
+function signedJson(body: Record<string, unknown>): { rawBody: Buffer; signature: string } {
+  const rawBody = Buffer.from(JSON.stringify(body), 'utf8');
+  return { rawBody, signature: createHmac('sha256', SECRET).update(rawBody).digest('hex') };
+}
+
+async function ensureTransition(id: number) {
+  const row = await readRow(id);
+  return ensurePromotionTransition(engine, row);
 }
 
 async function readRow(id: number): Promise<ConnectorCandidateRow> {
@@ -275,7 +295,7 @@ describe('status mapping: failed → failed (status stays accepted)', () => {
 
     const result = await handlePromotionCallback({ rawBody, signatureHeader: signature, secret: SECRET, engine });
     expect(result.ok).toBe(true);
-    expect((result as Extract<PromotionCallbackResult, { ok: true }>).mappedStatus).toBe('failed');
+    expect((result as Extract<PromotionCallbackResult, { ok: true }>).mappedStatus).toBe('dispatch_failed');
 
     const after = await readRow(id);
     expect(after.promotion_status).toBe('failed');
@@ -457,10 +477,10 @@ describe('idempotency (replay-safe)', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-// Monotonic guard (stale 'opened' replay) + >1-match fail-closed
+// Monotonic lifecycle + legacy identity ambiguity fail-closed
 // ─────────────────────────────────────────────────────────────────
 describe('monotonic guard + ambiguous match', () => {
-  test("a stale 'opened' replayed after 'failed' is ignored — no downgrade, no promoted_at re-stamp", async () => {
+  test("a late 'opened' after dispatch failure advances to PR opened", async () => {
     const { id, hash16 } = await seedDispatched('rec-stale');
 
     // The Brain first reports failure → promotion_status='failed'.
@@ -475,11 +495,11 @@ describe('monotonic guard + ambiguous match', () => {
     expect(r2.ok).toBe(true);
     expect((r2 as Extract<PromotionCallbackResult, { ok: true }>).status).toBe(200);
 
-    // The row stays 'failed' — the stale 'opened' did NOT revert it or re-stamp promoted_at.
+    // Dispatch failure is not durable PR evidence; a later signed opened callback can advance it.
     const after = await readRow(id);
-    expect(after.promotion_status).toBe('failed');
-    expect(after.promotion_pr_url).toBeNull();
-    expect(after.promoted_at).toBeNull();
+    expect(after.promotion_status).toBe('pr_opened');
+    expect(after.promotion_pr_url).toBe(PR_URL);
+    expect(after.promoted_at).not.toBeNull();
     expect(after.status).toBe('accepted');
   });
 
@@ -565,5 +585,141 @@ describe('logging discipline (AC7)', () => {
     expect(all).not.toContain(forgedSig);
     expect(all).not.toContain('FORGEDLEAK'); // body never parsed/logged on a sig failure
     expect(all).not.toContain(SECRET);
+  });
+});
+
+describe('generation-aware callback v2', () => {
+  test('correlation id disambiguates two accepted generations with the same source record id', async () => {
+    const first = await seedDispatched('same-session', { version: 'g1', contextGeneration: 1 });
+    const second = await seedDispatched('same-session', { version: 'g2', contextGeneration: 2 });
+    await ensureTransition(first.id);
+    const secondTransition = await ensureTransition(second.id);
+    const { rawBody, signature } = signedJson({
+      schema_version: 2,
+      correlation_id: secondTransition.correlation_id,
+      status: 'indexed',
+      merge_sha: 'a'.repeat(40),
+      workflow_run_id: '12345',
+    });
+
+    const result = await handlePromotionCallback({ rawBody, signatureHeader: signature, secret: SECRET, engine });
+    expect(result.ok).toBe(true);
+    expect((result as Extract<PromotionCallbackResult, { ok: true }>).candidateId).toBe(second.id);
+    expect((await readRow(first.id)).promotion_status).toBeNull();
+    expect((await readRow(second.id)).promotion_status).toBe('indexed');
+  });
+
+  test('merged, indexing failure, and retry completion are recorded without losing durable progress', async () => {
+    const { id } = await seedDispatched('v2-lifecycle', { contextGeneration: 4 });
+    const transition = await ensureTransition(id);
+    for (const body of [
+      { schema_version: 2, correlation_id: transition.correlation_id, status: 'opened', branch: BRANCH, pr_url: PR_URL },
+      { schema_version: 2, correlation_id: transition.correlation_id, status: 'merged', merge_sha: 'b'.repeat(40), workflow_run_id: '76' },
+      {
+        schema_version: 2,
+        correlation_id: transition.correlation_id,
+        status: 'indexing_failed',
+        failure_code: 'reindex_workflow_failed',
+        merge_sha: 'b'.repeat(40),
+        workflow_run_id: '77',
+      },
+      { schema_version: 2, correlation_id: transition.correlation_id, status: 'indexed', merge_sha: 'b'.repeat(40), workflow_run_id: '78' },
+    ]) {
+      const signed = signedJson(body);
+      const result = await handlePromotionCallback({
+        rawBody: signed.rawBody,
+        signatureHeader: signed.signature,
+        secret: SECRET,
+        engine,
+      });
+      expect(result.ok).toBe(true);
+    }
+
+    const final = await readPromotionTransitionByCandidate(engine, id);
+    expect(final?.state).toBe('indexed');
+    expect(final?.last_durable_stage).toBe('indexed');
+    expect(final?.failure_code).toBeNull();
+    expect(final?.merge_sha).toBe('b'.repeat(40));
+    expect(final?.workflow_run_id).toBe('78');
+  });
+
+  test('late callbacks cannot regress an indexed transition and are audited as stale', async () => {
+    const { id } = await seedDispatched('v2-stale');
+    const transition = await ensureTransition(id);
+    const indexed = signedJson({
+      schema_version: 2,
+      correlation_id: transition.correlation_id,
+      status: 'indexed',
+      merge_sha: 'c'.repeat(40),
+      workflow_run_id: 'stale-88',
+    });
+    await handlePromotionCallback({ rawBody: indexed.rawBody, signatureHeader: indexed.signature, secret: SECRET, engine });
+    const opened = signedJson({
+      schema_version: 2,
+      correlation_id: transition.correlation_id,
+      status: 'opened',
+      branch: BRANCH,
+      pr_url: PR_URL,
+    });
+    const result = await handlePromotionCallback({ rawBody: opened.rawBody, signatureHeader: opened.signature, secret: SECRET, engine });
+
+    expect(result.ok).toBe(true);
+    expect((result as Extract<PromotionCallbackResult, { ok: true }>).outcome).toBe('stale');
+    expect((await readPromotionTransitionByCandidate(engine, id))?.state).toBe('indexed');
+    const [event] = await engine.executeRaw<{ outcome: string; reason_code: string }>(
+      `SELECT outcome, reason_code FROM connector_promotion_events
+        WHERE candidate_id = $1 ORDER BY id DESC LIMIT 1`,
+      [id],
+    );
+    expect(event).toEqual({ outcome: 'stale', reason_code: 'out_of_order_callback' });
+  });
+
+  test('unknown failure taxonomy is rejected before any state mutation', async () => {
+    const { id } = await seedDispatched('v2-bad-failure');
+    const transition = await ensureTransition(id);
+    const signed = signedJson({
+      schema_version: 2,
+      correlation_id: transition.correlation_id,
+      status: 'indexing_failed',
+      failure_code: 'raw-secret-provider-message',
+      merge_sha: 'f'.repeat(40),
+      workflow_run_id: 'bad-failure-93',
+    });
+    const result = await handlePromotionCallback({ rawBody: signed.rawBody, signatureHeader: signed.signature, secret: SECRET, engine });
+    expect(result.ok).toBe(false);
+    expect((result as Extract<PromotionCallbackResult, { ok: false }>).status).toBe(400);
+    expect((await readPromotionTransitionByCandidate(engine, id))?.state).toBe('accepted_dispatching');
+  });
+
+  test.each([
+    ['opened without branch', { status: 'opened', pr_url: PR_URL }],
+    ['opened without PR URL', { status: 'opened', branch: BRANCH }],
+    ['merged without merge SHA', { status: 'merged', workflow_run_id: '91' }],
+    ['merged without workflow run', { status: 'merged', merge_sha: 'd'.repeat(40) }],
+    ['dispatch failure without failure code', { status: 'dispatch_failed' }],
+    ['indexing failure without merge SHA', { status: 'indexing_failed', workflow_run_id: '92', failure_code: 'reindex_workflow_failed' }],
+    ['indexing failure without workflow run', { status: 'indexing_failed', merge_sha: 'e'.repeat(40), failure_code: 'reindex_workflow_failed' }],
+    ['indexing failure without failure code', { status: 'indexing_failed', merge_sha: 'e'.repeat(40), workflow_run_id: '93' }],
+    ['indexed without merge SHA', { status: 'indexed', workflow_run_id: '94' }],
+    ['indexed without workflow run', { status: 'indexed', merge_sha: 'e'.repeat(40) }],
+  ])('rejects %s before any state mutation', async (_label, stage) => {
+    const { id } = await seedDispatched(`v2-missing-${String(stage.status)}`);
+    const transition = await ensureTransition(id);
+    const signed = signedJson({
+      schema_version: 2,
+      correlation_id: transition.correlation_id,
+      ...stage,
+    });
+
+    const result = await handlePromotionCallback({
+      rawBody: signed.rawBody,
+      signatureHeader: signed.signature,
+      secret: SECRET,
+      engine,
+    });
+
+    expect(result.ok).toBe(false);
+    expect((result as Extract<PromotionCallbackResult, { ok: false }>).status).toBe(400);
+    expect((await readPromotionTransitionByCandidate(engine, id))?.state).toBe('accepted_dispatching');
   });
 });

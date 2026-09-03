@@ -7,12 +7,12 @@
  *   → canonicalize (canonicalizeArtifactForSigning)
  *   → sign (signArtifact, hex HMAC keyed by PROMOTION_HMAC_SECRET)
  *   → emit (emitRepositoryDispatch → repository_dispatch to techtris-brain)
- *   → reflect (updateCandidatePromotionState: promotion_status='pr_opened')
+ *   → record a durable dispatch attempt (PR creation remains unproven)
  *
- * Failure semantics (AC5): a dispatch/emit failure throws OUT of the hook. approveCandidate
- * catches it and leaves the candidate `accepted` with NO promotion_status (retriable). The
- * hook NEVER marks the candidate promoted on failure and NEVER swallows the error into a
- * "promoted" state.
+ * Failure semantics: a dispatch/emit failure is classified into the durable transition and
+ * attempt ledgers, then throws OUT of the hook. approveCandidate keeps the review decision
+ * accepted and retriable. A successful repository_dispatch is only delivery acceptance;
+ * `pr_opened` is written exclusively from a verified Brain callback.
  *
  * INERT seam (AC5): registering this hook performs NO live dispatch by itself. The real
  * POST only happens when a candidate is approved AND the secret + token are configured.
@@ -31,7 +31,6 @@ import {
   canonicalizeArtifactForSigning,
   signArtifact,
   emitRepositoryDispatch,
-  updateCandidatePromotionState,
   getPromotionDispatchToken,
   BRAIN_DISPATCH_REPO,
   PROMOTION_APP_ID_ENV,
@@ -40,6 +39,12 @@ import {
   type FetchFn,
   type AppAuthFetch,
 } from './promotion.ts';
+import {
+  beginPromotionDispatchAttempt,
+  finishPromotionDispatchAttempt,
+  promotionDispatchFrozen,
+  recordPromotionDispatchBlocked,
+} from './promotion-state.ts';
 
 /** Env var holding the HMAC secret shared with the Brain bridge. NEVER logged. */
 export const PROMOTION_HMAC_SECRET_ENV = 'PROMOTION_HMAC_SECRET';
@@ -67,6 +72,8 @@ export interface PromotionHookDeps {
   fetchFn?: FetchFn;
   /** Target repo override (tests). Defaults to the Brain repo inside emitRepositoryDispatch. */
   repo?: string;
+  /** Per-request GitHub deadline override (tests). Production defaults to 15 seconds. */
+  githubRequestTimeoutMs?: number;
 }
 
 /**
@@ -90,6 +97,7 @@ function makeDefaultTokenResolver(
       return getPromotionDispatchToken(deps.repo ?? BRAIN_DISPATCH_REPO, {
         getEnv,
         fetchImpl: deps.dispatchTokenFetch,
+        timeoutMs: deps.githubRequestTimeoutMs,
       });
     }
     throw new Error(
@@ -123,36 +131,43 @@ export function makePromotionHook(deps: PromotionHookDeps = {}): PromotionHook {
   return async (
     engine: BrainEngine,
     candidate: ConnectorCandidateRow,
-    _actor: string,
+    actor: string,
     target: PromotionTarget,
   ): Promise<{ prUrl?: string }> => {
-    const secret = getSecret();
-    if (!secret) throw new Error(`${PROMOTION_HMAC_SECRET_ENV} is not set — cannot sign promotion artifact`);
+    if (await promotionDispatchFrozen(engine)) {
+      await recordPromotionDispatchBlocked(engine, candidate.id, 'dispatch_frozen');
+      throw new Error('promotion dispatch is frozen pending legacy reconciliation');
+    }
+    const attempt = await beginPromotionDispatchAttempt(engine, candidate.id, actor);
+    try {
+      const secret = getSecret();
+      if (!secret) throw new Error(`${PROMOTION_HMAC_SECRET_ENV} is not set — cannot sign promotion artifact`);
 
-    // build → canonicalize → sign
-    const artifact = buildPromotionArtifact(candidate, target);
-    const canonical = canonicalizeArtifactForSigning(artifact);
-    const signature = signArtifact(canonical, secret);
+      // build → canonicalize → sign
+      const artifact = buildPromotionArtifact(candidate, target);
+      const canonical = canonicalizeArtifactForSigning(artifact);
+      const signature = signArtifact(canonical, secret);
 
-    // Resolve the dispatch Bearer: a static token, else a minted GitHub App installation token.
-    // Throws (caught by approveCandidate → accepted-pending, retriable) when no credential is set.
-    const githubToken = await getToken();
-
-    // emit (throws on non-2xx → approveCandidate leaves the row accepted-pending, retriable)
-    await emitRepositoryDispatch({
-      canonical,
-      signature,
-      githubToken,
-      repo: deps.repo,
-      fetchFn: deps.fetchFn,
-    });
-    logPromotion('dispatched', candidate);
-
-    // reflect: a successful dispatch means the Brain bridge will open a PR. We record
-    // 'pr_opened' as the optimistic post-dispatch state; the Brain reflects the terminal
-    // pr_url/branch/indexed back via its callback (a separate path).
-    await updateCandidatePromotionState(engine, candidate.id, { promotion_status: 'pr_opened' });
-
+      // Resolve the dispatch Bearer: a static token, else a minted GitHub App installation token.
+      const githubToken = await getToken();
+      await emitRepositoryDispatch({
+        canonical,
+        signature,
+        githubToken,
+        repo: deps.repo,
+        fetchFn: deps.fetchFn,
+        timeoutMs: deps.githubRequestTimeoutMs,
+      });
+    } catch (err) {
+      await finishPromotionDispatchAttempt(engine, candidate.id, attempt.attemptNo, err);
+      throw err;
+    }
+    // Persist success outside the network try/catch. If this write fails, it must fail
+    // loudly without being reclassified as a failed remote dispatch.
+    await finishPromotionDispatchAttempt(engine, candidate.id, attempt.attemptNo);
+    logPromotion('dispatched_awaiting_callback', candidate);
+    // A 204 repository_dispatch response proves delivery acceptance, not PR creation.
+    // pr_opened is recorded only by the signed Brain callback.
     return {};
   };
 }

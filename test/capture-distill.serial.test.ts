@@ -4,7 +4,7 @@
  * The distiller groups RAW per-turn `capture/<session>/…` pages by session and,
  * for each COMPLETED session (newest capture older than --idle-hours), makes ONE
  * gateway chat() call that emits 0–6 durable memory statements, written as
- * `distilled/<session-slug>/mem-K` pages + a `distill-state/<session-slug>`
+ * immutable `distilled/<session-slug>/g-N/mem-K` pages + a `distill-state/<session-slug>`
  * idempotency marker.
  *
  * Mirrors connector-context-mirror.test.ts (a fake engine capturing listPages +
@@ -27,6 +27,7 @@ import {
   type ChatOpts,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
+import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
 import {
   distillCaptureSessions,
   groupCapturesBySession,
@@ -51,6 +52,7 @@ function makeFakeEngine(seededPages: Page[] = []) {
   const puts: { slug: string; page: PageInput; sourceId?: string }[] = [];
   const chunkWrites: { slug: string; count: number; sourceId?: string }[] = [];
   const deletes: { slug: string; sourceId?: string }[] = [];
+  const getCalls: { slug: string; sourceId?: string }[] = [];
   const listCalls: (PageFilters | undefined)[] = [];
   const allPages = (): Page[] => [...seededPages, ...store.values()];
 
@@ -82,7 +84,8 @@ function makeFakeEngine(seededPages: Page[] = []) {
   };
 
   // getPage: store (latest write) wins over the seeded set; null when unknown.
-  const getPage = async (slug: string): Promise<Page | null> => {
+  const getPage = async (slug: string, opts?: { sourceId?: string }): Promise<Page | null> => {
+    getCalls.push({ slug, sourceId: opts?.sourceId });
     return store.get(slug) ?? allPages().find((p) => p.slug === slug) ?? null;
   };
 
@@ -124,6 +127,36 @@ function makeFakeEngine(seededPages: Page[] = []) {
     store.delete(slug);
   };
 
+  const executeRaw = async (sql: string, params: unknown[] = []): Promise<unknown[]> => {
+    if (!sql.includes('WITH capture_sessions AS')) throw new Error(`unexpected SQL in fake engine: ${sql}`);
+    const sourceId = String(params[0] ?? 'capture-events');
+    const grouped = new Map<string, { session_id: string; capture_slug_prefix: string; turns: number; newest_at: Date }>();
+    for (const page of allPages()) {
+      const slug = String(page.slug ?? '');
+      if (!slug.startsWith('capture/') || page.source_id !== sourceId) continue;
+      const pathSession = slug.split('/')[1] ?? '';
+      const fm = (page.frontmatter ?? {}) as Record<string, unknown>;
+      const sessionId = typeof fm.session_id === 'string' && fm.session_id ? fm.session_id : pathSession;
+      const capturedAt = typeof fm.captured_at === 'string' ? new Date(fm.captured_at) : null;
+      const updated = capturedAt && Number.isFinite(capturedAt.getTime()) ? capturedAt : new Date(page.updated_at);
+      const current = grouped.get(sessionId);
+      if (!current) {
+        grouped.set(sessionId, {
+          session_id: sessionId,
+          capture_slug_prefix: `capture/${pathSession}/`,
+          turns: 1,
+          newest_at: updated,
+        });
+      } else {
+        current.turns += 1;
+        if (updated > current.newest_at) current.newest_at = updated;
+      }
+    }
+    return [...grouped.values()].sort((a, b) =>
+      a.newest_at.getTime() - b.newest_at.getTime() || a.session_id.localeCompare(b.session_id),
+    );
+  };
+
   const engine = {
     kind: 'pglite',
     listPages,
@@ -132,8 +165,9 @@ function makeFakeEngine(seededPages: Page[] = []) {
     putPage,
     upsertChunks,
     deletePage,
+    executeRaw,
   } as unknown as BrainEngine;
-  return { engine, puts, listCalls, store, chunkWrites, deletes };
+  return { engine, puts, listCalls, store, chunkWrites, deletes, getCalls };
 }
 
 /** A bare `distill-state/<slug>` marker page (only the slug is read by the done-set). */
@@ -301,7 +335,7 @@ describe('distillCaptureSessions — happy path', () => {
     // two mem pages + one marker
     const memPuts = puts.filter((p) => p.slug.startsWith('distilled/'));
     const markerPuts = puts.filter((p) => p.slug.startsWith('distill-state/'));
-    expect(memPuts.map((p) => p.slug)).toEqual(['distilled/sess-1/mem-1', 'distilled/sess-1/mem-2']);
+    expect(memPuts.map((p) => p.slug)).toEqual(['distilled/sess-1/g-1/mem-1', 'distilled/sess-1/g-1/mem-2']);
     expect(markerPuts.map((p) => p.slug)).toEqual(['distill-state/sess-1']);
 
     // Each memory page must ALSO be chunked. A page written without chunks is
@@ -309,8 +343,8 @@ describe('distillCaptureSessions — happy path', () => {
     // the defect that left 83 production distilled pages invisible. The marker
     // page is deliberately NOT chunked: it is idempotency state, not content.
     expect(chunkWrites.map((c) => c.slug)).toEqual([
-      'distilled/sess-1/mem-1',
-      'distilled/sess-1/mem-2',
+      'distilled/sess-1/g-1/mem-1',
+      'distilled/sess-1/g-1/mem-2',
     ]);
     expect(chunkWrites.every((c) => c.count > 0)).toBe(true);
     // Chunk writes must be SOURCE-SCOPED. upsertChunks resolves the page by
@@ -444,7 +478,7 @@ describe('distillCaptureSessions — failure tolerance', () => {
     expect(puts.some((p) => p.slug === 'distill-state/bad')).toBe(false);
     expect(puts.some((p) => p.slug === 'distill-state/good')).toBe(true);
     expect(puts.some((p) => p.slug.startsWith('distilled/bad/'))).toBe(false);
-    expect(puts.some((p) => p.slug === 'distilled/good/mem-1')).toBe(true);
+    expect(puts.some((p) => p.slug === 'distilled/good/g-1/mem-1')).toBe(true);
   });
 
   test('chat gateway unavailable → eligible session fails (not marked done), nothing written', async () => {
@@ -460,6 +494,99 @@ describe('distillCaptureSessions — failure tolerance', () => {
     expect(report.sessions[0].status).toBe('failed');
     expect(report.sessions[0].error).toContain('unavailable');
     expect(puts.length).toBe(0);
+  });
+
+  test('a transient provider outcome is never replayed automatically', async () => {
+    const { engine } = makeFakeEngine([
+      mkCapture({ slug: 'capture/retry/prompt-1', session_id: 'retry', updated_at: OLD }),
+    ]);
+    let calls = 0;
+    const sdkRetries: Array<number | undefined> = [];
+    __setChatTransportForTests(async (chatOpts): Promise<ChatResult> => {
+      calls += 1;
+      sdkRetries.push(chatOpts.maxRetries);
+      throw new AITransientError('provider result was not received', { status: 503 });
+    });
+
+    const report = await distillCaptureSessions(engine, {
+      now: NOW,
+      maxCalls: 2,
+      maxInputTokens: 100_000,
+      maxOutputTokens: 3_000,
+    });
+
+    expect(calls).toBe(1);
+    expect(sdkRetries).toEqual([0]);
+    expect(report.calls).toBe(1);
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('ambiguous_provider_outcome');
+    expect(report.distilled).toBe(0);
+  });
+
+  test('a systemic provider/config failure stops the batch after one call and stays visible', async () => {
+    const { engine, puts } = makeFakeEngine([
+      mkCapture({ slug: 'capture/first/prompt-1', session_id: 'first', updated_at: OLD }),
+      mkCapture({ slug: 'capture/second/prompt-1', session_id: 'second', updated_at: OLD }),
+    ]);
+    let calls = 0;
+    __setChatTransportForTests(async () => {
+      calls += 1;
+      throw new AIConfigError('billing disabled');
+    });
+
+    const report = await distillCaptureSessions(engine, { now: NOW, maxSessions: 2 });
+
+    expect(calls).toBe(1);
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('systemic_failure');
+    expect(report.failed).toBe(1);
+    expect(report.deferred).toBe(1);
+    expect(report.sessions.find((s) => s.session_id === 'first')?.error_class).toBe('config');
+    expect(report.sessions.find((s) => s.session_id === 'second')?.status).toBe('deferred');
+    expect(puts.length).toBe(0);
+  });
+});
+
+describe('distillCaptureSessions — bounded work selection', () => {
+  test('exact-session execution requires the durable operational queue', async () => {
+    const { engine } = makeFakeEngine([
+      mkCapture({ slug: 'capture/canary/prompt-1', session_id: 'canary', updated_at: OLD }),
+    ]);
+
+    await expect(distillCaptureSessions(engine, {
+      now: NOW,
+      sessionIds: ['canary'],
+      maxSessions: 1,
+      maxCalls: 1,
+    })).rejects.toThrow(/durable operational state/);
+  });
+
+  test('a session cap selects the oldest sessions and hydrates only their capture pages', async () => {
+    const seeded: Page[] = [];
+    for (let i = 0; i < 10; i++) {
+      const hour = String(i).padStart(2, '0');
+      seeded.push(mkCapture({
+        slug: `capture/sess-${hour}/prompt-1`,
+        session_id: `sess-${hour}`,
+        updated_at: `2026-06-28T${hour}:00:00Z`,
+      }));
+    }
+    const { engine, getCalls } = makeFakeEngine(seeded);
+    const { calls } = stubChat(() => '["memory"]');
+
+    const report = await distillCaptureSessions(engine, { now: NOW, maxSessions: 2 });
+
+    expect(report.status).toBe('partial');
+    expect(report.stop_reason).toBe('session_limit');
+    expect(report.eligible).toBe(10);
+    expect(report.selected).toBe(2);
+    expect(report.deferred).toBe(8);
+    expect(report.distilled).toBe(2);
+    expect(calls.length).toBe(2);
+    expect(getCalls.filter((call) => call.slug.startsWith('capture/')).map((call) => call.slug)).toEqual([
+      'capture/sess-00/prompt-1',
+      'capture/sess-01/prompt-1',
+    ]);
   });
 });
 
@@ -484,7 +611,13 @@ describe('distillCaptureSessions — uncapped enumeration (>100)', () => {
     const { engine, puts } = makeFakeEngine(seeded);
     stubChat(() => '["one durable memory"]');
 
-    const report = await distillCaptureSessions(engine, { now: NOW });
+    const report = await distillCaptureSessions(engine, {
+      now: NOW,
+      maxSessions: N,
+      maxCalls: N,
+      maxInputTokens: 1_000_000,
+      maxOutputTokens: N * 1500,
+    });
 
     // With the old listPages(100) cap, total_sessions would have been 100.
     expect(report.total_sessions).toBe(N);
@@ -531,17 +664,17 @@ describe('distillCaptureSessions — orphaned mem-K pruning', () => {
     // RETRIEVABLE stale memory.
     const { engine, deletes, chunkWrites, store } = makeFakeEngine([
       mkCapture({ slug: 'capture/sess-1/prompt-1', session_id: 'sess-1', kind: 'prompt', turn: 1, updated_at: OLD }),
-      mkCapture({ slug: 'distilled/sess-1/mem-2', compiled_truth: 'STALE memory from the longer previous run', updated_at: OLD }),
+      mkCapture({ slug: 'distilled/sess-1/g-1/mem-2', compiled_truth: 'STALE memory from the longer previous run', updated_at: OLD }),
     ]);
     stubChat(() => JSON.stringify(['The one memory this run produced.']));
 
     await distillCaptureSessions(engine, { now: NOW });
 
-    expect(deletes.map((d) => d.slug)).toEqual(['distilled/sess-1/mem-2']);
+    expect(deletes.map((d) => d.slug)).toEqual(['distilled/sess-1/g-1/mem-2']);
     expect(deletes.every((d) => d.sourceId === 'capture-events')).toBe(true);
     // and it is not left chunked/retrievable
-    expect(chunkWrites.map((c) => c.slug)).toEqual(['distilled/sess-1/mem-1']);
-    expect(store.has('distilled/sess-1/mem-2')).toBe(false);
+    expect(chunkWrites.map((c) => c.slug)).toEqual(['distilled/sess-1/g-1/mem-1']);
+    expect(store.has('distilled/sess-1/g-1/mem-2')).toBe(false);
   });
 
   test('no deletes when the run produces the same number of memories', async () => {

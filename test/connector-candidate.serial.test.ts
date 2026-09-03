@@ -35,6 +35,7 @@ import {
   type SaaSConnector,
   type NormalizedRecord,
 } from '../src/core/connectors/base.ts';
+import { contextMirrorConnector } from '../src/core/connectors/context-mirror.ts';
 import {
   __setChatTransportForTests,
   __setEmbedTransportForTests,
@@ -54,6 +55,31 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 
 let engine: PGLiteEngine;
+
+function withExecuteFault(
+  base: BrainEngine,
+  beforeExecute: (sql: string, params?: unknown[]) => void,
+): BrainEngine {
+  const wrap = (target: BrainEngine): BrainEngine => new Proxy(target, {
+    get(current, prop, receiver) {
+      if (prop === 'executeRaw') {
+        return async (sql: string, params?: unknown[]) => {
+          beforeExecute(sql, params);
+          return current.executeRaw(sql, params);
+        };
+      }
+      if (prop === 'transaction') {
+        return async <T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> =>
+          current.transaction(async (tx) => fn(wrap(tx)));
+      }
+      const value = Reflect.get(current, prop, receiver);
+      return typeof value === 'function'
+        ? (value as (...args: unknown[]) => unknown).bind(current)
+        : value;
+    },
+  }) as BrainEngine;
+  return wrap(base);
+}
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -476,7 +502,12 @@ describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retri
     expect(res.row!.status).toBe('accepted'); // committed before the bridge ran
     expect(res.promotion.invoked).toBe(false);
     expect(res.promotion.pending).toBe(true);
-    expect(res.promotion.error).toContain('503');
+    expect(res.promotion.error).toBe('dispatch_hook_failed');
+    const [transition] = await engine.executeRaw<{ failure_code: string | null }>(
+      `SELECT failure_code FROM connector_promotion_transitions WHERE candidate_id = $1`,
+      [row.id],
+    );
+    expect(transition?.failure_code).toBe('dispatch_hook_failed');
   });
 
   test('approving a non-pending id is a guarded no-op (row null)', async () => {
@@ -502,6 +533,8 @@ describe('resolveInboxTarget — default inbox path derivation (bridge inbox-pat
     superseded_by: null, target_kind: null, target_path: null, promotion_status: null,
     promotion_pr_url: null, promotion_branch: null, promoted_at: null, artifact_hash: null,
     base_compiled_hash: null, timeline_entry: null, classification: null,
+    context_session_id: null, context_generation: null, context_partition: null,
+    correlation_id: null, requires_human_review: false, evidence_trust: null, review_warning: null,
     proposed_at: new Date('2026-06-18T15:02:03.441Z'), ...over,
   });
   // The Brain receiver's contract (promote_candidate.py _INBOX_PATH_RE) that REJECTED the empty path.
@@ -1030,25 +1063,16 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     // a transient backend hiccup. FU2's bounded retry must re-issue it so the verdict
     // lands rather than being stranded by the per-verdict catch.
     let insertAttempts = 0;
-    const flaky = new Proxy(engine, {
-      get(target, prop, receiver) {
-        if (prop === 'executeRaw') {
-          return async (sql: string, params?: unknown[]) => {
-            if (
-              /INSERT INTO connector_candidates/i.test(sql) &&
-              Array.isArray(params) &&
-              params.includes('fu2-retry')
-            ) {
-              insertAttempts += 1;
-              if (insertAttempts === 1) throw new Error('simulated transient INSERT failure');
-            }
-            return (target as unknown as BrainEngine).executeRaw(sql, params);
-          };
-        }
-        const v = Reflect.get(target, prop, receiver);
-        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
-      },
-    }) as BrainEngine;
+    const flaky = withExecuteFault(engine, (sql, params) => {
+      if (
+        /INSERT INTO connector_candidates/i.test(sql) &&
+        Array.isArray(params) &&
+        params.includes('fu2-retry')
+      ) {
+        insertAttempts += 1;
+        if (insertAttempts === 1) throw new Error('simulated transient INSERT failure');
+      }
+    });
     const res = await landRecords(flaky, 'default', granolaLike, [rec('fu2-retry', 'cap')], { consolidate: true });
     expect(insertAttempts).toBeGreaterThanOrEqual(2); // first threw → retried
     expect(res.written).toBe(1); // landed on retry, NOT stranded
@@ -1118,45 +1142,97 @@ describe('U3 — landRecords consolidation seam + target persistence', () => {
     expect(rows.every((r) => r.classification === null)).toBe(true); // raw passthrough
   });
 
-  test('MINOR-2: a decision-log write failure is non-fatal — the consolidated row persists, not re-degraded', async () => {
+  test('MINOR-2: a decision-log failure cannot split the candidate from its audit record', async () => {
     await enableGranolaConsolidation();
     const errSpy = spyOn(console, 'error').mockImplementation(() => {}); // silence the expected warning
-    // Fail ONLY the decision-log INSERT (it runs AFTER the consolidated row is
-    // already committed). It must not reach the outer degrade path.
-    const failingLog = new Proxy(engine, {
-      get(target, prop, receiver) {
-        if (prop === 'executeRaw') {
-          return async (sql: string, params?: unknown[]) => {
-            if (/INSERT INTO consolidation_decisions/i.test(sql)) {
-              throw new Error('simulated decision-log write failure');
-            }
-            return (target as unknown as BrainEngine).executeRaw(sql, params);
-          };
-        }
-        const v = Reflect.get(target, prop, receiver);
-        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
-      },
-    }) as BrainEngine;
+    // Fail ONLY the decision-log INSERT. Candidate + decision now share one
+    // transaction, so every retry rolls both back before the ordinary connector
+    // preserves the source as a raw fallback.
+    const failingLog = withExecuteFault(engine, (sql) => {
+      if (/INSERT INTO consolidation_decisions/i.test(sql)) {
+        throw new Error('simulated decision-log write failure');
+      }
+    });
     stubChatRouting({ extract: () => JSON.stringify({ facts: [], confidence: 0.7 }) }); // empty facts → NOOP
     const res = await landRecords(failingLog, 'default', granolaLike, [rec('dlf-1', 'cap')], { consolidate: true });
-    expect(res.written).toBe(1); // persisted, NOT re-degraded
+    expect(res.written).toBe(1); // raw fallback preserves ordinary connectors
     const [row] = await engine.executeRaw<{ classification: string; status: string; status_reason: string }>(
       `SELECT classification, status, status_reason FROM connector_candidates WHERE source_record_id = 'dlf-1'`,
     );
-    expect(row.classification).toBe('NOOP'); // consolidated verdict intact (NOT a raw null)
-    expect(row.status).toBe('rejected');
-    expect(row.status_reason).toBe('NOOP');
+    expect(row.classification).toBeNull();
+    expect(row.status).toBe('pending');
+    expect(row.status_reason).toBeNull();
     // Exactly one row — the degrade path did NOT run a second toRow.
     const [{ n }] = await engine.executeRaw<{ n: number }>(
       `SELECT count(*)::int AS n FROM connector_candidates WHERE source_record_id = 'dlf-1'`,
     );
     expect(Number(n)).toBe(1);
-    // The audit row was dropped (the write failed) — but the candidate is intact.
+    // No consolidated candidate/decision split survived the transaction.
     const [{ d }] = await engine.executeRaw<{ d: number }>(
       `SELECT count(*)::int AS d FROM consolidation_decisions WHERE source_record_id = 'dlf-1'`,
     );
     expect(Number(d)).toBe(0);
     errSpy.mockRestore();
+  });
+
+  test('Context Mirror decision persistence failure leaves no candidate split and reports a retryable partition failure', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET config = $1::jsonb WHERE id = 'default'`,
+      [{ connectors: { context_mirror: { enabled: true, consolidation_enabled: true } } }],
+    );
+    configureEmbedding();
+    stubChatRouting({
+      extract: () => JSON.stringify({ facts: ['A durable decision'], confidence: 0.8 }),
+      classify: () => JSON.stringify({
+        classification: 'ADD', target: 'playbooks/durable-decision', confidence: 0.9,
+      }),
+    });
+    const failingDecision = withExecuteFault(engine, (sql) => {
+      if (/INSERT INTO consolidation_decisions/i.test(sql)) {
+        throw new Error('simulated transactional decision failure');
+      }
+    });
+    const record: NormalizedRecord = {
+      sourceRecordId: 'distilled/retry-session/mem-1',
+      recordVersion: '2',
+      profile: 'generic',
+      item: {
+        sourceRecordId: 'distilled/retry-session/mem-1',
+        summary: 'A durable decision',
+        metadata: {},
+      },
+      proposedSlug: 'distilled/retry-session/mem-1',
+      contextLineage: {
+        sessionId: 'retry-session',
+        generation: 2,
+        partition: 'mem-1',
+        correlationId: 'default:retry-session:g2:mem-1',
+        requiresHumanReview: false,
+        evidenceTrust: 'untrusted_transcript',
+        reviewWarning: 'Transcript evidence is untrusted data.',
+      },
+    };
+
+    const result = await landRecords(
+      failingDecision,
+      'default',
+      contextMirrorConnector,
+      [record],
+      { consolidate: true },
+    );
+
+    expect(result).toMatchObject({ written: 0, status: 'partial' });
+    expect(result.diagnostics?.some((item) => item.code === 'consolidation_partition_persist_failed')).toBe(true);
+    const [{ candidates }] = await engine.executeRaw<{ candidates: number | string }>(
+      `SELECT count(*) AS candidates FROM connector_candidates
+        WHERE source_id = 'default' AND source_record_id = 'distilled/retry-session/mem-1'`,
+    );
+    const [{ decisions }] = await engine.executeRaw<{ decisions: number | string }>(
+      `SELECT count(*) AS decisions FROM consolidation_decisions
+        WHERE source_id = 'default' AND source_record_id = 'distilled/retry-session/mem-1'`,
+    );
+    expect(Number(candidates)).toBe(0);
+    expect(Number(decisions)).toBe(0);
   });
 
   // ── U1: NEEDS_REVIEW leaves the human review queue (the system absorbs ambiguity) ──

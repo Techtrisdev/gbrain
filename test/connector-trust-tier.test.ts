@@ -38,6 +38,13 @@ function candidateRow(overrides: Partial<ConnectorCandidateRow> = {}): Connector
     base_compiled_hash: null,
     timeline_entry: null,
     classification: 'ADD',
+    context_session_id: null,
+    context_generation: null,
+    context_partition: null,
+    correlation_id: null,
+    requires_human_review: false,
+    evidence_trust: null,
+    review_warning: null,
     proposed_at: new Date('2026-01-01T00:00:00.000Z'),
     ...overrides,
   };
@@ -148,6 +155,14 @@ describe('trustTierDecision', () => {
     expect(trustTierDecision(candidateRow({ redactions: [{ field: 'email' }] }))).toBe('human');
   });
 
+  test('historical or corrected transcript evidence always stays human', () => {
+    expect(trustTierDecision(candidateRow({
+      requires_human_review: true,
+      evidence_trust: 'untrusted_transcript',
+      review_warning: 'Historical correction reconstructed from transcript evidence.',
+    }))).toBe('human');
+  });
+
   test('malformed unexpected input is human and never throws', () => {
     expect(() =>
       trustTierDecision(candidateRow({
@@ -173,6 +188,20 @@ describe('maybeAutoApprove', () => {
     expect(id).toBe(123);
     expect(target.kind).toBe('new_page');
     expect(target.path).toBe('playbooks/foo.md');
+  });
+
+  test('operator auto-promote cannot approve a historical correction', async () => {
+    const row = candidateRow({
+      requires_human_review: true,
+      evidence_trust: 'untrusted_transcript',
+      review_warning: 'Historical correction reconstructed from transcript evidence.',
+    });
+    const approve = mockApproval(row);
+
+    await expect(
+      maybeAutoApprove(fakeEngine({ autoPromote: 'true', currentCandidate: row }), row),
+    ).resolves.toBe(false);
+    expect(approve).not.toHaveBeenCalled();
   });
 
   test('default-off config leaves a row untouched', async () => {

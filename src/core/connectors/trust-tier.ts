@@ -33,7 +33,8 @@ export const AUTO_PROMOTE_ACTOR = 'connector:auto-promote';
 
 type TrustRelevantCandidateRow = Pick<
   ConnectorCandidateRow,
-  'status' | 'classification' | 'confidence' | 'target_path' | 'target_kind' | 'rationale_ref' | 'redactions'
+  'status' | 'classification' | 'confidence' | 'target_path' | 'target_kind' | 'rationale_ref' | 'redactions' |
+  'requires_human_review'
 >;
 
 const AUTO_APPROVE_DENIED_PATH_PREFIXES = [
@@ -72,10 +73,12 @@ export function __setApproveCandidateForTests(fn: ApproveCandidateFn | null): vo
 export function trustTierDecision(
   row: Pick<
     ConnectorCandidateRow,
-    'classification' | 'confidence' | 'target_path' | 'rationale_ref' | 'redactions' | 'target_kind'
+    'classification' | 'confidence' | 'target_path' | 'rationale_ref' | 'redactions' | 'target_kind' |
+    'requires_human_review'
   >,
 ): TrustDecision {
   try {
+    if (row.requires_human_review) return 'human';
     // The promotion receiver now supports new_page (create a new content page).
     // A high-confidence ADD with a safe, non-sensitive target path, a rationale,
     // and no redactions can auto-approve — the receiver re-checks novelty at
@@ -201,7 +204,8 @@ async function readCurrentTrustRelevantRow(
 ): Promise<TrustRelevantCandidateRow | null> {
   try {
     const rows = await engine.executeRaw<TrustRelevantCandidateRow>(
-      `SELECT status, classification, confidence, target_path, target_kind, rationale_ref, redactions
+      `SELECT status, classification, confidence, target_path, target_kind, rationale_ref, redactions,
+              requires_human_review
          FROM connector_candidates WHERE id = $1`,
       [id],
     );

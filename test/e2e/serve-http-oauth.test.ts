@@ -178,6 +178,20 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(body).toContain('result');
   }, 15_000);
 
+  test('read token can call source-confined Context Mirror status over HTTP MCP', async () => {
+    const { access_token } = await mintToken('read');
+    const res = await mcpCall(access_token, 'tools/call', {
+      name: 'context_mirror_status',
+      arguments: { source_id: 'default' },
+    });
+
+    expect(res.status).not.toBe(401);
+    const body = await res.text();
+    expect(body).not.toContain('insufficient_scope');
+    expect(body).toContain('schema_version');
+    expect(body).toContain('source_id');
+  }, 15_000);
+
   test('expired/invalid token is rejected at /mcp', async () => {
     const res = await mcpCall('gbrain_at_totally_fake_token', 'tools/list');
     // Invalid tokens should not return 200 with tool results

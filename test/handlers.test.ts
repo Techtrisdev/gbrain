@@ -12,6 +12,8 @@
 import { describe, test, expect, beforeAll, afterAll, mock } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionWorker } from '../src/core/minions/worker.ts';
+import { UnrecoverableError } from '../src/core/minions/types.ts';
+import { registerConnector } from '../src/core/connectors/base.ts';
 import { registerBuiltinHandlers } from '../src/commands/jobs.ts';
 
 let engine: PGLiteEngine;
@@ -72,6 +74,32 @@ describe('connector_poll handler — TECH-2038 param validation (REVIEW#3)', () 
     // 'gone' source does not exist in the fresh PGLite brain → source_not_found skip.
     const result = await callHandler({ sourceId: 'gone-source-xyz', provider: 'linear' });
     expect((result as any).skippedReason).toBe('source_not_found');
+  });
+
+  test('a failed structured poll is terminal instead of being retried', async () => {
+    const provider = 'handler-failed-poll';
+    registerConnector({
+      provider,
+      signatureHeader: 'x-test-signature',
+      verifyWebhook: () => true,
+      accountFromPayload: () => 'acct-1',
+      normalize: () => [],
+      toCandidate: (record, sourceId) => ({ source_id: sourceId, source_record_id: record.sourceRecordId }),
+      backfill: async () => ({
+        status: 'failed',
+        landed: 0,
+        diagnostics: [{ stage: 'distill', code: 'config', message: 'provider is not configured' }],
+      }),
+    });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config) VALUES ($1, $1, $2)
+       ON CONFLICT (id) DO UPDATE SET config = EXCLUDED.config`,
+      ['handler-failed-source', JSON.stringify({ connectors: { [provider]: { enabled: true } } })],
+    );
+
+    const promise = callHandler({ sourceId: 'handler-failed-source', provider });
+    await expect(promise).rejects.toBeInstanceOf(UnrecoverableError);
+    await expect(promise).rejects.toThrow(/config: provider is not configured/);
   });
 });
 

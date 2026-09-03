@@ -23,6 +23,13 @@ import {
   artifactHash,
   type PromotionTarget,
 } from './promotion.ts';
+import {
+  assertPromotionRetryFresh,
+  ensurePromotionTransition,
+  preparePromotionRetry,
+  readPromotionTransitionByCandidate,
+  recordPromotionDispatchBlocked,
+} from './promotion-state.ts';
 
 // ── Input type ────────────────────────────────────────────────────────────────
 
@@ -72,9 +79,19 @@ export interface ConnectorCandidateItem {
   base_compiled_hash?: string | null;
   /** Candidate status override. NOOP lands 'rejected' (off the pending queue); a GENUINE
    *  contradiction lands 'needs_review' (a distinct review surface, T6). Default 'pending'. */
-  status?: 'pending' | 'accepted' | 'rejected' | 'needs_review';
+  status?: 'pending' | 'accepted' | 'rejected' | 'needs_review' | 'awaiting_review_capacity';
   /** Status reason. NOOP sets 'NOOP'. strip()'d. Default null. */
   status_reason?: string | null;
+  /** Context Mirror lineage. Absent for ordinary SaaS connector candidates. */
+  context_session_id?: string | null;
+  context_generation?: number | null;
+  context_partition?: string | null;
+  correlation_id?: string | null;
+  /** Corrections and recovered evidence can never use trust-tier auto approval. */
+  requires_human_review?: boolean;
+  /** Provenance boundary: transcript-derived text is untrusted quoted evidence. */
+  evidence_trust?: 'untrusted_transcript' | null;
+  review_warning?: string | null;
 }
 
 // ── Row type (what we insert / return) ────────────────────────────────────────
@@ -97,7 +114,7 @@ export interface ConnectorCandidateRow {
   expires_at: Date | null;
   as_of: Date | null;
   rationale_ref: string | null;
-  status: 'pending' | 'accepted' | 'rejected' | 'needs_review';
+  status: 'pending' | 'accepted' | 'rejected' | 'needs_review' | 'awaiting_review_capacity';
   status_reason: string | null;
   acted_by: string | null;
   acted_at: Date | null;
@@ -116,6 +133,13 @@ export interface ConnectorCandidateRow {
   base_compiled_hash: string | null;
   timeline_entry: string | null;
   classification: ConsolidationClassification | null;
+  context_session_id: string | null;
+  context_generation: number | null;
+  context_partition: string | null;
+  correlation_id: string | null;
+  requires_human_review: boolean;
+  evidence_trust: 'untrusted_transcript' | null;
+  review_warning: string | null;
   proposed_at: Date;
 }
 
@@ -273,6 +297,13 @@ function buildCandidateRow(
     classification: item.classification ?? null,
     timeline_entry: item.timeline_entry != null ? strip(item.timeline_entry) : null,
     base_compiled_hash: item.base_compiled_hash ?? null,
+    context_session_id: item.context_session_id != null ? strip(item.context_session_id) : null,
+    context_generation: item.context_generation ?? null,
+    context_partition: item.context_partition != null ? strip(item.context_partition) : null,
+    correlation_id: item.correlation_id != null ? strip(item.correlation_id) : null,
+    requires_human_review: item.requires_human_review ?? false,
+    evidence_trust: item.evidence_trust ?? null,
+    review_warning: item.review_warning != null ? strip(item.review_warning) : null,
   };
 }
 
@@ -322,6 +353,7 @@ export async function toRow(
   //  $20  classification     TEXT
   //  $21  timeline_entry     TEXT
   //  $22  base_compiled_hash TEXT
+  //  $23..$29 Context Mirror lineage and trust metadata
   const params: unknown[] = [
     candidate.source_id,            // $1
     candidate.source_record_id,     // $2
@@ -345,6 +377,13 @@ export async function toRow(
     candidate.classification,       // $20
     candidate.timeline_entry,       // $21
     candidate.base_compiled_hash,   // $22
+    candidate.context_session_id,   // $23
+    candidate.context_generation,   // $24
+    candidate.context_partition,    // $25
+    candidate.correlation_id,       // $26
+    candidate.requires_human_review,// $27
+    candidate.evidence_trust,       // $28
+    candidate.review_warning,       // $29
   ];
 
   const insertSql = `
@@ -356,7 +395,9 @@ export async function toRow(
       redactions,
       expires_at, as_of, rationale_ref,
       status, status_reason, acted_by, acted_at, superseded_by,
-      target_kind, target_path, classification, timeline_entry, base_compiled_hash
+      target_kind, target_path, classification, timeline_entry, base_compiled_hash,
+      context_session_id, context_generation, context_partition, correlation_id,
+      requires_human_review, evidence_trust, review_warning
     ) VALUES (
       $1, $2, $3,
       $4::text[],
@@ -365,7 +406,8 @@ export async function toRow(
       $9::jsonb,
       $10, $11, $12,
       $13, $14, $15, $16, $17,
-      $18, $19, $20, $21, $22
+      $18, $19, $20, $21, $22,
+      $23, $24, $25, $26, $27, $28, $29
     )
     ON CONFLICT (source_id, source_record_id, version) DO NOTHING
     RETURNING ${CANDIDATE_COLUMNS}
@@ -460,6 +502,8 @@ const CANDIDATE_COLS = [
   'promotion_branch', 'promoted_at', 'artifact_hash',
   // Memory Consolidation Engine (U6 columns / U3 writer)
   'base_compiled_hash', 'timeline_entry', 'classification',
+  'context_session_id', 'context_generation', 'context_partition', 'correlation_id',
+  'requires_human_review', 'evidence_trust', 'review_warning',
   'proposed_at',
 ] as const;
 /** Bare column list, for RETURNING / unqualified SELECT. */
@@ -591,6 +635,10 @@ export async function sweepExpiredCandidates(engine: BrainEngine): Promise<numbe
   const rows = await engine.executeRaw<{ id: number }>(
     `DELETE FROM connector_candidates
       WHERE expires_at IS NOT NULL AND expires_at < now() AND status <> 'accepted'
+        AND NOT EXISTS (
+          SELECT 1 FROM context_mirror_recovery_holds h
+           WHERE h.source_id = connector_candidates.source_id AND h.active
+        )
       RETURNING id`,
     [],
   );
@@ -790,6 +838,21 @@ export interface ApproveResult {
   promotion: { invoked: boolean; pending?: boolean; prUrl?: string; error?: string };
 }
 
+function targetFromAcceptedCandidate(candidate: ConnectorCandidateRow): PromotionTarget {
+  const kind = candidate.target_kind;
+  if (kind == null) throw new PromotionTargetError('accepted candidate is missing its promotion target');
+  return {
+    kind,
+    path: candidate.target_path ?? '',
+    ...(kind === 'update_page'
+      ? {
+          timeline_entry: candidate.timeline_entry ?? undefined,
+          base_compiled_hash: candidate.base_compiled_hash ?? undefined,
+        }
+      : {}),
+  };
+}
+
 /**
  * Approve a PENDING candidate, honoring a MACHINE-pre-computed consolidation UPDATE target when
  * the stored row carries one (U4) and otherwise the reviewer-selected target.
@@ -886,33 +949,81 @@ export async function approveCandidate(
   // 5. Accept UPDATE, guarded by status='pending' for idempotency. A consolidation UPDATE row
   //    keeps its classifier-set target_kind/target_path (do NOT clobber the 'update_page' the
   //    classifier wrote at land time); a reviewer-driven row persists the chosen target.
-  const rows = honorStored
-    ? await engine.executeRaw<ConnectorCandidateRow>(
-        `UPDATE connector_candidates
-            SET status = 'accepted', acted_by = $2, acted_at = now(), artifact_hash = $3
-          WHERE id = $1 AND status = 'pending'
-          RETURNING ${CANDIDATE_COLUMNS}`,
-        [id, strip(actor), hash],
-      )
-    : await engine.executeRaw<ConnectorCandidateRow>(
-        `UPDATE connector_candidates
-            SET status = 'accepted', acted_by = $2, acted_at = now(),
-                target_kind = $3, target_path = $4, artifact_hash = $5
-          WHERE id = $1 AND status = 'pending'
-          RETURNING ${CANDIDATE_COLUMNS}`,
-        [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
-      );
+  const rows = await engine.transaction(async (tx) => {
+    const acceptedRows = honorStored
+      ? await tx.executeRaw<ConnectorCandidateRow>(
+          `UPDATE connector_candidates
+              SET status = 'accepted', acted_by = $2, acted_at = now(), artifact_hash = $3
+            WHERE id = $1 AND status = 'pending'
+            RETURNING ${CANDIDATE_COLUMNS}`,
+          [id, strip(actor), hash],
+        )
+      : await tx.executeRaw<ConnectorCandidateRow>(
+          `UPDATE connector_candidates
+              SET status = 'accepted', acted_by = $2, acted_at = now(),
+                  target_kind = $3, target_path = $4, artifact_hash = $5
+            WHERE id = $1 AND status = 'pending'
+            RETURNING ${CANDIDATE_COLUMNS}`,
+          [id, strip(actor), effectiveTarget.kind, effectiveTarget.path || null, hash],
+        );
+    if (acceptedRows[0]) await ensurePromotionTransition(tx, acceptedRows[0]);
+    return acceptedRows;
+  });
   const row = rows[0] ? coerceCandidateRow(rows[0]) : null;
   if (!row) return { row: null, promotion: { invoked: false } };
 
   // 4. Hand to the promotion hook (build → sign → emit → reflect). Failure stays retriable.
   const hook = getPromotionHook();
-  if (!hook) return { row, promotion: { invoked: false, pending: true } };
+  if (!hook) {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_unavailable');
+    return { row, promotion: { invoked: false, pending: true, error: 'dispatch_hook_unavailable' } };
+  }
   try {
     const result = await hook(engine, row, actor, effectiveTarget);
     return { row, promotion: { invoked: true, prUrl: result.prUrl } };
-  } catch (err) {
+  } catch {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_failed');
     // Bridge failure: the row stays 'accepted' (already committed) — retriable, never lost.
-    return { row, promotion: { invoked: false, pending: true, error: err instanceof Error ? err.message : String(err) } };
+    const transition = await readPromotionTransitionByCandidate(engine, row.id);
+    return { row, promotion: { invoked: false, pending: true, error: transition?.failure_code ?? 'dispatch_failed' } };
+  }
+}
+
+/**
+ * Explicit operator retry for an already-approved candidate. Approval is not
+ * repeated, the v2 correlation identity is reused, and an UPDATE target is
+ * revalidated against current compiled truth before any external dispatch.
+ */
+export async function retryCandidatePromotion(
+  engine: BrainEngine,
+  id: number,
+  actor: string,
+  expectedSourceId?: string,
+  reason = 'operator_retry',
+): Promise<ApproveResult> {
+  const [current] = await engine.executeRaw<ConnectorCandidateRow>(
+    `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates
+      WHERE id = $1 AND status = 'accepted'
+        AND ($2::text IS NULL OR source_id = $2)`,
+    [id, expectedSourceId ?? null],
+  );
+  if (!current) return { row: null, promotion: { invoked: false } };
+  const row = coerceCandidateRow(current);
+  const target = targetFromAcceptedCandidate(row);
+  validatePromotionTarget(target);
+  await assertPromotionRetryFresh(engine, row);
+  await preparePromotionRetry(engine, row.id, { actor: strip(actor), reason: strip(reason) });
+  const hook = getPromotionHook();
+  if (!hook) {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_unavailable');
+    return { row, promotion: { invoked: false, pending: true, error: 'dispatch_hook_unavailable' } };
+  }
+  try {
+    const result = await hook(engine, row, strip(actor), target);
+    return { row, promotion: { invoked: true, prUrl: result.prUrl } };
+  } catch {
+    await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_failed');
+    const transition = await readPromotionTransitionByCandidate(engine, row.id);
+    return { row, promotion: { invoked: false, pending: true, error: transition?.failure_code ?? 'dispatch_failed' } };
   }
 }

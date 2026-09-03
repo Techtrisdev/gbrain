@@ -7,8 +7,8 @@
  * `repository_dispatch` (event_type `connector-promotion`). gbrain NEVER validates,
  * renders, or opens a PR itself — that is the already-merged Brain bridge
  * (scripts/check_promote.py / .github/workflows/promote.yml). gbrain ONLY: persists the
- * target (in approveCandidate), builds + signs + emits the artifact, and reflects the
- * dispatch state back onto the candidate row.
+ * target (in approveCandidate), builds + signs + emits the artifact, and receives signed
+ * lifecycle callbacks without ever treating dispatch acceptance as PR or index proof.
  *
  * THE LOCKED CONTRACT (the Brain bridge is merged — match it byte-for-byte):
  *  - The Brain verifies hmac.new(secret, artifact_bytes, sha256) over the RAW delivered
@@ -42,6 +42,10 @@
 import { createHash, createHmac } from 'node:crypto';
 import type { BrainEngine } from '../engine.ts';
 import type { ConnectorCandidateRow } from './candidate.ts';
+import type {
+  PromotionCallbackMetadata,
+  PromotionLifecycleState,
+} from './promotion-state.ts';
 import { hmacSha256Verify } from './base.ts';
 import { strip } from './redact.ts';
 import { mintAppJwt } from './github-app-jwt.ts';
@@ -85,14 +89,24 @@ export interface PromotionArtifactTarget {
   base_compiled_hash?: string;
 }
 
-/** The minimized approval artifact — EXACTLY these 5 keys (Brain ARTIFACT_SCHEMA). */
-export interface PromotionArtifact {
+/** Legacy minimized approval artifact. The Brain dual-reader keeps accepting it
+ * while already-dispatched candidates drain. */
+export interface PromotionArtifactV1 {
   provider: string;
   source_id: string;
   source_record_id: string;
   redaction_attestation: string;
   target: PromotionArtifactTarget;
 }
+
+/** Generation-aware artifact. The correlation remains the identity through
+ * Brain branch, PR, frontmatter, reindex proof, and callback acknowledgement. */
+export interface PromotionArtifactV2 extends PromotionArtifactV1 {
+  schema_version: 2;
+  correlation_id: string;
+}
+
+export type PromotionArtifact = PromotionArtifactV1 | PromotionArtifactV2;
 
 /** The redaction attestation string stamped on every artifact. */
 export const REDACTION_ATTESTATION = 'redact.ts:v1 strip() applied; no secrets/PII detected';
@@ -128,11 +142,19 @@ export const PROMOTION_EVENT_TYPE = 'connector-promotion';
  * source_record_id). Pure; no I/O.
  */
 export function buildPromotionArtifact(
-  row: Pick<ConnectorCandidateRow, 'provider' | 'source_id' | 'source_record_id' | 'proposed_markdown'>,
+  row: Pick<ConnectorCandidateRow, 'provider' | 'source_id' | 'source_record_id' | 'proposed_markdown'>
+    & Partial<Pick<ConnectorCandidateRow, 'id' | 'context_generation'>>,
   target: PromotionTarget,
 ): PromotionArtifact {
   const isUpdate = target.kind === 'update_page';
+  const candidateId = Number(row.id);
+  const generation = Number(row.context_generation);
+  const generationAware = Number.isSafeInteger(candidateId) && candidateId > 0
+    && Number.isSafeInteger(generation) && generation > 0;
   return {
+    ...(generationAware
+      ? { schema_version: 2 as const, correlation_id: `cm-promo-v2-c${candidateId}-g${generation}` }
+      : {}),
     provider: row.provider ?? '',
     source_id: row.source_id,
     source_record_id: row.source_record_id,
@@ -208,10 +230,61 @@ export function artifactHash(canonical: string): string {
 // ── Emit (repository_dispatch) ──────────────────────────────────────────────────────
 
 /** Minimal fetch shape so tests inject a fake (no real network). Mirrors global fetch. */
+type GitHubFetchResponse = { ok: boolean; status: number; text: () => Promise<string> };
+
 export type FetchFn = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
-) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
+) => Promise<GitHubFetchResponse>;
+
+/** Every GitHub API request is bounded so a stuck socket cannot strand a promotion attempt. */
+const PROMOTION_GITHUB_REQUEST_TIMEOUT_MS = 15_000;
+
+function githubRequestTimeoutMs(override: number | undefined): number {
+  const timeoutMs = override ?? PROMOTION_GITHUB_REQUEST_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('promotion GitHub request timeout must be a positive integer');
+  }
+  return timeoutMs;
+}
+
+async function fetchGitHubWithTimeout<
+  TInit extends {
+    method: string;
+    headers: Record<string, string>;
+    signal?: AbortSignal;
+  },
+>(
+  doFetch: (url: string, init: TInit) => Promise<GitHubFetchResponse>,
+  url: string,
+  init: Omit<TInit, 'signal'>,
+  timeoutMs: number,
+): Promise<GitHubFetchResponse> {
+  const controller = new AbortController();
+  const timeoutError = new Error(`promotion GitHub request timeout after ${timeoutMs}ms`);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      doFetch(url, { ...init, signal: controller.signal } as TInit),
+      timeout,
+    ]);
+  } catch (error) {
+    // Fetch implementations vary in the AbortError they surface. Keep the durable
+    // failure taxonomy stable whenever our own deadline fired.
+    if (timedOut) throw timeoutError;
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 export interface EmitDispatchOpts {
   /** The canonical artifact STRING (opaque — not re-serialized). */
@@ -224,6 +297,8 @@ export interface EmitDispatchOpts {
   repo?: string;
   /** Injected fetch (tests pass a fake; production uses global fetch). */
   fetchFn?: FetchFn;
+  /** Per-request deadline override (tests). Production defaults to 15 seconds. */
+  timeoutMs?: number;
 }
 
 export interface EmitDispatchResult {
@@ -256,7 +331,7 @@ export async function emitRepositoryDispatch(opts: EmitDispatchOpts): Promise<Em
     },
   });
 
-  const res = await doFetch(url, {
+  const res = await fetchGitHubWithTimeout(doFetch, url, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${opts.githubToken}`,
@@ -266,7 +341,7 @@ export async function emitRepositoryDispatch(opts: EmitDispatchOpts): Promise<Em
       'user-agent': 'gbrain-connector-promotion',
     },
     body,
-  });
+  }, githubRequestTimeoutMs(opts.timeoutMs));
 
   if (!res.ok) {
     // The response body MAY echo nothing sensitive, but to be safe we do not include the
@@ -295,8 +370,8 @@ export const PROMOTION_INSTALLATION_ID_ENV = 'GBRAIN_PROMOTE_GITHUB_INSTALLATION
 /** Injectable fetch for App-auth HTTP (GET resolve; POST exchange carries a scoped JSON body). Tests pass a fake. */
 export type AppAuthFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
-) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
+) => Promise<GitHubFetchResponse>;
 
 interface CachedInstallToken {
   token: string;
@@ -314,6 +389,8 @@ export interface DispatchTokenDeps {
   fetchImpl?: AppAuthFetch;
   /** Clock (tests inject). Defaults to Date.now. */
   now?: () => number;
+  /** Per-request deadline override (tests). Production defaults to 15 seconds. */
+  timeoutMs?: number;
 }
 
 const appAuthHeaders = (appJwt: string): Record<string, string> => ({
@@ -334,13 +411,14 @@ async function resolveInstallationId(
   appJwt: string,
   doFetch: AppAuthFetch,
   getEnv: (key: string) => string | undefined,
+  timeoutMs: number,
 ): Promise<string> {
   const override = getEnv(PROMOTION_INSTALLATION_ID_ENV);
   if (override && override.trim()) return override.trim();
-  const res = await doFetch(`https://api.github.com/repos/${repo}/installation`, {
+  const res = await fetchGitHubWithTimeout(doFetch, `https://api.github.com/repos/${repo}/installation`, {
     method: 'GET',
     headers: appAuthHeaders(appJwt),
-  });
+  }, timeoutMs);
   if (!res.ok) {
     throw new Error(`resolve App installation for ${repo} failed: status=${res.status} (is the App installed with contents:write?)`);
   }
@@ -362,6 +440,7 @@ export async function getPromotionDispatchToken(
   const getEnv = deps.getEnv ?? ((key: string) => process.env[key]);
   const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as AppAuthFetch);
   const nowMs = deps.now ?? (() => Date.now());
+  const timeoutMs = githubRequestTimeoutMs(deps.timeoutMs);
 
   // Cache check first (keyed by repo) — a hit skips the JWT mint + both App-auth HTTP calls.
   const cached = promotionInstallTokenCache.get(repo);
@@ -373,7 +452,7 @@ export async function getPromotionDispatchToken(
   if (!appId) throw new Error(`${PROMOTION_APP_ID_ENV} is not set (GitHub App id)`);
 
   const appJwt = mintAppJwt(privateKey, appId);
-  const installationId = await resolveInstallationId(repo, appJwt, doFetch, getEnv);
+  const installationId = await resolveInstallationId(repo, appJwt, doFetch, getEnv, timeoutMs);
 
   // Scope the installation token to JUST the target repo + the minimum permission needed.
   // repository_dispatch (POST /repos/{owner}/{repo}/dispatches) requires Contents: write per
@@ -386,13 +465,15 @@ export async function getPromotionDispatchToken(
     repositories: [repoName],
     permissions: { contents: 'write' },
   });
-  const res = await doFetch(
+  const res = await fetchGitHubWithTimeout(
+    doFetch,
     `https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
     {
       method: 'POST',
       headers: { ...appAuthHeaders(appJwt), 'content-type': 'application/json' },
       body: tokenRequestBody,
     },
+    timeoutMs,
   );
   if (!res.ok) throw new Error(`App installation token exchange failed: status=${res.status}`);
   const json = JSON.parse(await res.text()) as { token?: string; expires_at?: string };
@@ -489,14 +570,17 @@ const CANDIDATE_PROMOTION_RETURNING = [
   'status', 'status_reason', 'acted_by', 'acted_at', 'superseded_by',
   'target_kind', 'target_path', 'promotion_status', 'promotion_pr_url',
   'promotion_branch', 'promoted_at', 'artifact_hash',
-  'proposed_at',
+  'base_compiled_hash', 'timeline_entry', 'classification',
+  'context_session_id', 'context_generation', 'context_partition', 'correlation_id',
+  'requires_human_review', 'evidence_trust', 'review_warning', 'proposed_at',
 ].join(', ');
 
 // ════════════════════════════════════════════════════════════════════════════════════
 // Promotion STATUS CALLBACK (TECH-2110) — the inbound machine endpoint
 // ════════════════════════════════════════════════════════════════════════════════════
 //
-// THE LOCKED CONTRACT — built to the MERGED Brain bridge, NOT the speculative ticket spec.
+// DUAL-READER CONTRACT — legacy Brain callbacks remain valid while the generation-aware
+// callback identity rolls out after this receiver is deployed.
 //
 // The TECH-2110 ticket spec'd an inbound wire of
 //   { candidate_id, artifact_hash, …, signed_at, nonce }  +  header X-Promotion-Signature
@@ -544,9 +628,54 @@ export interface PromotionCallbackBody {
 /** The 4 keys the body must carry — used to reject BOTH missing and unknown keys. */
 const PROMOTION_CALLBACK_KEYS: readonly string[] = ['branch', 'pr_url', 'source_record_id_hash', 'status'];
 
+/** Generation-aware callback contract. The Brain sender moves to this only after this reader ships. */
+export type PromotionCallbackV2Status =
+  | 'opened'
+  | 'dispatch_failed'
+  | 'merged'
+  | 'indexing_failed'
+  | 'indexed';
+
+interface PromotionCallbackBodyV2Base {
+  schema_version: 2;
+  correlation_id: string;
+  branch?: string;
+  pr_url?: string;
+  merge_sha?: string;
+  workflow_run_id?: string;
+  failure_code?: string;
+}
+
+/** V2 callbacks carry the durable evidence required by their lifecycle stage. */
+export type PromotionCallbackBodyV2 = PromotionCallbackBodyV2Base & (
+  | { status: 'opened'; branch: string; pr_url: string; failure_code?: never }
+  | { status: 'dispatch_failed'; failure_code: string }
+  | { status: 'merged'; merge_sha: string; workflow_run_id: string; failure_code?: never }
+  | { status: 'indexing_failed'; merge_sha: string; workflow_run_id: string; failure_code: string }
+  | { status: 'indexed'; merge_sha: string; workflow_run_id: string; failure_code?: never }
+);
+
+const PROMOTION_CALLBACK_V2_KEYS = new Set([
+  'schema_version', 'correlation_id', 'status', 'branch', 'pr_url',
+  'merge_sha', 'workflow_run_id', 'failure_code',
+]);
+const PROMOTION_CALLBACK_V2_STATUSES = new Set<PromotionCallbackV2Status>([
+  'opened', 'dispatch_failed', 'merged', 'indexing_failed', 'indexed',
+]);
+const CALLBACK_FAILURE_CODES = new Set([
+  'brain_reported_dispatch_failure',
+  'brain_reported_indexing_failure',
+  'dispatch_workflow_failed',
+  'promotion_validation_failed',
+  'pr_creation_failed',
+  'reindex_workflow_failed',
+  'indexed_callback_failed',
+  'retrieval_proof_failed',
+]);
+
 /** Discriminated result the Express wrapper maps to an HTTP response. */
 export type PromotionCallbackResult =
-  | { ok: true; status: 200; candidateId: number; mappedStatus: PromotionStatus }
+  | { ok: true; status: 200; candidateId: number; mappedStatus: PromotionLifecycleState; outcome: 'applied' | 'stale' }
   | { ok: false; status: 400 | 401 | 404 | 409 | 500; error: string };
 
 /**
@@ -583,6 +712,58 @@ function parsePromotionCallbackBody(parsed: unknown): PromotionCallbackBody | nu
   return { status, branch, pr_url, source_record_id_hash };
 }
 
+function optionalBoundedString(value: unknown, max: number): value is string | undefined {
+  return value === undefined || (typeof value === 'string' && value.length > 0 && value.length <= max);
+}
+
+function parsePromotionCallbackBodyV2(parsed: unknown): PromotionCallbackBodyV2 | null {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const obj = parsed as Record<string, unknown>;
+  if (Object.keys(obj).some((key) => !PROMOTION_CALLBACK_V2_KEYS.has(key))) return null;
+  if (obj.schema_version !== 2) return null;
+  if (typeof obj.correlation_id !== 'string' || !/^cm-promo-v2-c[1-9]\d*-g\d+$/.test(obj.correlation_id)) return null;
+  if (typeof obj.status !== 'string' || !PROMOTION_CALLBACK_V2_STATUSES.has(obj.status as PromotionCallbackV2Status)) return null;
+  if (!optionalBoundedString(obj.branch, 255) || !optionalBoundedString(obj.pr_url, 2_048)) return null;
+  if (!optionalBoundedString(obj.workflow_run_id, 64) || !optionalBoundedString(obj.failure_code, 80)) return null;
+  if (obj.merge_sha !== undefined && (typeof obj.merge_sha !== 'string' || !/^[0-9a-f]{40}$/.test(obj.merge_sha))) return null;
+  if (obj.failure_code !== undefined && !CALLBACK_FAILURE_CODES.has(obj.failure_code as string)) return null;
+  if (obj.status === 'opened' && (obj.branch === undefined || obj.pr_url === undefined)) return null;
+  if (
+    (obj.status === 'merged' || obj.status === 'indexing_failed' || obj.status === 'indexed')
+    && (obj.merge_sha === undefined || obj.workflow_run_id === undefined)
+  ) return null;
+  if ((obj.status === 'dispatch_failed' || obj.status === 'indexing_failed') && obj.failure_code === undefined) return null;
+  if ((obj.status === 'opened' || obj.status === 'merged' || obj.status === 'indexed') && obj.failure_code !== undefined) return null;
+  return obj as unknown as PromotionCallbackBodyV2;
+}
+
+function callbackState(status: PromotionCallbackWireStatus | PromotionCallbackV2Status): PromotionLifecycleState {
+  if (status === 'opened') return 'pr_opened';
+  if (status === 'failed' || status === 'dispatch_failed') return 'dispatch_failed';
+  if (status === 'merged') return 'merged_reindexing';
+  if (status === 'indexing_failed') return 'indexing_failed';
+  return 'indexed';
+}
+
+function callbackMetadata(
+  body: PromotionCallbackBody | PromotionCallbackBodyV2,
+): PromotionCallbackMetadata {
+  if ('schema_version' in body) {
+    return {
+      branch: body.branch,
+      prUrl: body.pr_url,
+      mergeSha: body.merge_sha,
+      workflowRunId: body.workflow_run_id,
+      failureCode: body.failure_code,
+    };
+  }
+  return {
+    branch: body.branch || undefined,
+    prUrl: body.pr_url || undefined,
+    failureCode: body.status === 'failed' ? 'brain_reported_dispatch_failure' : undefined,
+  };
+}
+
 /**
  * Among the dispatched-and-awaiting-callback set (status='accepted' AND artifact_hash IS NOT
  * NULL), return ALL candidates whose source_record_id hashes to the wire identity.
@@ -616,9 +797,9 @@ async function matchCandidatesByHash(
  * Order is load-bearing:
  *   1. secret present?            no → 500 (fail-closed), no parse, no write.
  *   2. hmacSha256Verify(raw)?     no → 401, body NEVER parsed/logged, no write.
- *   3. JSON.parse + strict 4-key validate → bad → 400, no write.
- *   4. match by source_record_id_hash → 0 → 404; >1 → 409 ambiguous (ZERO writes, never guess).
- *   5. allowlisted writeback via updateCandidatePromotionState → 200 (idempotent on replay).
+ *   3. JSON.parse + strict legacy-or-v2 shape validation → bad → 400, no write.
+ *   4. legacy hash identity fails closed on ambiguity; v2 correlation identity is exact.
+ *   5. apply a monotonic lifecycle transition and audit stale/out-of-order callbacks.
  */
 export async function handlePromotionCallback(args: {
   rawBody: Buffer;
@@ -650,10 +831,36 @@ export async function handlePromotionCallback(args: {
   } catch {
     return { ok: false, status: 400, error: 'malformed_json' };
   }
-  const body = parsePromotionCallbackBody(parsed);
-  if (!body) {
+  const legacyBody = parsePromotionCallbackBody(parsed);
+  const v2Body = parsePromotionCallbackBodyV2(parsed);
+  if (!legacyBody && !v2Body) {
     return { ok: false, status: 400, error: 'invalid_body' };
   }
+
+  const { applyPromotionCallbackTransition } = await import('./promotion-state.ts');
+  if (v2Body) {
+    try {
+      const result = await applyPromotionCallbackTransition(
+        engine,
+        v2Body.correlation_id,
+        callbackState(v2Body.status),
+        callbackMetadata(v2Body),
+      );
+      if (!result) return { ok: false, status: 404, error: 'candidate_not_found' };
+      console.log(`promotion callback: applied status=${v2Body.status} correlation_id=${v2Body.correlation_id}`);
+      return {
+        ok: true,
+        status: 200,
+        candidateId: result.candidateId,
+        mappedStatus: result.state,
+        outcome: result.outcome,
+      };
+    } catch (err) {
+      console.error('promotion callback: writeback failed:', err instanceof Error ? err.message : String(err));
+      return { ok: false, status: 500, error: 'writeback_failed' };
+    }
+  }
+  const body = legacyBody!;
 
   // (4) Match by source_record_id_hash among the dispatched set. Fail CLOSED on ambiguity:
   //     0 → 404; exactly 1 → proceed; >1 → 409 with ZERO writes. The Brain callback carries no
@@ -679,57 +886,30 @@ export async function handlePromotionCallback(args: {
   }
   const candidate = matches[0];
 
-  // (4.5) Monotonic guard against a stale 'opened' redelivery. The merged Brain sends no
-  //       nonce/timestamp and its HMAC never expires, so an OLD valid-MAC 'opened' delivery
-  //       could be replayed after the row already reached a different terminal promotion_status
-  //       (e.g. 'failed') and would otherwise revert it to 'pr_opened' + re-stamp promoted_at.
-  //       'failed' is authoritative (it corrects the optimistic pr_opened); re-promotion is
-  //       impossible (approveCandidate is guarded by status='pending'), so 'failed'→'pr_opened'
-  //       is NEVER legitimate. Refuse an 'opened' that would downgrade any already-set terminal
-  //       state that is not itself pr_opened; the response stays 200 (idempotent-friendly for
-  //       at-least-once redelivery) and reports the preserved state. 'failed' is never blocked,
-  //       and a true idempotent 'opened' (current already pr_opened) falls through to the no-op
-  //       write below.
-  if (
-    body.status === 'opened' &&
-    candidate.promotion_status != null &&
-    candidate.promotion_status !== 'pr_opened'
-  ) {
-    console.warn(
-      `promotion callback: ignoring stale 'opened' for candidate_id=${candidate.id} already at promotion_status=${candidate.promotion_status}`,
-    );
-    return {
-      ok: true,
-      status: 200,
-      candidateId: Number(candidate.id),
-      mappedStatus: candidate.promotion_status as PromotionStatus,
-    };
-  }
-
-  // (5) Allowlisted writeback. The status MAPPING is load-bearing: 'opened' is NOT a valid
-  //     promotion_status CHECK value - it maps to 'pr_opened'. 'indexed' and 'failed' map
-  //     to their same-named promotion_status values. The candidate row's status stays
-  //     'accepted' (NOT 'rejected') - updateCandidatePromotionState can never touch status.
-  //     Re-applying the same patch (a duplicate delivery) writes the same values - an idempotent no-op - and
-  //     returns 200 (replay-safe: the Brain sends no nonce/timestamp).
-  const patch: PromotionStatePatch =
-    body.status === 'opened'
-      ? { promotion_status: 'pr_opened', promotion_pr_url: body.pr_url, promotion_branch: body.branch, promoted: true }
-      : body.status === 'indexed'
-        ? { promotion_status: 'indexed' }
-        : { promotion_status: 'failed' };
-
+  // Legacy identity can be ambiguous, but once exactly one candidate is found it enters the
+  // same monotonic lifecycle as v2. A late signed `opened` may advance a dispatch failure;
+  // no callback can regress an already indexed transition.
   try {
-    const updated = await updateCandidatePromotionState(engine, candidate.id, patch);
-    if (!updated) {
-      // The row vanished between match and update (extremely unlikely). Treat as not-found.
-      return { ok: false, status: 404, error: 'candidate_not_found' };
-    }
+    const { ensurePromotionTransition } = await import('./promotion-state.ts');
+    const transition = await ensurePromotionTransition(engine, candidate);
+    const result = await applyPromotionCallbackTransition(
+      engine,
+      transition.correlation_id,
+      callbackState(body.status),
+      callbackMetadata(body),
+    );
+    if (!result) return { ok: false, status: 404, error: 'candidate_not_found' };
     // AC7 logging: status, source_record_id_hash (safe), and the matched candidate id ONLY.
     console.log(
       `promotion callback: applied status=${body.status} source_record_id_hash=${body.source_record_id_hash} candidate_id=${candidate.id}`,
     );
-    return { ok: true, status: 200, candidateId: Number(candidate.id), mappedStatus: patch.promotion_status as PromotionStatus };
+    return {
+      ok: true,
+      status: 200,
+      candidateId: result.candidateId,
+      mappedStatus: result.state,
+      outcome: result.outcome,
+    };
   } catch (err) {
     console.error('promotion callback: writeback failed:', err instanceof Error ? err.message : String(err));
     return { ok: false, status: 500, error: 'writeback_failed' };

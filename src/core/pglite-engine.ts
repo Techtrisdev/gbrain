@@ -347,6 +347,14 @@ export class PGLiteEngine implements BrainEngine {
                 WHERE table_schema='public' AND table_name='sources' AND column_name='trust_frontmatter_overrides') AS sources_trust_fm_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='pages' AND column_name='generation') AS pages_generation_exists
+        , EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='connector_candidates') AS connector_candidates_exists
+        , EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='connector_candidates' AND column_name='context_session_id') AS candidate_context_session_id_exists
+        , EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='context_mirror_session_heads') AS context_session_heads_exists
+        , EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='context_mirror_session_heads' AND column_name='current_eligible_at') AS current_eligible_at_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -388,6 +396,10 @@ export class PGLiteEngine implements BrainEngine {
       sources_cr_mode_exists: boolean;
       sources_trust_fm_exists: boolean;
       pages_generation_exists: boolean;
+      connector_candidates_exists: boolean;
+      candidate_context_session_id_exists: boolean;
+      context_session_heads_exists: boolean;
+      current_eligible_at_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -459,6 +471,15 @@ export class PGLiteEngine implements BrainEngine {
     // body; bootstrap only needs to add the column on pre-v91 brains so
     // the CREATE INDEX doesn't crash.
     const needsPagesGeneration = probe.pages_exists && !probe.pages_generation_exists;
+    // v110 adds the Context Mirror lineage index to connector_candidates.
+    // The latest schema replays before migrations, so older candidate tables
+    // need the indexed columns before that CREATE INDEX is encountered.
+    const needsCandidateLineage = probe.connector_candidates_exists
+      && !probe.candidate_context_session_id_exists;
+    // v111 moves the pending-session index to current-generation eligibility.
+    // Preserve first-ever eligibility while making pre-v111 schema replay safe.
+    const needsCurrentEligibility = probe.context_session_heads_exists
+      && !probe.current_eligible_at_exists;
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -469,7 +490,8 @@ export class PGLiteEngine implements BrainEngine {
         && !needsFilesBootstrap && !needsOauthClientsBootstrap
         && !needsSourcesArchive && !needsPagesLastRetrievedAt
         && !needsPagesProvenance
-        && !needsContextualRetrievalColumns && !needsPagesGeneration) return;
+        && !needsContextualRetrievalColumns && !needsPagesGeneration
+        && !needsCandidateLineage && !needsCurrentEligibility) return;
 
     console.log('  Pre-v0.21 brain detected, applying forward-reference bootstrap');
 
@@ -709,6 +731,21 @@ export class PGLiteEngine implements BrainEngine {
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 1;
       `);
     }
+
+    if (needsCandidateLineage) {
+      await this.db.exec(`
+        ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_session_id TEXT;
+        ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_generation INTEGER;
+        ALTER TABLE connector_candidates ADD COLUMN IF NOT EXISTS context_partition TEXT;
+      `);
+    }
+
+    if (needsCurrentEligibility) {
+      await this.db.exec(`
+        ALTER TABLE context_mirror_session_heads ADD COLUMN IF NOT EXISTS current_eligible_at TIMESTAMPTZ;
+        ALTER TABLE context_mirror_session_heads ADD COLUMN IF NOT EXISTS current_cohort_at TIMESTAMPTZ;
+      `);
+    }
   }
 
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
@@ -863,6 +900,10 @@ export class PGLiteEngine implements BrainEngine {
       `DELETE FROM pages
        WHERE deleted_at IS NOT NULL
          AND deleted_at < now() - ($1 || ' hours')::interval
+         AND NOT EXISTS (
+           SELECT 1 FROM context_mirror_recovery_holds h
+            WHERE h.source_id = pages.source_id AND h.active
+         )
        RETURNING slug`,
       [hours]
     );

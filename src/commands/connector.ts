@@ -35,6 +35,8 @@ import {
   type ConnectorPollResult,
 } from '../core/connectors/poll.ts';
 import { listCandidates, type ReviewCandidate } from '../core/connectors/candidate.ts';
+import { consolidateContextMirrorGeneration } from '../core/connectors/context-mirror.ts';
+import { rollbackContextGeneration } from '../core/connectors/context-mirror-state.ts';
 // Side-effect import: register all SaaS connectors so the standalone `gbrain connector`
 // CLI resolves providers. Without it getConnector() returns undefined and every source
 // skips as `connector_not_registered` (the HTTP server gets this via serve-http.ts:60;
@@ -75,6 +77,167 @@ export async function resolveConnectorPollTargets(
   return { targets };
 }
 
+export interface TargetedConsolidationArgs {
+  sourceId: string;
+  sessionId: string;
+  generation: number;
+  maxPartitions: number;
+  maxCalls: number;
+  maxCostUsd: number;
+  maxRuntimeMs: number;
+  budgetAuditPath: string;
+  json: boolean;
+}
+
+export interface GenerationRollbackArgs {
+  sourceId: string;
+  sessionId: string;
+  generation: number;
+  rollbackGeneration: number;
+  json: boolean;
+}
+
+function finiteTargetedNumber(flag: string, value: string, integer: boolean): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0 || (integer && !Number.isInteger(parsed))) {
+    throw new Error(`${flag} must be a finite ${integer ? 'integer ' : ''}> 0`);
+  }
+  return parsed;
+}
+
+/** Strict parser for the one-generation consolidation canary. Ordinary poll
+ * parsing remains unchanged; this seam refuses defaults because every provider
+ * and partition boundary must be explicit in the evidence packet. */
+export function parseTargetedConsolidationArgs(args: string[]): TargetedConsolidationArgs {
+  const values = new Map<string, string>();
+  let json = false;
+  const allowed = new Set([
+    '--source', '--session-id', '--generation', '--max-partitions', '--max-calls',
+    '--max-cost-usd', '--max-runtime-ms', '--budget-audit-path',
+  ]);
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index];
+    if (flag === '--json') {
+      if (json) throw new Error('--json may be specified only once');
+      json = true;
+      continue;
+    }
+    if (!allowed.has(flag)) throw new Error(`unknown targeted consolidation option: ${flag}`);
+    if (values.has(flag)) throw new Error(`${flag} may be specified only once`);
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    values.set(flag, value);
+    index += 1;
+  }
+  const missing = [...allowed].filter((flag) => !values.has(flag));
+  if (missing.length > 0) throw new Error(`required targeted consolidation options missing: ${missing.join(', ')}`);
+  return {
+    sourceId: values.get('--source')!,
+    sessionId: values.get('--session-id')!,
+    generation: finiteTargetedNumber('--generation', values.get('--generation')!, true),
+    maxPartitions: finiteTargetedNumber('--max-partitions', values.get('--max-partitions')!, true),
+    maxCalls: finiteTargetedNumber('--max-calls', values.get('--max-calls')!, true),
+    maxCostUsd: finiteTargetedNumber('--max-cost-usd', values.get('--max-cost-usd')!, false),
+    maxRuntimeMs: finiteTargetedNumber('--max-runtime-ms', values.get('--max-runtime-ms')!, true),
+    budgetAuditPath: values.get('--budget-audit-path')!,
+    json,
+  };
+}
+
+export function parseGenerationRollbackArgs(args: string[]): GenerationRollbackArgs {
+  const values = new Map<string, string>();
+  let json = false;
+  const allowed = new Set(['--source', '--session-id', '--generation', '--rollback-generation']);
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index];
+    if (flag === '--json') {
+      if (json) throw new Error('--json may be specified only once');
+      json = true;
+      continue;
+    }
+    if (!allowed.has(flag)) throw new Error(`unknown generation rollback option: ${flag}`);
+    if (values.has(flag)) throw new Error(`${flag} may be specified only once`);
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    values.set(flag, value);
+    index += 1;
+  }
+  const missing = [...allowed].filter((flag) => !values.has(flag));
+  if (missing.length > 0) throw new Error(`required generation rollback options missing: ${missing.join(', ')}`);
+  return {
+    sourceId: values.get('--source')!,
+    sessionId: values.get('--session-id')!,
+    generation: finiteTargetedNumber('--generation', values.get('--generation')!, true),
+    rollbackGeneration: finiteTargetedNumber(
+      '--rollback-generation', values.get('--rollback-generation')!, true,
+    ),
+    json,
+  };
+}
+
+type ConnectorPollRunner = (
+  engine: BrainEngine,
+  target: ConnectorPollTarget,
+) => Promise<ConnectorPollResult>;
+
+function sanitizedPollError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.replace(/[\r\n\t]+/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 500) || 'connector poll failed';
+}
+
+/**
+ * Poll every selected target even when one target throws. A connector-specific
+ * outage must be visible in the final result without starving unrelated
+ * connectors that happen to be scheduled in the same process.
+ */
+export async function pollConnectorTargets(
+  engine: BrainEngine,
+  targets: ConnectorPollTarget[],
+  runner: ConnectorPollRunner = runConnectorPoll,
+): Promise<ConnectorPollResult[]> {
+  const results: ConnectorPollResult[] = [];
+  for (const target of targets) {
+    try {
+      results.push(await runner(engine, target));
+    } catch (err) {
+      results.push({
+        ...target,
+        status: 'failed',
+        landed: 0,
+        tombstoned: 0,
+        diagnostics: [{
+          stage: 'poll',
+          code: 'poll_exception',
+          message: sanitizedPollError(err),
+        }],
+      });
+    }
+  }
+  return results;
+}
+
+export interface ConnectorPollSummary {
+  status: 'ok' | 'partial' | 'failed';
+  exitCode: 0 | 1;
+  landed: number;
+  tombstoned: number;
+}
+
+/** Reduce per-target truth into the command's stable overall outcome. */
+export function connectorPollSummary(results: ConnectorPollResult[]): ConnectorPollSummary {
+  const status = results.some((result) => result.status === 'failed')
+    ? 'failed'
+    : results.some((result) => result.status === 'partial')
+      ? 'partial'
+      : 'ok';
+  return {
+    status,
+    exitCode: status === 'failed' ? 1 : 0,
+    landed: results.reduce((n, result) => n + result.landed, 0),
+    tombstoned: results.reduce((n, result) => n + result.tombstoned, 0),
+  };
+}
+
 export async function runConnector(engine: BrainEngine | null, args: string[]): Promise<void> {
   const sub = args[0];
   if (!sub || sub === '--help' || sub === '-h') {
@@ -85,11 +248,19 @@ export async function runConnector(engine: BrainEngine | null, args: string[]): 
     await runPoll(engine, args.slice(1));
     return;
   }
+  if (sub === 'consolidate') {
+    await runTargetedConsolidation(engine, args.slice(1));
+    return;
+  }
+  if (sub === 'rollback-generation') {
+    await runGenerationRollback(engine, args.slice(1));
+    return;
+  }
   if (sub === 'review') {
     await runReview(engine, args.slice(1));
     return;
   }
-  console.error(`Unknown connector subcommand "${sub}". Try: gbrain connector poll | gbrain connector review`);
+  console.error(`Unknown connector subcommand "${sub}". Try: gbrain connector poll | gbrain connector consolidate | gbrain connector rollback-generation | gbrain connector review`);
   process.exit(2);
 }
 
@@ -123,21 +294,100 @@ async function runPoll(engine: BrainEngine | null, args: string[]): Promise<void
     return;
   }
 
-  const results: ConnectorPollResult[] = [];
-  for (const t of targets) {
-    results.push(await runConnectorPoll(engine, t));
-  }
-  const landed = results.reduce((n, r) => n + r.landed, 0);
-  const tombstoned = results.reduce((n, r) => n + r.tombstoned, 0);
+  const results = await pollConnectorTargets(engine, targets);
+  const summary = connectorPollSummary(results);
 
   if (json) {
-    console.log(JSON.stringify({ targets, polled: results.length, landed, tombstoned, results }, null, 2));
+    console.log(JSON.stringify({ targets, polled: results.length, ...summary, results }, null, 2));
   } else {
     for (const r of results) {
-      const tail = r.skippedReason ? `skipped (${r.skippedReason})` : `landed=${r.landed} tombstoned=${r.tombstoned}`;
+      const tail = r.skippedReason
+        ? `skipped (${r.skippedReason})`
+        : `${r.status}: landed=${r.landed} tombstoned=${r.tombstoned}`;
       console.log(`  ${r.sourceId}/${r.provider}: ${tail}`);
     }
-    console.log(`connector poll: ${results.length} target(s) polled, landed=${landed}, tombstoned=${tombstoned}`);
+    console.log(
+      `connector poll: ${summary.status}, ${results.length} target(s) polled, ` +
+        `landed=${summary.landed}, tombstoned=${summary.tombstoned}`,
+    );
+  }
+  if (summary.exitCode !== 0) process.exitCode = summary.exitCode;
+}
+
+async function runTargetedConsolidation(engine: BrainEngine | null, args: string[]): Promise<void> {
+  if (!engine) {
+    console.error('connector consolidate requires a database. Run `gbrain init` first.');
+    process.exitCode = 1;
+    return;
+  }
+  let parsed: TargetedConsolidationArgs;
+  try {
+    parsed = parseTargetedConsolidationArgs(args);
+  } catch (err) {
+    console.error(`connector consolidate: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 2;
+    return;
+  }
+  const source = (await loadAllSources(engine)).find((candidate) => candidate.id === parsed.sourceId);
+  if (!source) {
+    console.error(`connector consolidate: source ${parsed.sourceId} not found`);
+    process.exitCode = 1;
+    return;
+  }
+  const report = await consolidateContextMirrorGeneration(
+    engine,
+    { id: source.id, config: source.config },
+    {
+      sessionId: parsed.sessionId,
+      generation: parsed.generation,
+      maxPartitions: parsed.maxPartitions,
+      maxCalls: parsed.maxCalls,
+      maxCostUsd: parsed.maxCostUsd,
+      maxRuntimeMs: parsed.maxRuntimeMs,
+      budgetAuditPath: parsed.budgetAuditPath,
+    },
+  );
+  if (parsed.json) {
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    process.stdout.write(
+      `connector consolidate: ${report.status}; selected=${report.selected_partitions}; ` +
+      `provider_calls=${report.provider_calls_reserved}; cost=$${report.estimated_cost_usd.toFixed(6)}; ` +
+      `stop=${report.stop_reason}\n`,
+    );
+  }
+  if (report.status !== 'ok') process.exitCode = 1;
+}
+
+async function runGenerationRollback(engine: BrainEngine | null, args: string[]): Promise<void> {
+  if (!engine) {
+    console.error('connector rollback-generation requires a database. Run `gbrain init` first.');
+    process.exitCode = 1;
+    return;
+  }
+  let parsed: GenerationRollbackArgs;
+  try {
+    parsed = parseGenerationRollbackArgs(args);
+  } catch (err) {
+    console.error(`connector rollback-generation: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    const report = await rollbackContextGeneration(engine, {
+      sourceId: parsed.sourceId,
+      sessionId: parsed.sessionId,
+      generation: parsed.generation,
+      rollbackGeneration: parsed.rollbackGeneration,
+    });
+    if (parsed.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    else process.stdout.write(
+      `connector rollback-generation: ${report.status}; generation=${report.generation}; `
+      + `restored=${report.rollback_generation}; rejected_candidates=${report.rejected_candidates}\n`,
+    );
+  } catch (err) {
+    console.error(`connector rollback-generation: ${err instanceof Error ? err.message : String(err)}`);
+    process.exitCode = 1;
   }
 }
 
@@ -464,6 +714,10 @@ the autopilot connector-dispatch branch (no Minion worker required).
 Subcommands:
   poll    Poll enabled connector sources NOW. Lands connector_candidates (a
           REVIEW queue) — NEVER durable Brain pages, NEVER a promotion.
+  rollback-generation
+          Restore the immediately prior generation for one exact historical
+          repair. Preserves evidence and refuses ordinary, ambiguous, accepted,
+          or promoted work.
   review  Push the confident pending consolidation queue to a human — a READ-ONLY,
           glanceable digest of ADD/UPDATE proposals, confidence-ranked. Writes
           nothing; accept/reject stay on the admin accept→promote seam.

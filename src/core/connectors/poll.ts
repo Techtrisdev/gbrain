@@ -36,7 +36,13 @@
 
 import type { BrainEngine } from '../engine.ts';
 import { withRefreshingLock, LockUnavailableError } from '../db-lock.ts';
-import { getConnector, type ConnectorSource } from './base.ts';
+import {
+  getConnector,
+  type ConnectorBackfillResult,
+  type ConnectorDiagnostic,
+  type ConnectorRunStatus,
+  type ConnectorSource,
+} from './base.ts';
 import { toRow, sweepExpiredCandidates, type ConnectorCandidateItem } from './candidate.ts';
 
 // ── Config shapes (read-only views over sources.config) ──────────────────────
@@ -294,10 +300,14 @@ export interface ConnectorPollParams {
 export interface ConnectorPollResult {
   sourceId: string;
   provider: string;
+  /** End-to-end connector outcome; skipped gates remain `ok` with skippedReason. */
+  status: ConnectorRunStatus;
   /** Number of candidates landed by the connector's backfill this run. */
   landed: number;
   /** Number of tombstone candidates written for vanished records. */
   tombstoned: number;
+  /** Sanitized stage diagnostics. No raw connector bodies. */
+  diagnostics?: ConnectorDiagnostic[];
   /** Set when the poll short-circuited (no source, archived, kill-switch, no
    *  connector, disabled, or no backfill). */
   skippedReason?:
@@ -339,7 +349,7 @@ export async function runConnectorPoll(
   env: Record<string, string | undefined> = process.env,
 ): Promise<ConnectorPollResult> {
   const { sourceId, provider } = params;
-  const base: ConnectorPollResult = { sourceId, provider, landed: 0, tombstoned: 0 };
+  const base: ConnectorPollResult = { sourceId, provider, status: 'ok', landed: 0, tombstoned: 0 };
 
   // Run-time archived re-check mirrors dispatch selection (loadAllSources excludes
   // archived). Tolerate pre-v0.26.5 brains without the `archived` column (42703).
@@ -398,7 +408,11 @@ export async function runConnectorPoll(
   // extraction landed). `.bind` keeps both the narrowed type and the receiver.
   const backfill = connector.backfill.bind(connector);
   const doPollWork = async (): Promise<ConnectorPollResult> => {
-    const landed = await backfill(engine, source);
+    const rawBackfill = await backfill(engine, source);
+    const backfillResult: ConnectorBackfillResult = typeof rawBackfill === 'number'
+      ? { status: 'ok', landed: rawBackfill }
+      : rawBackfill;
+    const landed = backfillResult.landed;
 
     // Reconciliation gate (anti-mass-tombstone): run ONLY when we have an authoritative,
     // non-empty current set, OR the connector explicitly confirmed zero records. An empty
@@ -446,7 +460,13 @@ export async function runConnectorPoll(
       );
     }
 
-    return { ...base, landed, tombstoned };
+    return {
+      ...base,
+      status: backfillResult.status,
+      landed,
+      tombstoned,
+      ...(backfillResult.diagnostics?.length ? { diagnostics: backfillResult.diagnostics } : {}),
+    };
   };
 
   // Capability probe: an engine without the postgres-js / PGLite escape hatch can't take

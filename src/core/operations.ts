@@ -3746,6 +3746,236 @@ const sources_status: Operation = {
   cliHints: { name: 'sources_status', hidden: true },
 };
 
+function assertContextMirrorStatusSource(ctx: OperationContext, sourceId: string): string {
+  if (sourceId === '__all__' || !isValidSourceId(sourceId)) {
+    throw new OperationError(
+      'invalid_params',
+      'context_mirror_status requires one concrete valid source_id',
+    );
+  }
+  if (ctx.remote === true) {
+    const readable = getReadableSourceIds(ctx) ?? [];
+    if (!readable.includes(sourceId)) {
+      throw new OperationError(
+        'permission_denied',
+        `context_mirror_status source_id '${sourceId}' is outside the authenticated read scope`,
+      );
+    }
+  }
+  return sourceId;
+}
+
+const context_mirror_status: Operation = {
+  name: 'context_mirror_status',
+  description:
+    'Read-only, source-confined Context Mirror pipeline status. Returns exact aggregate ' +
+    'counts, bounded queue/circuit/promotion state, and explicit unknown external proof. ' +
+    'Never returns transcript bodies, messages, page slugs, error text, secrets, or URLs.',
+  params: {
+    source_id: {
+      type: 'string',
+      required: true,
+      description: 'One concrete source inside the authenticated read allowlist; federation is never implicit.',
+    },
+  },
+  scope: 'read',
+  mutating: false,
+  handler: async (ctx, p) => {
+    const sourceId = assertContextMirrorStatusSource(ctx, p.source_id as string);
+    const { getContextMirrorStatus } = await import('./connectors/context-mirror-status.ts');
+    const status = await getContextMirrorStatus(ctx.engine, sourceId);
+    if (!status) {
+      throw new OperationError('source_not_found', `Source not found: ${sourceId}`);
+    }
+    return status;
+  },
+  cliHints: { name: 'context_mirror_status', hidden: true },
+};
+
+/**
+ * Context Mirror recovery controls are deliberately bound to the authenticated
+ * write source carried by OperationContext. They never accept a source_id
+ * parameter: an admin credential cannot use federation/read scope to mutate a
+ * different source. Remote calls also require the auth record and context to
+ * agree, so a transport wiring regression fails closed.
+ */
+function contextMirrorAdminSource(ctx: OperationContext): string {
+  const sourceId = ctx.sourceId;
+  if (sourceId === '__all__' || !isValidSourceId(sourceId)) {
+    throw new OperationError(
+      'invalid_params',
+      'Context Mirror admin operations require one concrete valid authenticated source',
+    );
+  }
+  if (ctx.remote === true && ctx.auth?.sourceId !== sourceId) {
+    throw new OperationError(
+      'permission_denied',
+      'Context Mirror admin operation source does not match the authenticated write source',
+    );
+  }
+  return sourceId;
+}
+
+function contextMirrorAdminActor(ctx: OperationContext): string {
+  if (ctx.auth?.clientId) return `mcp:${ctx.auth.clientId.slice(0, 32)}`;
+  return ctx.remote === false ? 'cli' : 'mcp:unknown';
+}
+
+function contextMirrorAdminReason(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new OperationError('invalid_params', 'A non-empty operator reason is required');
+  }
+  const reason = value.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240);
+  if (!reason) {
+    throw new OperationError('invalid_params', 'A non-empty operator reason is required');
+  }
+  return reason;
+}
+
+const retry_candidate_promotion: Operation = {
+  name: 'retry_candidate_promotion',
+  description:
+    'Admin-only, source-confined retry of an already-approved Context Mirror promotion. ' +
+    'Reuses the durable promotion correlation/attempt ledger and only re-dispatches the governed PR path; ' +
+    'it never approves, merges, indexes, or writes shared Brain content directly.',
+  params: {
+    candidate_id: { type: 'number', required: true, description: 'Accepted candidate id in the authenticated source' },
+    reason: { type: 'string', required: true, description: 'Operator reason recorded with the retry audit' },
+  },
+  scope: 'admin',
+  mutating: true,
+  handler: async (ctx, p) => {
+    const sourceId = contextMirrorAdminSource(ctx);
+    const candidateId = p.candidate_id as number;
+    if (!Number.isSafeInteger(candidateId) || candidateId <= 0) {
+      throw new OperationError('invalid_params', 'candidate_id must be a positive safe integer');
+    }
+    const reason = contextMirrorAdminReason(p.reason);
+    const actor = contextMirrorAdminActor(ctx);
+    const rows = await ctx.engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM connector_candidates WHERE id = $1`,
+      [candidateId],
+    );
+    if (!rows[0]) throw new OperationError('candidate_not_found', 'Candidate not found');
+    if (rows[0].source_id !== sourceId) {
+      throw new OperationError('permission_denied', 'Candidate is outside the authenticated source');
+    }
+
+    const { retryCandidatePromotion } = await import('./connectors/candidate.ts');
+    const { readPromotionTransitionByCandidate } = await import('./connectors/promotion-state.ts');
+    const result = await retryCandidatePromotion(ctx.engine, candidateId, actor, sourceId, reason);
+    const transition = await readPromotionTransitionByCandidate(ctx.engine, candidateId);
+    if (!result.row || !transition || transition.source_id !== sourceId) {
+      throw new OperationError('candidate_not_retryable', 'Candidate promotion is not retryable');
+    }
+    ctx.logger.info(
+      `[context-mirror-admin] operation=retry_candidate_promotion source=${sourceId} ` +
+      `candidate_id=${candidateId} actor=${actor} reason=${JSON.stringify(reason)}`,
+    );
+    return {
+      source_id: sourceId,
+      candidate_id: candidateId,
+      candidate_status: result.row.status,
+      dispatch_invoked: result.promotion.invoked,
+      dispatch_pending: result.promotion.pending === true,
+      dispatch_error: result.promotion.error ?? null,
+      correlation_id: transition.correlation_id,
+      promotion_state: transition.state,
+      last_durable_stage: transition.last_durable_stage,
+      next_action: transition.next_action,
+      attempt_count: Number(transition.attempt_count),
+      governance: {
+        approval_preserved: true,
+        merge_preserved: true,
+        direct_shared_write: false,
+      },
+    };
+  },
+};
+
+const rollback_context_generation: Operation = {
+  name: 'rollback_context_generation',
+  description:
+    'Admin-only, source-confined rollback to the immediately prior verified Context Mirror generation. ' +
+    'The transactional generation helper refuses accepted/promoted candidates and ambiguous provider work.',
+  params: {
+    session_id: { type: 'string', required: true, description: 'Context Mirror session id in the authenticated source' },
+    generation: { type: 'number', required: true, description: 'Current generation to roll back' },
+    rollback_generation: { type: 'number', required: true, description: 'Immediately prior generation to restore' },
+    reason: { type: 'string', required: true, description: 'Operator reason recorded on affected candidate audit rows' },
+  },
+  scope: 'admin',
+  mutating: true,
+  handler: async (ctx, p) => {
+    const sourceId = contextMirrorAdminSource(ctx);
+    const sessionId = typeof p.session_id === 'string' ? p.session_id.trim() : '';
+    const generation = p.generation as number;
+    const rollbackGeneration = p.rollback_generation as number;
+    if (!sessionId || sessionId.length > 240 || /[\r\n\t]/.test(sessionId)) {
+      throw new OperationError('invalid_params', 'session_id must be a non-empty single-line identifier');
+    }
+    if (!Number.isSafeInteger(generation) || !Number.isSafeInteger(rollbackGeneration)) {
+      throw new OperationError('invalid_params', 'generation values must be safe integers');
+    }
+    const reason = contextMirrorAdminReason(p.reason);
+    const actor = contextMirrorAdminActor(ctx);
+    const { rollbackContextGeneration } = await import('./connectors/context-mirror-state.ts');
+    const report = await rollbackContextGeneration(ctx.engine, {
+      sourceId,
+      sessionId,
+      generation,
+      rollbackGeneration,
+      actor,
+      reason,
+    });
+    ctx.logger.info(
+      `[context-mirror-admin] operation=rollback_context_generation source=${sourceId} ` +
+      `session_id=${sessionId} generation=${generation} rollback_generation=${rollbackGeneration} ` +
+      `actor=${actor} reason=${JSON.stringify(reason)}`,
+    );
+    return report;
+  },
+};
+
+const set_context_mirror_recovery_hold: Operation = {
+  name: 'set_context_mirror_recovery_hold',
+  description:
+    'Admin-only, source-confined recovery hold toggle. A hold stops destructive expiry while an operator ' +
+    'repairs Context Mirror state; both activation and release require an explicit reason.',
+  params: {
+    active: { type: 'boolean', required: true, description: 'true to activate the hold; false to release it' },
+    reason: { type: 'string', required: true, description: 'Operator reason recorded durably with the hold state' },
+  },
+  scope: 'admin',
+  mutating: true,
+  handler: async (ctx, p) => {
+    const sourceId = contextMirrorAdminSource(ctx);
+    const reason = contextMirrorAdminReason(p.reason);
+    const actor = contextMirrorAdminActor(ctx);
+    const { setContextMirrorRecoveryHold } = await import('./connectors/context-mirror-state.ts');
+    const hold = await setContextMirrorRecoveryHold(
+      ctx.engine,
+      sourceId,
+      p.active as boolean,
+      reason,
+      actor,
+    );
+    ctx.logger.info(
+      `[context-mirror-admin] operation=set_context_mirror_recovery_hold source=${sourceId} ` +
+      `active=${hold.active} actor=${actor} reason=${JSON.stringify(reason)}`,
+    );
+    return {
+      source_id: sourceId,
+      active: hold.active,
+      reason: hold.reason,
+      acted_by: hold.actedBy,
+      held_at: hold.heldAt?.toISOString() ?? null,
+      released_at: hold.releasedAt?.toISOString() ?? null,
+      updated_at: hold.updatedAt?.toISOString() ?? null,
+    };
+  },
+};
+
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
 // ============================================================
@@ -4729,7 +4959,8 @@ export const operations: Operation[] = [
   // v0.30: calibration aggregates over takes
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
-  whoami, sources_add, sources_list, sources_remove, sources_status,
+  whoami, sources_add, sources_list, sources_remove, sources_status, context_mirror_status,
+  retry_candidate_promotion, rollback_context_generation, set_context_mirror_recovery_hold,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.31: hot memory (facts table)

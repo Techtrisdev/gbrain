@@ -27,6 +27,7 @@ import { minimize, strip, type RawConnectorItem } from './redact.ts';
 import { recordConsolidationDecision } from './consolidation-decisions.ts';
 import { canonicalConsolidationSlug, resolveConsolidationSearchSource } from './consolidate.ts';
 import type { ConsolidationClassifyResult } from './consolidate.ts';
+import { chooseReviewAdmissionStatus } from './context-mirror-state.ts';
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
@@ -61,6 +62,34 @@ export interface NormalizedRecord {
   item: RawConnectorItem;
   /** Proposed brain slug (stripped by the framework). */
   proposedSlug?: string;
+  /** Stable upstream generation/version used by the candidate idempotency key. */
+  recordVersion?: string;
+  /** Context Mirror-only lineage; kept outside provider metadata so redaction
+   * minimization cannot accidentally drop the processing identity. */
+  contextLineage?: {
+    sessionId: string;
+    generation: number;
+    partition: string;
+    correlationId: string;
+    requiresHumanReview: boolean;
+    evidenceTrust: 'untrusted_transcript';
+    reviewWarning: string;
+  };
+}
+
+export type ConnectorRunStatus = 'ok' | 'partial' | 'failed';
+
+export interface ConnectorDiagnostic {
+  stage: string;
+  code: string;
+  message: string;
+}
+
+/** Backward-compatible structured result for connectors with multi-stage work. */
+export interface ConnectorBackfillResult {
+  status: ConnectorRunStatus;
+  landed: number;
+  diagnostics?: ConnectorDiagnostic[];
 }
 
 /** The contract every SaaS connector implements. */
@@ -107,7 +136,7 @@ export interface SaaSConnector {
   toCandidate(record: NormalizedRecord, sourceId: string): ConnectorCandidateItem;
   /** Outbound backfill (initial/periodic sync). Declared here; implemented per-connector
    *  once connector_tokens / OAuth (TECH-2033) lands. Uses the same landRecords path. */
-  backfill?(engine: BrainEngine, source: ConnectorSource): Promise<number>;
+  backfill?(engine: BrainEngine, source: ConnectorSource): Promise<number | ConnectorBackfillResult>;
   /** Optional post-connect hook, invoked by the OAuth /callback AFTER storeToken
    *  persists the grant (TECH-2040). A connector whose inbound trigger requires
    *  provider-side setup beyond the token grant (e.g. Google Calendar's
@@ -168,6 +197,14 @@ export function hmacSha256Verify(rawBody: Buffer, secret: string, signatureHex: 
 export interface LandResult {
   written: number;
   total: number;
+  /** Present when a multi-stage landing path needs to report degraded work. */
+  status?: ConnectorRunStatus;
+  diagnostics?: ConnectorDiagnostic[];
+}
+
+interface ConsolidationLandResult {
+  written: number;
+  diagnostics: ConnectorDiagnostic[];
 }
 
 /** Options for {@link landRecords}. */
@@ -214,11 +251,17 @@ export async function landRecords(
   // passthrough, and this read runs OUTSIDE the per-record try/catch, so an
   // unguarded throw here would otherwise abort the entire poll.
   let consolidation: ConsolidationDeps | null = null;
+  const diagnostics: ConnectorDiagnostic[] = [];
   if (opts.consolidate) {
     try {
       consolidation = await loadConsolidation(engine, sourceId);
-    } catch {
+    } catch (err) {
       consolidation = null;
+      diagnostics.push({
+        stage: 'consolidate',
+        code: 'consolidation_setup_failed',
+        message: safeConnectorDiagnostic(err),
+      });
     }
   }
 
@@ -249,6 +292,8 @@ export async function landRecords(
       profile: record.profile,
       item: { sourceRecordId: min.sourceRecordId, metadata: min.metadata, summary: min.summary },
       proposedSlug: record.proposedSlug,
+      recordVersion: record.recordVersion,
+      contextLineage: record.contextLineage,
     };
     const raw = connector.toCandidate(redacted, sourceId);
     const candidate: ConnectorCandidateItem = {
@@ -276,7 +321,9 @@ export async function landRecords(
     // The consolidation path may FAN OUT one capture into N candidate rows, so it
     // returns the COUNT it wrote (not a boolean); the raw passthrough writes one.
     if (consolidation) {
-      written += await landOneConsolidated(engine, sourceId, connector, candidate, consolidation);
+      const result = await landOneConsolidated(engine, sourceId, connector, candidate, consolidation);
+      written += result.written;
+      diagnostics.push(...result.diagnostics);
     } else {
       const landed = await toRow(engine, candidate);
       if (landed.written) {
@@ -285,7 +332,9 @@ export async function landRecords(
       }
     }
   }
-  return { written, total: records.length };
+  return diagnostics.length > 0
+    ? { written, total: records.length, status: 'partial', diagnostics }
+    : { written, total: records.length };
 }
 
 // ── Consolidation seam (U3) — POLL-only; degrade-to-passthrough by construction ──
@@ -350,22 +399,38 @@ async function landOneConsolidated(
   connector: SaaSConnector,
   candidate: ConnectorCandidateItem,
   deps: ConsolidationDeps,
-): Promise<number> {
+): Promise<ConsolidationLandResult> {
   const provider = candidate.provider ?? connector.provider;
   const version = strip(candidate.version ?? '1');
-  const passthrough = async (): Promise<number> => {
+  const diagnostics: ConnectorDiagnostic[] = [];
+  const passthrough = async (
+    diagnostic?: Omit<ConnectorDiagnostic, 'stage'>,
+  ): Promise<ConsolidationLandResult> => {
+    if (diagnostic) diagnostics.push({ stage: 'consolidate', ...diagnostic });
+    // Context Mirror raw/distilled evidence is not a review candidate. Its
+    // durable partition ledger retries provider or persistence failures; putting
+    // transcript-derived passthrough into the queue would bypass that decision
+    // and leak evidence into the governed promotion surface.
+    if (provider === 'context_mirror') {
+      return { written: 0, diagnostics };
+    }
     const landed = await toRow(engine, candidate);
-    if (!landed.written) return 0;
-    await maybeAutoApprove(engine, landed.row);
-    return 1;
+    if (landed.written) await maybeAutoApprove(engine, landed.row);
+    return { written: landed.written ? 1 : 0, diagnostics };
   };
   try {
     // Gate: per-connector flag (default false) + chat reachable. Either off →
     // today's raw passthrough (no DB pre-check, no LLM). The POLL-only structural
     // gate already held at the call site; this is the per-connector + availability
     // layer. extractConsolidationFacts re-checks both internally (defense in depth).
-    if (!deps.enabled(provider, deps.sourceConfig) || !isAvailable('chat')) {
+    if (!deps.enabled(provider, deps.sourceConfig)) {
       return await passthrough();
+    }
+    if (!isAvailable('chat')) {
+      return await passthrough({
+        code: 'consolidation_provider_unavailable',
+        message: 'consolidation is enabled but the chat provider is unavailable',
+      });
     }
 
     // KTD2 invariant guard. The fan-out key `<captureId>::<target>` AND the
@@ -382,7 +447,10 @@ async function landOneConsolidated(
         `[consolidation] captureId contains '::' for ${sourceId}/${provider} — ` +
           `degrading to raw passthrough (fan-out keying requires no '::' in the capture id)`,
       );
-      return await passthrough();
+      return await passthrough({
+        code: 'invalid_capture_identity',
+        message: "capture identity contains the reserved '::' fan-out delimiter",
+      });
     }
 
     // Idempotency pre-check (KTD3, fan-out-aware): a re-poll of an already-
@@ -392,16 +460,28 @@ async function landOneConsolidated(
     // extraction, no new row, not counted); the first poll's verdicts + decision
     // log stand.
     if (await captureConsolidated(engine, sourceId, candidate.source_record_id, version)) {
-      return 0;
+      return { written: 0, diagnostics };
     }
 
     // U1 → U2. extract reads the REDACTED capture summary (proposed_markdown,
     // strip()'d so a secret in the capture never reaches the LLM input either).
     const captureText = candidate.proposed_markdown ? strip(candidate.proposed_markdown) : '';
-    const extracted = await deps.extract({ captureText, provider, sourceConfig: deps.sourceConfig, engine });
+    const extracted = await deps.extract({
+      captureText,
+      provider,
+      sourceConfig: deps.sourceConfig,
+      engine,
+      // A distilled Context Mirror page is already one atomic memory. Limiting
+      // extraction to one fact gives its durable partition exactly one terminal
+      // candidate/decision identity and keeps review reservations exact.
+      ...(provider === 'context_mirror' ? { maxFacts: 1 } : {}),
+    });
     if (!extracted) {
       // U1 degrade (flag off / chat down / empty / malformed) → raw passthrough.
-      return await passthrough();
+      return await passthrough({
+        code: 'consolidation_extract_degraded',
+        message: 'fact extraction failed, was refused, or returned invalid output',
+      });
     }
     const verdicts = await deps.classify({
       facts: extracted.facts,
@@ -413,21 +493,49 @@ async function landOneConsolidated(
     if (!verdicts) {
       // Only the disabled-connector entry gate returns null here (already gated
       // above) — defensive: degrade to raw passthrough.
-      return await passthrough();
+      return await passthrough({
+        code: 'consolidation_classify_degraded',
+        message: 'fact classification did not produce a durable decision',
+      });
     }
 
-    const { written, threw } = await persistConsolidated(
+    const persisted = await persistConsolidated(
       engine, sourceId, candidate, version, verdicts, deps.surfaceMinConfidence,
     );
-    if (written > 0) return written;
+    diagnostics.push(...persisted.diagnostics);
+    if (persisted.written > 0) return { written: persisted.written, diagnostics };
     // Nothing landed. Preserve via raw passthrough ONLY when the capture genuinely got
     // nothing persisted: empty verdicts (no durable facts → land the idempotency marker
     // so a re-poll skips it) or a verdict that THREW (its INSERT failed). If verdicts
     // existed and ALL merely CONFLICTED (no throw), a concurrent poll already
     // consolidated this capture — return 0, do NOT write a spurious bare-id raw
     // candidate (review finding 3: the all-conflict fallback double-write under a race).
-    if (verdicts.length === 0 || threw) return await passthrough();
-    return 0;
+    if (verdicts.length === 0) {
+      return await passthrough();
+    }
+    if (persisted.threw) {
+      // Context Mirror owns a durable per-partition retry ledger. A persistence
+      // failure must leave that partition retryable; raw passthrough would turn
+      // a missing decision into a false terminal success.
+      if (provider === 'context_mirror') {
+        return {
+          written: 0,
+          diagnostics: [
+            ...diagnostics,
+            {
+              stage: 'consolidate',
+              code: 'consolidation_partition_persist_failed',
+              message: 'candidate and decision transaction rolled back; partition remains retryable',
+            },
+          ],
+        };
+      }
+      return await passthrough({
+        code: 'consolidation_partition_persist_failed',
+        message: 'one or more consolidation partitions could not be persisted',
+      });
+    }
+    return { written: 0, diagnostics };
   } catch (err) {
     if (isAbortError(err)) throw err; // graceful shutdown — propagate, don't land.
     // KTD4 degrade: any other throw isolates to THIS record. Throws reach here only
@@ -435,9 +543,12 @@ async function landOneConsolidated(
     // row was written — so this raw candidate genuinely lands (idempotent), the
     // capture is not lost, and the batch continues. Per-verdict persistence throws
     // are contained INSIDE persistConsolidated (a poison verdict degrades only
-    // itself), and the decision-log write is non-fatal there, so neither re-degrades
-    // an already-persisted consolidated row to a raw passthrough.
-    return await passthrough();
+    // itself), and candidate + decision persistence is transactional, so neither
+    // can leave a split durable state.
+    return await passthrough({
+      code: 'consolidation_record_degraded',
+      message: safeConnectorDiagnostic(err),
+    });
   }
 }
 
@@ -459,11 +570,12 @@ async function persistConsolidated(
   version: string,
   verdicts: ConsolidationClassifyResult[],
   surfaceMinConfidence: number,
-): Promise<{ written: number; threw: boolean }> {
+): Promise<{ written: number; threw: boolean; diagnostics: ConnectorDiagnostic[] }> {
   const captureId = candidate.source_record_id;
   const fanOut = verdicts.length > 1;
   let written = 0;
   let threw = false;
+  const diagnostics: ConnectorDiagnostic[] = [];
   for (const [index, verdict] of verdicts.entries()) {
     try {
       written += await persistOneVerdict(
@@ -473,21 +585,22 @@ async function persistConsolidated(
       if (isAbortError(err)) throw err; // graceful shutdown still propagates.
       // Per-verdict isolation: this verdict's row INSERT threw — log + skip it; the
       // sibling verdicts (already written or still to come) are unaffected.
-      // KNOWN LIMITATION (review finding 2): a thrown verdict is NOT retried — once a
-      // sibling lands, the per-capture prefix idempotency treats the whole capture as
-      // consolidated, so the failed partition is stranded. Rare (a transient row-INSERT
-      // throw), the human still sees the other partitions, and the loud log is the
-      // alert. A full fix (per-partition completion tracking / transactional fan-out)
-      // is a deferred follow-up.
+      // Context Mirror retries the owning durable memory partition; ordinary
+      // connectors preserve their historical per-verdict isolation behavior.
       threw = true;
       console.error(
         `[consolidation] fan-out verdict persist failed for ` +
           `${sourceId}/${fanoutRecordId(captureId, verdict, index, fanOut)} (${verdict.classification}): ` +
           `${err instanceof Error ? err.message : String(err)}`,
       );
+      diagnostics.push({
+        stage: 'consolidate',
+        code: 'consolidation_partition_persist_failed',
+        message: safeConnectorDiagnostic(err),
+      });
     }
   }
-  return { written, threw };
+  return { written, threw, diagnostics };
 }
 
 /**
@@ -582,18 +695,78 @@ async function persistOneVerdict(
   }
 
   const item = buildConsolidatedItem(base, final, resolvedPath, surfaceMinConfidence, singleWriterDowngrade);
-  // FU2: a transient row-INSERT throw must not strand this partition. `toRow` is an
-  // idempotent INSERT … ON CONFLICT DO NOTHING (a duplicate key returns written:false,
-  // it never throws), so a retry is safe — a throw here is a transient backend hiccup
-  // (connection blip / timeout). Retry with small backoff before letting it propagate
-  // to persistConsolidated's per-verdict catch, which strands + loudly logs THIS
-  // partition only. A PERMANENT error (exhausts the retries) still ends there — that
-  // residual single-partition loss is the documented known-limitation.
+  // A transient row-INSERT throw must not strand this verdict. `toRow` is an
+  // idempotent INSERT … ON CONFLICT DO NOTHING, so retrying the candidate + decision
+  // transaction is safe. Context Mirror additionally leaves the owning durable
+  // partition retryable after exhausted attempts; ordinary connectors retain their
+  // historical per-verdict isolation behavior.
   let written = false;
   let landedRow: ConnectorCandidateRow | null = null;
   for (let attempt = 1; ; attempt++) {
     try {
-      const landed = await toRow(engine, item);
+      const landed = await engine.transaction(async (tx) => {
+        let admitted = item;
+        const preferred = item.status ?? 'pending';
+        if (
+          item.provider === 'context_mirror' &&
+          item.context_session_id != null &&
+          (preferred === 'pending' || preferred === 'needs_review')
+        ) {
+          const status = await chooseReviewAdmissionStatus(
+            tx,
+            sourceId,
+            preferred,
+            Buffer.byteLength(item.proposed_markdown ?? '', 'utf8'),
+            item.requires_human_review === true,
+          );
+          admitted = {
+            ...item,
+            status,
+            ...(status === 'awaiting_review_capacity'
+              ? { status_reason: 'review_capacity' }
+              : {}),
+          };
+        }
+        const persisted = await toRow(tx, admitted);
+        if (
+          persisted.row &&
+          admitted.context_session_id != null &&
+          admitted.context_generation != null
+        ) {
+          await tx.executeRaw(
+            `UPDATE connector_candidates
+                SET status = 'rejected', status_reason = 'superseded_generation',
+                    superseded_by = $4, acted_at = COALESCE(acted_at, now())
+              WHERE source_id = $1 AND context_session_id = $2
+                AND context_generation < $3
+                AND (
+                  status IN ('pending','needs_review','awaiting_review_capacity')
+                  OR (
+                    status = 'rejected'
+                    AND status_reason = 'superseded_generation_pending_replacement'
+                    AND superseded_by IS NULL
+                  )
+                )
+                AND id <> $4`,
+            [sourceId, admitted.context_session_id, admitted.context_generation, persisted.row.id],
+          );
+        }
+        await recordConsolidationDecision(tx, {
+          sourceId,
+          sourceRecordId: recordId,
+          version,
+          classification: final.classification,
+          confidence: final.confidence,
+          targetPath: resolvedPath ?? final.target_path,
+          tier1Cosine: final.tier1_cosine,
+          model: final.model,
+          correlationId: admitted.correlation_id,
+          evidenceTrust: admitted.evidence_trust,
+          reviewWarning: admitted.review_warning,
+          requiresHumanReview: admitted.requires_human_review,
+        });
+        return persisted;
+      });
       written = landed.written;
       landedRow = landed.row;
       break;
@@ -603,35 +776,6 @@ async function persistOneVerdict(
     }
   }
 
-  // Durable decision log (audit + Tier-1 calibration), keyed on the per-target
-  // (source_id, source_record_id, version) tuple + classification (idempotent).
-  // Records the FINAL classification — what the row actually became, including a
-  // single-writer downgrade.
-  //
-  // NON-FATAL: the consolidated candidate row above is ALREADY committed. A
-  // decision-log failure must NOT propagate to persistConsolidated's per-verdict
-  // catch, which would otherwise log it as a "verdict persist failure" even though
-  // the candidate row landed fine. Worst case on failure is a lost audit row —
-  // never a re-degraded or duplicated candidate. (AbortError still propagates.)
-  try {
-    await recordConsolidationDecision(engine, {
-      sourceId,
-      sourceRecordId: recordId,
-      version,
-      classification: final.classification,
-      confidence: final.confidence,
-      targetPath: resolvedPath ?? final.target_path,
-      tier1Cosine: final.tier1_cosine,
-      model: final.model,
-    });
-  } catch (err) {
-    if (isAbortError(err)) throw err; // graceful shutdown still propagates.
-    console.error(
-      `[consolidation] decision-log write failed for ${sourceId}/${recordId} ` +
-        `(${final.classification}) — candidate row persisted, audit row dropped: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
   if (fanOut && !written) {
     // Swallowed ON CONFLICT inside a fan-out (review finding 4): the model named one
     // page in two partitions → both derive the same `<captureId>::<slug>` key →
@@ -831,7 +975,7 @@ async function hasInflightUpdatePage(engine: BrainEngine, targetPath: string): P
   const rows = await engine.executeRaw<{ one: number }>(
     `SELECT 1 AS one FROM connector_candidates
       WHERE target_kind = 'update_page' AND target_path = $1
-        AND status IN ('pending', 'accepted')
+        AND status IN ('pending', 'accepted', 'needs_review', 'awaiting_review_capacity')
       LIMIT 1`,
     [targetPath],
   );
@@ -843,6 +987,16 @@ async function hasInflightUpdatePage(engine: BrainEngine, targetPath: string): P
 function isAbortError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return err.name === 'AbortError' || /aborted|cancell?ed/i.test(err.message);
+}
+
+/** Bounded, one-line diagnostic text suitable for structured connector output. */
+function safeConnectorDiagnostic(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err))
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/(?:sk-|Bearer\s+)[A-Za-z0-9._-]{12,}/gi, '[redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240) || 'unknown consolidation failure';
 }
 
 function safeParse(value: string): Record<string, unknown> | null {

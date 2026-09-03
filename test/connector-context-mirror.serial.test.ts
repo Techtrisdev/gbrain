@@ -46,14 +46,22 @@ describe('Context Mirror live scheduling — distill_before_poll (serial: mock.m
   });
 
   test('a distill failure is non-fatal — consolidation still proceeds', async () => {
-    const distillSpy = mock(async () => {
-      throw new Error('gateway down');
-    });
+    const distillSpy = mock(async () => ({
+      status: 'failed',
+      stop_reason: 'systemic_failure',
+      failed: 1,
+      deferred: 2,
+      sessions: [{ status: 'failed', error_class: 'config', error: 'gateway down' }],
+    }));
     mock.module('../src/core/connectors/distill.ts', () => ({ distillCaptureSessions: distillSpy }));
-    const landed = await contextMirrorConnector.backfill!(
+    const result = await contextMirrorConnector.backfill!(
       emptyEngine(),
       source({ connectors: { context_mirror: { distill_before_poll: true } } }),
     );
-    expect(landed).toBe(0);
+    expect(result).toMatchObject({
+      status: 'failed',
+      landed: 0,
+      diagnostics: [{ stage: 'distill', code: 'config', message: 'gateway down' }],
+    });
   });
 });

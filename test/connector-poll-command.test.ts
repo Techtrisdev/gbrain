@@ -6,7 +6,71 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { resolveConnectorPollTargets } from '../src/commands/connector.ts';
+import {
+  connectorPollSummary,
+  parseGenerationRollbackArgs,
+  parseTargetedConsolidationArgs,
+  pollConnectorTargets,
+  resolveConnectorPollTargets,
+} from '../src/commands/connector.ts';
+
+describe('targeted consolidation command safety flags', () => {
+  test('requires an exact generation and finite provider envelope', () => {
+    expect(parseTargetedConsolidationArgs([
+      '--source', 'capture-events',
+      '--session-id', 'opaque-session-001',
+      '--generation', '1',
+      '--max-partitions', '2',
+      '--max-calls', '3',
+      '--max-cost-usd', '0.10',
+      '--max-runtime-ms', '60000',
+      '--budget-audit-path', 'D:/BrainProof/consolidation-budget.jsonl',
+      '--json',
+    ])).toMatchObject({
+      sourceId: 'capture-events',
+      sessionId: 'opaque-session-001',
+      generation: 1,
+      maxPartitions: 2,
+      maxCalls: 3,
+      maxCostUsd: 0.1,
+      maxRuntimeMs: 60_000,
+      budgetAuditPath: 'D:/BrainProof/consolidation-budget.jsonl',
+      json: true,
+    });
+  });
+
+  test('rejects missing, unknown, non-finite, and unbounded inputs', () => {
+    expect(() => parseTargetedConsolidationArgs([])).toThrow(/required/);
+    expect(() => parseTargetedConsolidationArgs(['--typo', 'x'])).toThrow(/unknown/);
+    expect(() => parseTargetedConsolidationArgs([
+      '--source', 'capture-events', '--session-id', 's', '--generation', '0',
+      '--max-partitions', '1', '--max-calls', '1', '--max-cost-usd', '0.1',
+      '--max-runtime-ms', '1', '--budget-audit-path', 'D:/proof.jsonl',
+    ])).toThrow(/generation/);
+    expect(() => parseTargetedConsolidationArgs([
+      '--source', 'capture-events', '--session-id', 's', '--generation', '1',
+      '--max-partitions', '1', '--max-calls', 'Infinity', '--max-cost-usd', '0.1',
+      '--max-runtime-ms', '1', '--budget-audit-path', 'D:/proof.jsonl',
+    ])).toThrow(/max-calls/);
+  });
+});
+
+describe('historical generation rollback command', () => {
+  test('requires one exact source, session, current generation, and prior generation', () => {
+    expect(parseGenerationRollbackArgs([
+      '--source', 'capture-events', '--session-id', 'opaque-session',
+      '--generation', '3', '--rollback-generation', '2', '--json',
+    ])).toEqual({
+      sourceId: 'capture-events', sessionId: 'opaque-session',
+      generation: 3, rollbackGeneration: 2, json: true,
+    });
+    expect(() => parseGenerationRollbackArgs([])).toThrow(/required/);
+    expect(() => parseGenerationRollbackArgs([
+      '--source', 'capture-events', '--session-id', 's',
+      '--generation', '2', '--rollback-generation', '0',
+    ])).toThrow(/finite integer/);
+  });
+});
 
 let engine: PGLiteEngine;
 beforeAll(async () => {
@@ -51,5 +115,25 @@ describe('resolveConnectorPollTargets', () => {
   test('--provider without --source → usage error', async () => {
     const { error } = await resolveConnectorPollTargets(engine, { provider: 'granola' });
     expect(error).toBeTruthy();
+  });
+});
+
+describe('connector poll result aggregation', () => {
+  test('continues after one target throws and produces a final nonzero summary', async () => {
+    const targets = [
+      { sourceId: 'broken', provider: 'context_mirror' },
+      { sourceId: 'healthy', provider: 'calendar' },
+    ];
+    const called: string[] = [];
+    const results = await pollConnectorTargets(engine, targets, async (_engine, target) => {
+      called.push(target.sourceId);
+      if (target.sourceId === 'broken') throw new Error('provider unavailable');
+      return { sourceId: target.sourceId, provider: target.provider, status: 'ok', landed: 2, tombstoned: 0 };
+    });
+
+    expect(called).toEqual(['broken', 'healthy']);
+    expect(results[0]).toMatchObject({ status: 'failed', landed: 0 });
+    expect(results[1]).toMatchObject({ status: 'ok', landed: 2 });
+    expect(connectorPollSummary(results)).toMatchObject({ status: 'failed', exitCode: 1, landed: 2 });
   });
 });
