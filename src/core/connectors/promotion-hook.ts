@@ -72,6 +72,8 @@ export interface PromotionHookDeps {
   fetchFn?: FetchFn;
   /** Target repo override (tests). Defaults to the Brain repo inside emitRepositoryDispatch. */
   repo?: string;
+  /** Per-request GitHub deadline override (tests). Production defaults to 15 seconds. */
+  githubRequestTimeoutMs?: number;
 }
 
 /**
@@ -95,6 +97,7 @@ function makeDefaultTokenResolver(
       return getPromotionDispatchToken(deps.repo ?? BRAIN_DISPATCH_REPO, {
         getEnv,
         fetchImpl: deps.dispatchTokenFetch,
+        timeoutMs: deps.githubRequestTimeoutMs,
       });
     }
     throw new Error(
@@ -153,6 +156,7 @@ export function makePromotionHook(deps: PromotionHookDeps = {}): PromotionHook {
         githubToken,
         repo: deps.repo,
         fetchFn: deps.fetchFn,
+        timeoutMs: deps.githubRequestTimeoutMs,
       });
     } catch (err) {
       await finishPromotionDispatchAttempt(engine, candidate.id, attempt.attemptNo, err);

@@ -55,6 +55,7 @@ export interface DistillArgs {
   requestTimeoutMs: number;
   maxRetries: number;
   model?: string;
+  sessionId?: string;
 }
 
 const HELP = `Usage: gbrain capture distill [options]
@@ -78,6 +79,8 @@ Options:
                        than N hours (= "completed"). Default: ${DEFAULT_IDLE_HOURS}.
   --max-sessions <N>   Maximum sessions selected (default: ${DEFAULT_MAX_SESSIONS}).
   --max-calls <N>      Maximum provider calls (default: ${DEFAULT_MAX_CALLS}).
+  --session-id <id>    Lease exactly one named session. Requires --max-sessions 1
+                       and --max-calls 1; never falls back to backlog work.
   --max-input-tokens <N>   Input-token ceiling (default: ${DEFAULT_MAX_INPUT_TOKENS}).
   --max-output-tokens <N>  Output-token ceiling (default: ${DEFAULT_MAX_OUTPUT_TOKENS}).
   --max-cost-usd <N>   Hard USD ceiling (default: ${DEFAULT_MAX_COST_USD}).
@@ -159,6 +162,12 @@ export function parseDistillArgs(args: string[]): DistillArgs | { help: true } {
       i += 1;
       continue;
     }
+    if (a === '--session-id') {
+      if (out.sessionId !== undefined) throw new Error('--session-id may be specified only once');
+      out.sessionId = requiredValue(args, i, a);
+      i += 1;
+      continue;
+    }
     if (a === '--idle-hours') {
       out.idleHours = finiteFlag(a, requiredValue(args, i, a), { min: 0 });
       i += 1;
@@ -183,6 +192,12 @@ export function parseDistillArgs(args: string[]): DistillArgs | { help: true } {
     }
     throw new Error(`unknown capture distill option: ${a}`);
     // unknown flag → ignore (matches `gbrain capture` parsing posture)
+  }
+  if (out.sessionId !== undefined && out.maxSessions !== 1) {
+    throw new Error('--session-id requires --max-sessions 1');
+  }
+  if (out.sessionId !== undefined && out.maxCalls !== 1) {
+    throw new Error('--session-id requires --max-calls 1');
   }
   return out;
 }
@@ -269,6 +284,7 @@ export async function runCaptureDistill(engine: BrainEngine | null, args: string
     requestTimeoutMs: parsed.requestTimeoutMs,
     maxRetries: parsed.maxRetries,
     model: parsed.model,
+    sessionIds: parsed.sessionId ? [parsed.sessionId] : undefined,
   });
 
   if (parsed.json) {

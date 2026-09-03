@@ -614,15 +614,16 @@ describe('generation-aware callback v2', () => {
     const transition = await ensureTransition(id);
     for (const body of [
       { schema_version: 2, correlation_id: transition.correlation_id, status: 'opened', branch: BRANCH, pr_url: PR_URL },
-      { schema_version: 2, correlation_id: transition.correlation_id, status: 'merged', merge_sha: 'b'.repeat(40) },
+      { schema_version: 2, correlation_id: transition.correlation_id, status: 'merged', merge_sha: 'b'.repeat(40), workflow_run_id: '76' },
       {
         schema_version: 2,
         correlation_id: transition.correlation_id,
         status: 'indexing_failed',
         failure_code: 'reindex_workflow_failed',
+        merge_sha: 'b'.repeat(40),
         workflow_run_id: '77',
       },
-      { schema_version: 2, correlation_id: transition.correlation_id, status: 'indexed', workflow_run_id: '78' },
+      { schema_version: 2, correlation_id: transition.correlation_id, status: 'indexed', merge_sha: 'b'.repeat(40), workflow_run_id: '78' },
     ]) {
       const signed = signedJson(body);
       const result = await handlePromotionCallback({
@@ -649,6 +650,8 @@ describe('generation-aware callback v2', () => {
       schema_version: 2,
       correlation_id: transition.correlation_id,
       status: 'indexed',
+      merge_sha: 'c'.repeat(40),
+      workflow_run_id: 'stale-88',
     });
     await handlePromotionCallback({ rawBody: indexed.rawBody, signatureHeader: indexed.signature, secret: SECRET, engine });
     const opened = signedJson({
@@ -679,8 +682,42 @@ describe('generation-aware callback v2', () => {
       correlation_id: transition.correlation_id,
       status: 'indexing_failed',
       failure_code: 'raw-secret-provider-message',
+      merge_sha: 'f'.repeat(40),
+      workflow_run_id: 'bad-failure-93',
     });
     const result = await handlePromotionCallback({ rawBody: signed.rawBody, signatureHeader: signed.signature, secret: SECRET, engine });
+    expect(result.ok).toBe(false);
+    expect((result as Extract<PromotionCallbackResult, { ok: false }>).status).toBe(400);
+    expect((await readPromotionTransitionByCandidate(engine, id))?.state).toBe('accepted_dispatching');
+  });
+
+  test.each([
+    ['opened without branch', { status: 'opened', pr_url: PR_URL }],
+    ['opened without PR URL', { status: 'opened', branch: BRANCH }],
+    ['merged without merge SHA', { status: 'merged', workflow_run_id: '91' }],
+    ['merged without workflow run', { status: 'merged', merge_sha: 'd'.repeat(40) }],
+    ['dispatch failure without failure code', { status: 'dispatch_failed' }],
+    ['indexing failure without merge SHA', { status: 'indexing_failed', workflow_run_id: '92', failure_code: 'reindex_workflow_failed' }],
+    ['indexing failure without workflow run', { status: 'indexing_failed', merge_sha: 'e'.repeat(40), failure_code: 'reindex_workflow_failed' }],
+    ['indexing failure without failure code', { status: 'indexing_failed', merge_sha: 'e'.repeat(40), workflow_run_id: '93' }],
+    ['indexed without merge SHA', { status: 'indexed', workflow_run_id: '94' }],
+    ['indexed without workflow run', { status: 'indexed', merge_sha: 'e'.repeat(40) }],
+  ])('rejects %s before any state mutation', async (_label, stage) => {
+    const { id } = await seedDispatched(`v2-missing-${String(stage.status)}`);
+    const transition = await ensureTransition(id);
+    const signed = signedJson({
+      schema_version: 2,
+      correlation_id: transition.correlation_id,
+      ...stage,
+    });
+
+    const result = await handlePromotionCallback({
+      rawBody: signed.rawBody,
+      signatureHeader: signed.signature,
+      secret: SECRET,
+      engine,
+    });
+
     expect(result.ok).toBe(false);
     expect((result as Extract<PromotionCallbackResult, { ok: false }>).status).toBe(400);
     expect((await readPromotionTransitionByCandidate(engine, id))?.state).toBe('accepted_dispatching');

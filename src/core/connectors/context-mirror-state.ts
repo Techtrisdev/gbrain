@@ -93,8 +93,27 @@ export interface ReviewCapacitySnapshot {
 export interface ContextMirrorRecoveryHold {
   active: boolean;
   reason: string;
+  actedBy: string;
   heldAt: Date | null;
   releasedAt: Date | null;
+  updatedAt: Date | null;
+}
+
+export interface ContextGenerationRollbackReport {
+  status: 'rolled_back' | 'already_rolled_back';
+  source_id: string;
+  session_id: string;
+  generation: number;
+  rollback_generation: number;
+  rejected_candidates: number;
+  actor: string;
+  reason: string;
+  rolled_back_at: string;
+  verification: {
+    current_generation: number;
+    rolled_back_generation_state: 'superseded';
+    restored_generation_state: 'complete';
+  };
 }
 
 interface CaptureMetadataRow {
@@ -124,10 +143,12 @@ export async function readContextMirrorRecoveryHold(
   const rows = await engine.executeRaw<{
     active: boolean;
     reason: string;
+    acted_by: string;
     held_at: Date | string | null;
     released_at: Date | string | null;
+    updated_at: Date | string | null;
   }>(
-    `SELECT active, reason, held_at, released_at
+    `SELECT active, reason, acted_by, held_at, released_at, updated_at
        FROM context_mirror_recovery_holds WHERE source_id = $1`,
     [sourceId],
   );
@@ -135,8 +156,10 @@ export async function readContextMirrorRecoveryHold(
   return {
     active: row?.active === true,
     reason: row?.reason ?? '',
+    actedBy: row?.acted_by ?? '',
     heldAt: row?.held_at ? new Date(row.held_at) : null,
     releasedAt: row?.released_at ? new Date(row.released_at) : null,
+    updatedAt: row?.updated_at ? new Date(row.updated_at) : null,
   };
 }
 
@@ -147,14 +170,16 @@ export async function setContextMirrorRecoveryHold(
   sourceId: string,
   active: boolean,
   reason: string,
+  actor = 'system',
 ): Promise<ContextMirrorRecoveryHold> {
   const cleanReason = reason.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240);
+  const cleanActor = actor.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120) || 'system';
   if (active && !cleanReason) throw new Error('context mirror recovery hold requires a reason');
   await engine.executeRaw(
     `INSERT INTO context_mirror_recovery_holds (
-       source_id, active, reason, held_at, released_at, updated_at
+       source_id, active, reason, acted_by, held_at, released_at, updated_at
      ) VALUES (
-       $1, $2, $3,
+       $1, $2, $3, $4,
        CASE WHEN $2 THEN now() ELSE NULL END,
        CASE WHEN $2 THEN NULL ELSE now() END,
        now()
@@ -162,6 +187,7 @@ export async function setContextMirrorRecoveryHold(
      ON CONFLICT (source_id) DO UPDATE SET
        active = EXCLUDED.active,
        reason = EXCLUDED.reason,
+       acted_by = EXCLUDED.acted_by,
        held_at = CASE
          WHEN EXCLUDED.active AND context_mirror_recovery_holds.active
            THEN context_mirror_recovery_holds.held_at
@@ -169,13 +195,17 @@ export async function setContextMirrorRecoveryHold(
          ELSE context_mirror_recovery_holds.held_at
        END,
        released_at = CASE WHEN EXCLUDED.active THEN NULL ELSE now() END,
-       updated_at = now()`,
-    [sourceId, active, cleanReason],
+       updated_at = now()
+     WHERE (context_mirror_recovery_holds.active,
+            context_mirror_recovery_holds.reason,
+            context_mirror_recovery_holds.acted_by)
+       IS DISTINCT FROM (EXCLUDED.active, EXCLUDED.reason, EXCLUDED.acted_by)`,
+    [sourceId, active, cleanReason, cleanActor],
   );
   return await readContextMirrorRecoveryHold(engine, sourceId);
 }
 
-function parseJsonObject(value: unknown): Record<string, unknown> {
+export function parseJsonObject(value: unknown): Record<string, unknown> {
   if (typeof value === 'string') {
     try {
       const parsed = JSON.parse(value) as unknown;
@@ -413,6 +443,7 @@ export async function claimPendingSessionHeads(
   sourceId: string,
   limit: number,
   now: Date,
+  sessionIds?: string[],
 ): Promise<DurableSessionHead[]> {
   await engine.executeRaw(
     `UPDATE context_mirror_session_heads
@@ -420,6 +451,11 @@ export async function claimPendingSessionHeads(
       WHERE source_id = $1 AND state = 'claimed' AND lease_expires_at < $2::timestamptz`,
     [sourceId, now.toISOString()],
   );
+  const selector = sessionIds && sessionIds.length > 0
+    ? ' AND session_id = ANY($3::text[])'
+    : '';
+  const params: unknown[] = [sourceId, limit];
+  if (selector) params.push(sessionIds);
   const candidates = await engine.executeRaw<{
     session_id: string;
     session_slug: string;
@@ -432,10 +468,10 @@ export async function claimPendingSessionHeads(
     `SELECT session_id, session_slug, capture_slug_prefix, turn_count,
             newest_capture_at, current_eligible_at, current_generation
        FROM context_mirror_session_heads
-      WHERE source_id = $1 AND state = 'pending' AND current_eligible_at IS NOT NULL
+      WHERE source_id = $1 AND state = 'pending' AND current_eligible_at IS NOT NULL${selector}
       ORDER BY current_eligible_at ASC, session_id ASC
       LIMIT $2`,
-    [sourceId, limit],
+    params,
   );
   const claimed: DurableSessionHead[] = [];
   for (const candidate of candidates) {
@@ -607,14 +643,63 @@ export async function markProviderCallFailed(
   engine: BrainEngine,
   correlationId: string,
   errorClass: string,
-  errorMessage: string,
+  _errorMessage: string,
 ): Promise<void> {
+  const safeClass = normalizeProviderErrorClass(errorClass);
   await engine.executeRaw(
     `UPDATE context_mirror_provider_calls
         SET state = 'failed', error_class = $2, error_message = $3, updated_at = now()
       WHERE correlation_id = $1 AND state IN ('prepared','inflight')`,
-    [correlationId, errorClass, errorMessage.slice(0, 500)],
+    [correlationId, safeClass, 'provider failure details omitted; reconcile by correlation_id'],
   );
+}
+
+const PROVIDER_ERROR_CLASSES = new Set([
+  'config',
+  'transient',
+  'budget',
+  'content',
+  'validation',
+  'unknown',
+]);
+
+function normalizeProviderErrorClass(errorClass: string): string {
+  return PROVIDER_ERROR_CLASSES.has(errorClass) ? errorClass : 'unknown';
+}
+
+/** A provider request left this process without a definitive response after the
+ * send boundary. It may have been accepted or billed, so it is never safe to
+ * replay automatically. Persist both the call and session stop state in one
+ * transaction so a later poll cannot reclaim the session. */
+export async function markProviderCallAmbiguous(
+  engine: BrainEngine,
+  args: { correlationId: string; sourceId: string; sessionId: string; generation: number; errorClass: string; errorMessage: string },
+): Promise<void> {
+  const safeClass = normalizeProviderErrorClass(args.errorClass);
+  await engine.transaction(async (tx) => {
+    const updated = await tx.executeRaw<{ one: number }>(
+      `UPDATE context_mirror_provider_calls
+          SET state = 'ambiguous_provider_outcome', error_class = $2,
+              error_message = $3, updated_at = now()
+        WHERE correlation_id = $1 AND state = 'inflight'
+        RETURNING 1 AS one`,
+      [
+        args.correlationId,
+        safeClass,
+        'provider outcome ambiguous; details omitted; reconcile by correlation_id',
+      ],
+    );
+    if (!updated[0]) {
+      throw new Error('provider call is no longer inflight; ambiguous outcome was not recorded');
+    }
+    await tx.executeRaw(
+      `UPDATE context_mirror_session_heads
+          SET state = 'ambiguous', disposition = 'ambiguous_provider_outcome',
+              claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND current_generation = $3`,
+      [args.sourceId, args.sessionId, args.generation],
+    );
+  });
 }
 
 export async function finishSession(
@@ -787,6 +872,222 @@ export async function markContextGenerationQuarantined(
       WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
     [sourceId, sessionId, generation],
   );
+}
+
+/** Restore the immediately prior verified generation while preserving all raw,
+ * distilled, provider, candidate, and decision evidence. This is deliberately
+ * narrower than a generic generation switch: only a current human-review-only
+ * correction may roll back, and accepted/promoted or ambiguous provider work
+ * blocks the operation. */
+export async function rollbackContextGeneration(
+  engine: BrainEngine,
+  input: {
+    sourceId: string;
+    sessionId: string;
+    generation: number;
+    rollbackGeneration: number;
+    actor?: string;
+    reason?: string;
+  },
+): Promise<ContextGenerationRollbackReport> {
+  if (!Number.isInteger(input.generation) || input.generation <= 1) {
+    throw new Error('rollback generation must be greater than one');
+  }
+  if (!Number.isInteger(input.rollbackGeneration)
+      || input.rollbackGeneration !== input.generation - 1) {
+    throw new Error('rollback target must be the immediately prior generation');
+  }
+  const actor = (input.actor ?? 'system').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120) || 'system';
+  const reason = (input.reason ?? 'legacy_operator_request').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240);
+  if (!reason) throw new Error('generation rollback requires a reason');
+  return await engine.transaction(async (tx) => {
+    await tx.executeRaw(`SELECT id FROM sources WHERE id = $1 FOR UPDATE`, [input.sourceId]);
+    const heads = await tx.executeRaw<{ current_generation: number | string }>(
+      `SELECT current_generation FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2 FOR UPDATE`,
+      [input.sourceId, input.sessionId],
+    );
+    if (!heads[0]) {
+      throw new Error('rollback source generation is not the current session head');
+    }
+    if (Number(heads[0].current_generation) === input.rollbackGeneration) {
+      const prior = await tx.executeRaw<{
+        state: string;
+        rollback_actor: string | null;
+        rollback_reason: string | null;
+        rollback_rejected_candidates: number | string | null;
+        rolled_back_at: Date | string | null;
+      }>(
+        `SELECT state, rollback_actor, rollback_reason, rollback_rejected_candidates, rolled_back_at
+           FROM context_mirror_generations
+          WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+        [input.sourceId, input.sessionId, input.generation],
+      );
+      const already = prior[0];
+      if (already?.state === 'superseded'
+          && already.rollback_actor === actor
+          && already.rollback_reason === reason
+          && already.rolled_back_at) {
+        const rolledBackAt = new Date(already.rolled_back_at).toISOString();
+        return {
+          status: 'already_rolled_back',
+          source_id: input.sourceId,
+          session_id: input.sessionId,
+          generation: input.generation,
+          rollback_generation: input.rollbackGeneration,
+          rejected_candidates: Number(already.rollback_rejected_candidates ?? 0),
+          actor,
+          reason,
+          rolled_back_at: rolledBackAt,
+          verification: {
+            current_generation: input.rollbackGeneration,
+            rolled_back_generation_state: 'superseded',
+            restored_generation_state: 'complete',
+          },
+        };
+      }
+      throw new Error('rollback source generation is not the current session head');
+    }
+    if (Number(heads[0].current_generation) !== input.generation) {
+      throw new Error('rollback source generation is not the current session head');
+    }
+    const generations = await tx.executeRaw<{
+      generation: number | string;
+      state: string;
+      is_current: boolean;
+      requires_human_review: boolean;
+    }>(
+      `SELECT generation,state,is_current,requires_human_review
+         FROM context_mirror_generations
+        WHERE source_id = $1 AND session_id = $2 AND generation IN ($3,$4)
+        ORDER BY generation FOR UPDATE`,
+      [input.sourceId, input.sessionId, input.rollbackGeneration, input.generation],
+    );
+    const previous = generations.find((row) => Number(row.generation) === input.rollbackGeneration);
+    const current = generations.find((row) => Number(row.generation) === input.generation);
+    if (!previous || !current || !current.is_current) {
+      throw new Error('rollback generations are missing or current pointer is inconsistent');
+    }
+    if (!current.requires_human_review) {
+      throw new Error('ordinary generation rollback is forbidden');
+    }
+    if (!['complete', 'quarantined', 'building'].includes(current.state)) {
+      throw new Error(`generation state ${current.state} cannot be rolled back safely`);
+    }
+    if (!['complete', 'superseded'].includes(previous.state)) {
+      throw new Error('rollback target is not a previously completed generation');
+    }
+    const [unsafeProvider] = await tx.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_provider_calls
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3
+          AND state IN ('prepared','inflight','ambiguous_provider_outcome')`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    if (Number(unsafeProvider?.count ?? 0) > 0) {
+      throw new Error('generation has ambiguous or in-flight provider work');
+    }
+    const [unsafeCandidate] = await tx.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM connector_candidates
+        WHERE source_id = $1 AND context_session_id = $2 AND context_generation = $3
+          AND (status = 'accepted' OR promotion_status IS NOT NULL)`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    if (Number(unsafeCandidate?.count ?? 0) > 0) {
+      throw new Error('generation has accepted or promoted candidate evidence');
+    }
+    await tx.executeRaw(
+      `UPDATE context_mirror_generations
+          SET is_current = false, state = 'superseded',
+              superseded_at = COALESCE(superseded_at, now()), updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    await tx.executeRaw(
+      `UPDATE context_mirror_generations
+          SET is_current = true, state = 'complete', updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3`,
+      [input.sourceId, input.sessionId, input.rollbackGeneration],
+    );
+    await tx.executeRaw(
+      `UPDATE context_mirror_partitions
+          SET state = 'superseded', claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3
+          AND state <> 'superseded'`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    const rejected = await tx.executeRaw<{ one: number }>(
+      `UPDATE connector_candidates
+          SET status = 'rejected', status_reason = 'historical_generation_rolled_back',
+              acted_by = COALESCE(acted_by, $4), acted_at = COALESCE(acted_at, now())
+        WHERE source_id = $1 AND context_session_id = $2 AND context_generation = $3
+          AND status IN ('pending','needs_review','awaiting_review_capacity')
+        RETURNING 1 AS one`,
+      [input.sourceId, input.sessionId, input.generation, actor],
+    );
+    const audit = await tx.executeRaw<{ rolled_back_at: Date | string }>(
+      `UPDATE context_mirror_generations
+          SET rollback_actor = $4, rollback_reason = $5,
+              rollback_rejected_candidates = $6, rolled_back_at = now(), updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3
+        RETURNING rolled_back_at`,
+      [input.sourceId, input.sessionId, input.generation, actor, reason, rejected.length],
+    );
+    await tx.executeRaw(
+      `UPDATE context_mirror_review_reservations
+          SET state = 'released', updated_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = $3 AND state = 'active'`,
+      [input.sourceId, input.sessionId, input.generation],
+    );
+    await tx.executeRaw(
+      `UPDATE context_mirror_session_heads
+          SET current_generation = $3, state = 'complete', disposition = 'generation_rollback',
+              claim_id = NULL, lease_expires_at = NULL, updated_at = now()
+        WHERE source_id = $1 AND session_id = $2`,
+      [input.sourceId, input.sessionId, input.rollbackGeneration],
+    );
+    const verified = await tx.executeRaw<{
+      current_generation: number | string;
+      rolled_back_state: string;
+      restored_state: string;
+    }>(
+      `SELECT h.current_generation,
+              rolled.state AS rolled_back_state,
+              restored.state AS restored_state
+         FROM context_mirror_session_heads h
+         JOIN context_mirror_generations rolled
+           ON rolled.source_id = h.source_id AND rolled.session_id = h.session_id
+          AND rolled.generation = $3
+         JOIN context_mirror_generations restored
+           ON restored.source_id = h.source_id AND restored.session_id = h.session_id
+          AND restored.generation = $4
+        WHERE h.source_id = $1 AND h.session_id = $2`,
+      [input.sourceId, input.sessionId, input.generation, input.rollbackGeneration],
+    );
+    const proof = verified[0];
+    if (!proof
+        || Number(proof.current_generation) !== input.rollbackGeneration
+        || proof.rolled_back_state !== 'superseded'
+        || proof.restored_state !== 'complete'
+        || !audit[0]?.rolled_back_at) {
+      throw new Error('generation rollback durable verification failed');
+    }
+    return {
+      status: 'rolled_back',
+      source_id: input.sourceId,
+      session_id: input.sessionId,
+      generation: input.generation,
+      rollback_generation: input.rollbackGeneration,
+      rejected_candidates: rejected.length,
+      actor,
+      reason,
+      rolled_back_at: new Date(audit[0].rolled_back_at).toISOString(),
+      verification: {
+        current_generation: Number(proof.current_generation),
+        rolled_back_generation_state: 'superseded',
+        restored_generation_state: 'complete',
+      },
+    };
+  });
 }
 
 /** Source-serialized capacity reservation. Provider work may start only after
@@ -1048,6 +1349,7 @@ export async function claimContextPartitions(
   sourceId: string,
   limit: number,
   now: Date,
+  selector?: { sessionId: string; generation: number },
 ): Promise<ClaimedContextPartition[]> {
   await engine.executeRaw(
     `UPDATE context_mirror_partitions
@@ -1055,6 +1357,11 @@ export async function claimContextPartitions(
       WHERE source_id = $1 AND state = 'claimed' AND lease_expires_at < $2::timestamptz`,
     [sourceId, now.toISOString()],
   );
+  const selectorSql = selector
+    ? ' AND p.session_id = $3 AND p.generation = $4'
+    : '';
+  const params: unknown[] = [sourceId, limit];
+  if (selector) params.push(selector.sessionId, selector.generation);
   const candidates = await engine.executeRaw<{
     session_id: string; generation: number | string; partition_key: string;
     distilled_slug: string; content_hash: string; requires_human_review: boolean;
@@ -1066,9 +1373,10 @@ export async function claimContextPartitions(
          ON g.source_id = p.source_id AND g.session_id = p.session_id AND g.generation = p.generation
       WHERE p.source_id = $1 AND p.state IN ('pending','failed')
         AND g.is_current AND g.state = 'complete'
+        ${selectorSql}
       ORDER BY g.completed_at ASC, p.session_id ASC, p.generation ASC, p.partition_key ASC
       LIMIT $2`,
-    [sourceId, limit],
+    params,
   );
   const claimed: ClaimedContextPartition[] = [];
   for (const candidate of candidates) {

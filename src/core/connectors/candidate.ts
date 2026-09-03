@@ -998,17 +998,21 @@ export async function retryCandidatePromotion(
   engine: BrainEngine,
   id: number,
   actor: string,
+  expectedSourceId?: string,
+  reason = 'operator_retry',
 ): Promise<ApproveResult> {
   const [current] = await engine.executeRaw<ConnectorCandidateRow>(
-    `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates WHERE id = $1 AND status = 'accepted'`,
-    [id],
+    `SELECT ${CANDIDATE_COLUMNS} FROM connector_candidates
+      WHERE id = $1 AND status = 'accepted'
+        AND ($2::text IS NULL OR source_id = $2)`,
+    [id, expectedSourceId ?? null],
   );
   if (!current) return { row: null, promotion: { invoked: false } };
   const row = coerceCandidateRow(current);
   const target = targetFromAcceptedCandidate(row);
   validatePromotionTarget(target);
   await assertPromotionRetryFresh(engine, row);
-  await preparePromotionRetry(engine, row.id);
+  await preparePromotionRetry(engine, row.id, { actor: strip(actor), reason: strip(reason) });
   const hook = getPromotionHook();
   if (!hook) {
     await recordPromotionDispatchBlocked(engine, row.id, 'dispatch_hook_unavailable');

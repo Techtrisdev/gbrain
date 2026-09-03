@@ -89,14 +89,24 @@ export interface PromotionArtifactTarget {
   base_compiled_hash?: string;
 }
 
-/** The minimized approval artifact — EXACTLY these 5 keys (Brain ARTIFACT_SCHEMA). */
-export interface PromotionArtifact {
+/** Legacy minimized approval artifact. The Brain dual-reader keeps accepting it
+ * while already-dispatched candidates drain. */
+export interface PromotionArtifactV1 {
   provider: string;
   source_id: string;
   source_record_id: string;
   redaction_attestation: string;
   target: PromotionArtifactTarget;
 }
+
+/** Generation-aware artifact. The correlation remains the identity through
+ * Brain branch, PR, frontmatter, reindex proof, and callback acknowledgement. */
+export interface PromotionArtifactV2 extends PromotionArtifactV1 {
+  schema_version: 2;
+  correlation_id: string;
+}
+
+export type PromotionArtifact = PromotionArtifactV1 | PromotionArtifactV2;
 
 /** The redaction attestation string stamped on every artifact. */
 export const REDACTION_ATTESTATION = 'redact.ts:v1 strip() applied; no secrets/PII detected';
@@ -132,11 +142,19 @@ export const PROMOTION_EVENT_TYPE = 'connector-promotion';
  * source_record_id). Pure; no I/O.
  */
 export function buildPromotionArtifact(
-  row: Pick<ConnectorCandidateRow, 'provider' | 'source_id' | 'source_record_id' | 'proposed_markdown'>,
+  row: Pick<ConnectorCandidateRow, 'provider' | 'source_id' | 'source_record_id' | 'proposed_markdown'>
+    & Partial<Pick<ConnectorCandidateRow, 'id' | 'context_generation'>>,
   target: PromotionTarget,
 ): PromotionArtifact {
   const isUpdate = target.kind === 'update_page';
+  const candidateId = Number(row.id);
+  const generation = Number(row.context_generation);
+  const generationAware = Number.isSafeInteger(candidateId) && candidateId > 0
+    && Number.isSafeInteger(generation) && generation > 0;
   return {
+    ...(generationAware
+      ? { schema_version: 2 as const, correlation_id: `cm-promo-v2-c${candidateId}-g${generation}` }
+      : {}),
     provider: row.provider ?? '',
     source_id: row.source_id,
     source_record_id: row.source_record_id,
@@ -212,10 +230,61 @@ export function artifactHash(canonical: string): string {
 // ── Emit (repository_dispatch) ──────────────────────────────────────────────────────
 
 /** Minimal fetch shape so tests inject a fake (no real network). Mirrors global fetch. */
+type GitHubFetchResponse = { ok: boolean; status: number; text: () => Promise<string> };
+
 export type FetchFn = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
-) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+  init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal },
+) => Promise<GitHubFetchResponse>;
+
+/** Every GitHub API request is bounded so a stuck socket cannot strand a promotion attempt. */
+const PROMOTION_GITHUB_REQUEST_TIMEOUT_MS = 15_000;
+
+function githubRequestTimeoutMs(override: number | undefined): number {
+  const timeoutMs = override ?? PROMOTION_GITHUB_REQUEST_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('promotion GitHub request timeout must be a positive integer');
+  }
+  return timeoutMs;
+}
+
+async function fetchGitHubWithTimeout<
+  TInit extends {
+    method: string;
+    headers: Record<string, string>;
+    signal?: AbortSignal;
+  },
+>(
+  doFetch: (url: string, init: TInit) => Promise<GitHubFetchResponse>,
+  url: string,
+  init: Omit<TInit, 'signal'>,
+  timeoutMs: number,
+): Promise<GitHubFetchResponse> {
+  const controller = new AbortController();
+  const timeoutError = new Error(`promotion GitHub request timeout after ${timeoutMs}ms`);
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      doFetch(url, { ...init, signal: controller.signal } as TInit),
+      timeout,
+    ]);
+  } catch (error) {
+    // Fetch implementations vary in the AbortError they surface. Keep the durable
+    // failure taxonomy stable whenever our own deadline fired.
+    if (timedOut) throw timeoutError;
+    throw error;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 export interface EmitDispatchOpts {
   /** The canonical artifact STRING (opaque — not re-serialized). */
@@ -228,6 +297,8 @@ export interface EmitDispatchOpts {
   repo?: string;
   /** Injected fetch (tests pass a fake; production uses global fetch). */
   fetchFn?: FetchFn;
+  /** Per-request deadline override (tests). Production defaults to 15 seconds. */
+  timeoutMs?: number;
 }
 
 export interface EmitDispatchResult {
@@ -260,7 +331,7 @@ export async function emitRepositoryDispatch(opts: EmitDispatchOpts): Promise<Em
     },
   });
 
-  const res = await doFetch(url, {
+  const res = await fetchGitHubWithTimeout(doFetch, url, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${opts.githubToken}`,
@@ -270,7 +341,7 @@ export async function emitRepositoryDispatch(opts: EmitDispatchOpts): Promise<Em
       'user-agent': 'gbrain-connector-promotion',
     },
     body,
-  });
+  }, githubRequestTimeoutMs(opts.timeoutMs));
 
   if (!res.ok) {
     // The response body MAY echo nothing sensitive, but to be safe we do not include the
@@ -299,8 +370,8 @@ export const PROMOTION_INSTALLATION_ID_ENV = 'GBRAIN_PROMOTE_GITHUB_INSTALLATION
 /** Injectable fetch for App-auth HTTP (GET resolve; POST exchange carries a scoped JSON body). Tests pass a fake. */
 export type AppAuthFetch = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body?: string },
-) => Promise<{ ok: boolean; status: number; text: () => Promise<string> }>;
+  init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
+) => Promise<GitHubFetchResponse>;
 
 interface CachedInstallToken {
   token: string;
@@ -318,6 +389,8 @@ export interface DispatchTokenDeps {
   fetchImpl?: AppAuthFetch;
   /** Clock (tests inject). Defaults to Date.now. */
   now?: () => number;
+  /** Per-request deadline override (tests). Production defaults to 15 seconds. */
+  timeoutMs?: number;
 }
 
 const appAuthHeaders = (appJwt: string): Record<string, string> => ({
@@ -338,13 +411,14 @@ async function resolveInstallationId(
   appJwt: string,
   doFetch: AppAuthFetch,
   getEnv: (key: string) => string | undefined,
+  timeoutMs: number,
 ): Promise<string> {
   const override = getEnv(PROMOTION_INSTALLATION_ID_ENV);
   if (override && override.trim()) return override.trim();
-  const res = await doFetch(`https://api.github.com/repos/${repo}/installation`, {
+  const res = await fetchGitHubWithTimeout(doFetch, `https://api.github.com/repos/${repo}/installation`, {
     method: 'GET',
     headers: appAuthHeaders(appJwt),
-  });
+  }, timeoutMs);
   if (!res.ok) {
     throw new Error(`resolve App installation for ${repo} failed: status=${res.status} (is the App installed with contents:write?)`);
   }
@@ -366,6 +440,7 @@ export async function getPromotionDispatchToken(
   const getEnv = deps.getEnv ?? ((key: string) => process.env[key]);
   const doFetch = deps.fetchImpl ?? (globalThis.fetch as unknown as AppAuthFetch);
   const nowMs = deps.now ?? (() => Date.now());
+  const timeoutMs = githubRequestTimeoutMs(deps.timeoutMs);
 
   // Cache check first (keyed by repo) — a hit skips the JWT mint + both App-auth HTTP calls.
   const cached = promotionInstallTokenCache.get(repo);
@@ -377,7 +452,7 @@ export async function getPromotionDispatchToken(
   if (!appId) throw new Error(`${PROMOTION_APP_ID_ENV} is not set (GitHub App id)`);
 
   const appJwt = mintAppJwt(privateKey, appId);
-  const installationId = await resolveInstallationId(repo, appJwt, doFetch, getEnv);
+  const installationId = await resolveInstallationId(repo, appJwt, doFetch, getEnv, timeoutMs);
 
   // Scope the installation token to JUST the target repo + the minimum permission needed.
   // repository_dispatch (POST /repos/{owner}/{repo}/dispatches) requires Contents: write per
@@ -390,13 +465,15 @@ export async function getPromotionDispatchToken(
     repositories: [repoName],
     permissions: { contents: 'write' },
   });
-  const res = await doFetch(
+  const res = await fetchGitHubWithTimeout(
+    doFetch,
     `https://api.github.com/app/installations/${encodeURIComponent(installationId)}/access_tokens`,
     {
       method: 'POST',
       headers: { ...appAuthHeaders(appJwt), 'content-type': 'application/json' },
       body: tokenRequestBody,
     },
+    timeoutMs,
   );
   if (!res.ok) throw new Error(`App installation token exchange failed: status=${res.status}`);
   const json = JSON.parse(await res.text()) as { token?: string; expires_at?: string };
@@ -559,16 +636,24 @@ export type PromotionCallbackV2Status =
   | 'indexing_failed'
   | 'indexed';
 
-export interface PromotionCallbackBodyV2 {
+interface PromotionCallbackBodyV2Base {
   schema_version: 2;
   correlation_id: string;
-  status: PromotionCallbackV2Status;
   branch?: string;
   pr_url?: string;
   merge_sha?: string;
   workflow_run_id?: string;
   failure_code?: string;
 }
+
+/** V2 callbacks carry the durable evidence required by their lifecycle stage. */
+export type PromotionCallbackBodyV2 = PromotionCallbackBodyV2Base & (
+  | { status: 'opened'; branch: string; pr_url: string; failure_code?: never }
+  | { status: 'dispatch_failed'; failure_code: string }
+  | { status: 'merged'; merge_sha: string; workflow_run_id: string; failure_code?: never }
+  | { status: 'indexing_failed'; merge_sha: string; workflow_run_id: string; failure_code: string }
+  | { status: 'indexed'; merge_sha: string; workflow_run_id: string; failure_code?: never }
+);
 
 const PROMOTION_CALLBACK_V2_KEYS = new Set([
   'schema_version', 'correlation_id', 'status', 'branch', 'pr_url',
@@ -585,6 +670,7 @@ const CALLBACK_FAILURE_CODES = new Set([
   'pr_creation_failed',
   'reindex_workflow_failed',
   'indexed_callback_failed',
+  'retrieval_proof_failed',
 ]);
 
 /** Discriminated result the Express wrapper maps to an HTTP response. */
@@ -641,6 +727,11 @@ function parsePromotionCallbackBodyV2(parsed: unknown): PromotionCallbackBodyV2 
   if (!optionalBoundedString(obj.workflow_run_id, 64) || !optionalBoundedString(obj.failure_code, 80)) return null;
   if (obj.merge_sha !== undefined && (typeof obj.merge_sha !== 'string' || !/^[0-9a-f]{40}$/.test(obj.merge_sha))) return null;
   if (obj.failure_code !== undefined && !CALLBACK_FAILURE_CODES.has(obj.failure_code as string)) return null;
+  if (obj.status === 'opened' && (obj.branch === undefined || obj.pr_url === undefined)) return null;
+  if (
+    (obj.status === 'merged' || obj.status === 'indexing_failed' || obj.status === 'indexed')
+    && (obj.merge_sha === undefined || obj.workflow_run_id === undefined)
+  ) return null;
   if ((obj.status === 'dispatch_failed' || obj.status === 'indexing_failed') && obj.failure_code === undefined) return null;
   if ((obj.status === 'opened' || obj.status === 'merged' || obj.status === 'indexed') && obj.failure_code !== undefined) return null;
   return obj as unknown as PromotionCallbackBodyV2;

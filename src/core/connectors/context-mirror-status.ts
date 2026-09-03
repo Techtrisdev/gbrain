@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../engine.ts';
-import { VERSION, BUILD_SHA } from '../../version.ts';
+import { VERSION, BUILD_SHA, HOST_BUILD_SHA } from '../../version.ts';
 import {
+  parseJsonObject,
   readContextMirrorRecoveryHold,
   reviewCapacitySnapshot,
 } from './context-mirror-state.ts';
@@ -17,7 +18,7 @@ export interface ContextMirrorStatusV1 {
   schema_version: 1;
   generated_at: string;
   source_id: string;
-  build: { version: string; sha: string };
+  build: { version: string; sha: string; host_sha: string };
   overall: {
     state: ContextMirrorPipelineState;
     reason_codes: string[];
@@ -153,22 +154,6 @@ export interface ContextMirrorStatusV1 {
 
 type JsonObject = Record<string, unknown>;
 
-function objectValue(value: unknown): JsonObject {
-  if (typeof value === 'string') {
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      return parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)
-        ? parsed as JsonObject
-        : {};
-    } catch {
-      return {};
-    }
-  }
-  return value != null && typeof value === 'object' && !Array.isArray(value)
-    ? value as JsonObject
-    : {};
-}
-
 function numberValue(value: unknown): number {
   const result = Number(value ?? 0);
   return Number.isFinite(result) ? result : 0;
@@ -219,14 +204,14 @@ function latestIso(values: Array<string | null>): string | null {
 }
 
 function parseCheckpointCursor(value: unknown): { updated_at?: string } {
-  const parsed = objectValue(value);
+  const parsed = parseJsonObject(value);
   return typeof parsed.updated_at === 'string' ? { updated_at: parsed.updated_at } : {};
 }
 
 function configFor(sourceConfig: unknown): JsonObject {
-  const root = objectValue(sourceConfig);
-  const connectors = objectValue(root.connectors);
-  return objectValue(connectors.context_mirror);
+  const root = parseJsonObject(sourceConfig);
+  const connectors = parseJsonObject(root.connectors);
+  return parseJsonObject(connectors.context_mirror);
 }
 
 function classifyOverall(input: {
@@ -242,14 +227,19 @@ function classifyOverall(input: {
   circuitOpen: boolean;
   failedRunWithBacklog: boolean;
   manifestGap: number;
+  decisionMissing: number;
   partitionPending: number;
   partitionFailed: number;
   partitionOver24h: number;
   unverifiedLegacy: number;
   reviewAgeExceeded: boolean;
   reviewCapacityBlocked: boolean;
+  reviewQueueOverLimit: boolean;
+  reviewServiceMargin: ContextMirrorStatusV1['review']['service_window']['margin_state'];
+  freshArrivals: number;
   recoveryHold: boolean;
   promotionIndexingFailed: number;
+  promotionDispatchFailed: number;
   promotionTransitionMissing: number;
   promotionUnresolvedLegacy: number;
   promotionDispatchFrozenWithWork: boolean;
@@ -263,6 +253,8 @@ function classifyOverall(input: {
   if (input.retryableOver24h > 0 || input.partitionOver24h > 0) broken.push('retryable_work_over_24h');
   if (input.partitionFailed > 0) broken.push('consolidation_partition_failed');
   if (input.manifestGap > 0) broken.push('generation_manifest_gap');
+  if (input.decisionMissing > 0) broken.push('consolidation_decision_missing');
+  if (input.promotionDispatchFailed > 0) broken.push('promotion_dispatch_failed');
   if (input.promotionIndexingFailed > 0) broken.push('promotion_indexing_failed');
   if (input.promotionTransitionMissing > 0) broken.push('promotion_transition_missing');
   if (broken.length > 0) {
@@ -272,6 +264,8 @@ function classifyOverall(input: {
         ? 'restore_provider_access_after_safety_gates'
         : broken.includes('generation_manifest_gap')
           ? 'repair_generation_manifest_before_retry'
+          : broken.includes('promotion_dispatch_failed')
+            ? 'reconcile_or_retry_failed_promotion_dispatch'
           : 'run_bounded_recovery_and_recheck_status';
     return { state: 'broken', reason_codes: broken, next_action: next };
   }
@@ -283,6 +277,11 @@ function classifyOverall(input: {
   if (input.unverifiedLegacy > 0) degraded.push('unverified_legacy_evidence');
   if (input.reviewAgeExceeded) degraded.push('review_queue_age_exceeded');
   if (input.reviewCapacityBlocked) degraded.push('review_capacity_blocked');
+  if (input.reviewQueueOverLimit) degraded.push('review_queue_over_limit');
+  if (input.reviewServiceMargin === 'insufficient') degraded.push('review_service_margin_insufficient');
+  if (input.reviewServiceMargin === 'insufficient_history' && input.freshArrivals > 0) {
+    degraded.push('review_service_history_insufficient');
+  }
   if (input.promotionUnresolvedLegacy > 0) degraded.push('unresolved_legacy_promotion');
   if (input.promotionDispatchFrozenWithWork) degraded.push('promotion_dispatch_frozen_with_work');
   if (!input.enabled && (input.raw > 0 || input.eligible > 0 || input.partitionPending > 0)) {
@@ -590,7 +589,7 @@ async function readContextMirrorStatus(
       ? 'idle'
       : observedDays < 14
         ? 'insufficient_history'
-        : serviceRate != null && freshRate != null && serviceRate > freshRate * 1.2
+        : serviceRate != null && freshRate != null && serviceRate >= freshRate * 1.2
           ? 'sufficient'
           : 'insufficient';
 
@@ -598,6 +597,8 @@ async function readContextMirrorStatus(
   const partitionPending = numberValue(partitions.pending) + numberValue(partitions.claimed);
   const reviewCapacityBlocked = eligiblePending > 0 &&
     (review.pendingLimit + review.stagingLimit <= review.humanPending + review.staged + review.reservedSlots);
+  const reviewQueueOverLimit = review.humanPending > review.pendingLimit ||
+    review.staged > review.stagingLimit || review.stagedBytes > review.stagingBytesLimit;
   const overall = classifyOverall({
     hasConfig,
     enabled: connectorEnabled,
@@ -611,14 +612,19 @@ async function readContextMirrorStatus(
     circuitOpen: circuit?.state === 'open',
     failedRunWithBacklog: lastRun?.status === 'failed' && eligiblePending > 0,
     manifestGap: numberValue(generations.manifest_gap),
+    decisionMissing: numberValue(partitions.decision_missing),
     partitionPending,
     partitionFailed: numberValue(partitions.failed),
     partitionOver24h: numberValue(partitions.retryable_over_24h),
     unverifiedLegacy: numberValue(generations.unverified_legacy),
     reviewAgeExceeded: review.humanAgeExceeded || review.stagingAgeExceeded,
     reviewCapacityBlocked,
+    reviewQueueOverLimit,
+    reviewServiceMargin: marginState,
+    freshArrivals,
     recoveryHold: recovery.active,
     promotionIndexingFailed: numberValue(promotions.indexing_failed),
+    promotionDispatchFailed: numberValue(promotions.dispatch_failed),
     promotionTransitionMissing: numberValue(candidates.promotion_transition_missing),
     promotionUnresolvedLegacy: numberValue(promotions.unresolved_legacy),
     promotionDispatchFrozenWithWork: dispatchFrozen && (
@@ -648,7 +654,7 @@ async function readContextMirrorStatus(
     schema_version: 1,
     generated_at: now.toISOString(),
     source_id: sourceId,
-    build: { version: VERSION, sha: BUILD_SHA },
+    build: { version: VERSION, sha: BUILD_SHA, host_sha: HOST_BUILD_SHA },
     overall,
     configuration: {
       connector_enabled: connectorEnabled,

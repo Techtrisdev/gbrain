@@ -45,6 +45,10 @@ import {
   type FetchFn,
 } from '../src/core/connectors/promotion.ts';
 import { makePromotionHook } from '../src/core/connectors/promotion-hook.ts';
+import {
+  applyPromotionCallbackTransition,
+  readPromotionTransitionByCandidate,
+} from '../src/core/connectors/promotion-state.ts';
 import { compiledTruthHash } from '../src/core/connectors/consolidate.ts';
 
 let engine: PGLiteEngine;
@@ -272,6 +276,24 @@ describe('emitRepositoryDispatch: payload + injected fetch', () => {
       emitRepositoryDispatch({ canonical: '{}', signature: 'aa', githubToken: TOKEN, fetchFn }),
     ).rejects.toThrow(/status=403/);
   });
+
+  test('a hung repository_dispatch is aborted at the finite request deadline', async () => {
+    let signal: AbortSignal | undefined;
+    const fetchFn: FetchFn = async (_url, init) => {
+      signal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    };
+    await expect(emitRepositoryDispatch({
+      canonical: '{}',
+      signature: 'aa',
+      githubToken: TOKEN,
+      fetchFn,
+      timeoutMs: 10,
+    })).rejects.toThrow(/GitHub request timeout/);
+    expect(signal?.aborted).toBe(true);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -344,6 +366,82 @@ describe('approveCandidate + promotion hook (end-to-end, injected fetch)', () =>
     expect(after.promotion_status).toBe('failed');
     expect(after.state).toBe('dispatch_failed');
     expect(Number(after.attempt_count)).toBe(1);
+  });
+
+  test('dispatch timeout is explicit and requires reconciliation before retry', async () => {
+    const hanging: FetchFn = async (_url, init) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+    registerPromotionHook(makePromotionHook({
+      ...deps(hanging),
+      githubRequestTimeoutMs: 10,
+    }));
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'ap-timeout',
+      provider: 'crunchbase',
+      proposed_markdown: '# Timeout',
+    });
+
+    const res = await approveCandidate(engine, row.id, 'admin', INBOX);
+
+    expect(res.row?.status).toBe('accepted');
+    expect(res.promotion.pending).toBe(true);
+    const [after] = await engine.executeRaw<{
+      state: string;
+      failure_code: string;
+      next_action: string;
+    }>(
+      `SELECT state, failure_code, next_action
+         FROM connector_promotion_transitions WHERE candidate_id = $1`,
+      [row.id],
+    );
+    expect(after).toEqual({
+      state: 'dispatch_failed',
+      failure_code: 'dispatch_outcome_unknown',
+      next_action: 'reconcile_dispatch',
+    });
+  });
+
+  test('a late dispatch error cannot regress a callback-advanced transition', async () => {
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'ap-callback-race',
+      provider: 'crunchbase',
+      proposed_markdown: '# Callback race',
+    });
+    const lateFailure: FetchFn = async () => {
+      const transition = await readPromotionTransitionByCandidate(engine, row.id);
+      expect(transition).not.toBeNull();
+      await applyPromotionCallbackTransition(
+        engine,
+        transition!.correlation_id,
+        'pr_opened',
+        { branch: 'promote/callback-race', prUrl: 'https://github.com/Techtrisdev/techtris-brain/pull/42' },
+      );
+      throw new Error('network connection failed after callback');
+    };
+    registerPromotionHook(makePromotionHook(deps(lateFailure)));
+
+    const res = await approveCandidate(engine, row.id, 'admin', INBOX);
+
+    expect(res.promotion.pending).toBe(true);
+    const transition = await readPromotionTransitionByCandidate(engine, row.id);
+    expect(transition?.state).toBe('pr_opened');
+    expect(transition?.failure_code).toBeNull();
+    expect(transition?.pr_url).toContain('/pull/42');
+    const [candidate] = await engine.executeRaw<{ promotion_status: string }>(
+      `SELECT promotion_status FROM connector_candidates WHERE id = $1`,
+      [row.id],
+    );
+    expect(candidate.promotion_status).toBe('pr_opened');
+    const [dispatchEvent] = await engine.executeRaw<{ outcome: string; resulting_state: string }>(
+      `SELECT outcome, resulting_state FROM connector_promotion_events
+        WHERE candidate_id = $1 AND event_type = 'dispatch'
+        ORDER BY id DESC LIMIT 1`,
+      [row.id],
+    );
+    expect(dispatchEvent).toEqual({ outcome: 'stale', resulting_state: 'pr_opened' });
   });
 
   test('successful emit waits for a signed PR-opened callback', async () => {
@@ -748,6 +846,29 @@ describe('U4 approveCandidate: honor the stored consolidation UPDATE target (end
   });
 });
 
+describe('generation-aware promotion artifact', () => {
+  test('Context Mirror candidate carries one exact v2 correlation through the signed artifact', () => {
+    const artifact = buildPromotionArtifact(
+      { ...ROW, id: 42, context_generation: 3, provider: 'context_mirror' },
+      { kind: 'new_page', path: 'projects/context-mirror-proof.md' },
+    );
+    expect(Object.keys(artifact).sort()).toEqual([
+      'schema_version', 'correlation_id', 'provider', 'redaction_attestation',
+      'source_id', 'source_record_id', 'target',
+    ].sort());
+    expect('schema_version' in artifact && artifact.schema_version).toBe(2);
+    expect('correlation_id' in artifact && artifact.correlation_id).toBe('cm-promo-v2-c42-g3');
+    expect(canonicalizeArtifactForSigning(artifact)).toContain('cm-promo-v2-c42-g3');
+  });
+
+  test('legacy candidates remain byte-compatible until their in-flight work drains', () => {
+    const artifact = buildPromotionArtifact(ROW, INBOX);
+    expect('schema_version' in artifact).toBe(false);
+    expect('correlation_id' in artifact).toBe(false);
+    expect(Object.keys(artifact)).toHaveLength(5);
+  });
+});
+
 describe('durable promotion retry lifecycle', () => {
   afterEach(() => registerPromotionHook(null));
 
@@ -897,6 +1018,7 @@ describe('promotion lifecycle migration', () => {
       toRow(engine, { source_id: 'default', source_record_id: 'legacy-unknown', proposed_markdown: '# Unknown' }),
       toRow(engine, { source_id: 'default', source_record_id: 'legacy-opened', proposed_markdown: '# Opened' }),
       toRow(engine, { source_id: 'default', source_record_id: 'legacy-needs-fix', proposed_markdown: '# Needs fix' }),
+      toRow(engine, { source_id: 'default', source_record_id: 'legacy-indexed', proposed_markdown: '# Indexed' }),
     ]);
     await engine.executeRaw(
       `UPDATE connector_candidates
@@ -911,6 +1033,10 @@ describe('promotion lifecycle migration', () => {
     await engine.executeRaw(
       `UPDATE connector_candidates SET promotion_status = 'needs_fix', promoted_at = now() WHERE id = $1`,
       [seeds[2].row.id],
+    );
+    await engine.executeRaw(
+      `UPDATE connector_candidates SET promotion_status = 'indexed', promoted_at = now() WHERE id = $1`,
+      [seeds[3].row.id],
     );
     await engine.executeRaw('DELETE FROM connector_promotion_events');
     await engine.executeRaw('DELETE FROM connector_promotion_attempts');
@@ -929,6 +1055,7 @@ describe('promotion lifecycle migration', () => {
         ORDER BY c.source_record_id`,
     );
     expect(rows).toEqual([
+      { source_record_id: 'legacy-indexed', state: 'unresolved_legacy', failure_code: 'legacy_index_proof_unverified', next_action: 'resolve_legacy' },
       { source_record_id: 'legacy-needs-fix', state: 'unresolved_legacy', failure_code: 'legacy_stage_unresolved', next_action: 'resolve_legacy' },
       { source_record_id: 'legacy-opened', state: 'pr_opened', failure_code: null, next_action: 'await_merge' },
       { source_record_id: 'legacy-unknown', state: 'dispatch_failed', failure_code: 'legacy_dispatch_outcome_unknown', next_action: 'reconcile_dispatch' },
@@ -938,7 +1065,7 @@ describe('promotion lifecycle migration', () => {
          (SELECT count(*) FROM connector_promotion_events) AS events,
          (SELECT count(*) FROM connector_promotion_attempts) AS attempts`,
     );
-    expect(Number(counts.events)).toBe(3);
-    expect(Number(counts.attempts)).toBe(3);
+    expect(Number(counts.events)).toBe(4);
+    expect(Number(counts.attempts)).toBe(4);
   });
 });

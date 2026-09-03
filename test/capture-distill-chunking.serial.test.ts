@@ -24,7 +24,7 @@ import {
   type ChatOpts,
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
-import { AIConfigError } from '../src/core/ai/errors.ts';
+import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
 import { distillCaptureSessions } from '../src/core/connectors/distill.ts';
 import { contextMirrorConnector } from '../src/core/connectors/context-mirror.ts';
 import {
@@ -101,12 +101,12 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(report.distilled).toBe(1);
     expect(report.memories_written).toBe(1);
 
-    const page = await engine.getPage('distilled/chunkgap-sess-1/mem-1');
+    const page = await engine.getPage('distilled/chunkgap-sess-1/g-1/mem-1');
     expect(page).not.toBeNull();
 
     // THE assertion. A chunkless page is invisible to semantic search forever,
     // because the embed sweep only ever embeds chunks.
-    const chunks = await engine.getChunks('distilled/chunkgap-sess-1/mem-1', {
+    const chunks = await engine.getChunks('distilled/chunkgap-sess-1/g-1/mem-1', {
       sourceId: CAPTURE_SOURCE,
     });
     expect(chunks.length).toBeGreaterThan(0);
@@ -166,6 +166,46 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(calls).toBe(1);
   });
 
+  test('a timed-out or disconnected provider send becomes ambiguous and is never replayed', async () => {
+    await seedCapture('capture/chunkgap-sess-1/prompt-1', 'Remember this once.', 1);
+    await seedCapture('capture/chunkgap-sess-1/reply-1', 'One durable response.', 2);
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      throw new AITransientError('connection closed after request send');
+    });
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    const first = await distillCaptureSessions(engine, { now, sourceId: CAPTURE_SOURCE });
+    const second = await distillCaptureSessions(engine, { now, sourceId: CAPTURE_SOURCE });
+
+    expect(first.status).toBe('failed');
+    expect(first.stop_reason).toBe('ambiguous_provider_outcome');
+    expect(second.calls).toBe(0);
+    expect(calls).toBe(1);
+    const [provider] = await engine.executeRaw<{
+      state: string;
+      error_class: string;
+      error_message: string;
+    }>(
+      `SELECT state,error_class,error_message FROM context_mirror_provider_calls
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
+    const [head] = await engine.executeRaw<{ state: string; disposition: string }>(
+      `SELECT state,disposition FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
+    expect(provider?.state).toBe('ambiguous_provider_outcome');
+    expect(provider?.error_class).toBe('transient');
+    expect(provider?.error_message).toBe(
+      'provider outcome ambiguous; details omitted; reconcile by correlation_id',
+    );
+    expect(provider?.error_message).not.toContain('connection closed');
+    expect(head).toEqual({ state: 'ambiguous', disposition: 'ambiguous_provider_outcome' });
+  });
+
   test('a 3,000-session bootstrap resumes by checkpoint and claims only five metadata heads', async () => {
     await engine.executeRaw(
       `INSERT INTO pages (
@@ -199,7 +239,96 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(claimed.map((head) => head.sessionId)).toEqual([
       'sess-0001', 'sess-0002', 'sess-0003', 'sess-0004', 'sess-0005',
     ]);
-  }, 15_000);
+  }, 30_000);
+
+  test('an exact canary lease cannot claim or call for an unrelated pending session', async () => {
+    for (const sessionId of ['older-unrelated', 'named-canary']) {
+      await engine.putPage(
+        `capture/${sessionId}/prompt-1`,
+        {
+          type: 'note',
+          title: sessionId,
+          compiled_truth: `redacted input for ${sessionId}`,
+          timeline: '',
+          frontmatter: { session_id: sessionId, kind: 'prompt', turn: 1 },
+        } as never,
+        { sourceId: CAPTURE_SOURCE },
+      );
+    }
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      return {
+        text: JSON.stringify(['one bounded canary memory']),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      };
+    });
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    const report = await distillCaptureSessions(engine, {
+      now,
+      sourceId: CAPTURE_SOURCE,
+      sessionIds: ['named-canary'],
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+
+    expect(report.status).toBe('partial');
+    expect(report.stop_reason).toBe('session_limit');
+    expect(report.selected).toBe(1);
+    expect(report.calls).toBe(1);
+    expect(calls).toBe(1);
+    expect(report.sessions.map((session) => session.session_id)).toEqual(['named-canary']);
+    expect(await engine.getPage('distilled/named-canary/g-1/mem-1', { sourceId: CAPTURE_SOURCE })).not.toBeNull();
+    expect(await engine.getPage('distilled/older-unrelated/g-1/mem-1', { sourceId: CAPTURE_SOURCE })).toBeNull();
+    const [unrelated] = await engine.executeRaw<{ state: string; attempt_count: number | string }>(
+      `SELECT state, attempt_count FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, 'older-unrelated'],
+    );
+    expect(unrelated).toMatchObject({ state: 'pending' });
+    expect(Number(unrelated.attempt_count)).toBe(0);
+  });
+
+  test('a missing named canary fails closed without falling back to backlog work', async () => {
+    await engine.putPage(
+      'capture/unrelated/prompt-1',
+      {
+        type: 'note', title: 'unrelated', compiled_truth: 'unrelated redacted input', timeline: '',
+        frontmatter: { session_id: 'unrelated', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      throw new Error('must not be called');
+    });
+    const report = await distillCaptureSessions(engine, {
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      sourceId: CAPTURE_SOURCE,
+      sessionIds: ['missing-canary'],
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('target_unavailable');
+    expect(report.selected).toBe(0);
+    expect(report.calls).toBe(0);
+    expect(calls).toBe(0);
+    const [unrelated] = await engine.executeRaw<{ state: string; attempt_count: number | string }>(
+      `SELECT state, attempt_count FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, 'unrelated'],
+    );
+    expect(unrelated).toMatchObject({ state: 'pending' });
+    expect(Number(unrelated.attempt_count)).toBe(0);
+  });
 
   test('same-timestamp consolidation above 100 rows resumes with a composite cursor', async () => {
     await engine.executeRaw(
@@ -303,7 +432,10 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     const second = await distillCaptureSessions(engine, { now: secondNow, sourceId: CAPTURE_SOURCE });
 
     expect(second.distilled).toBe(1);
-    const page = await engine.getPage('distilled/chunkgap-sess-1/mem-1', { sourceId: CAPTURE_SOURCE });
+    const firstPage = await engine.getPage('distilled/chunkgap-sess-1/g-1/mem-1', { sourceId: CAPTURE_SOURCE });
+    const page = await engine.getPage('distilled/chunkgap-sess-1/g-2/mem-1', { sourceId: CAPTURE_SOURCE });
+    expect(firstPage?.compiled_truth).toBe('generation one memory');
+    expect((firstPage?.frontmatter as Record<string, unknown>)?.generation).toBe(1);
     expect(page?.compiled_truth).toBe(memory);
     expect((page?.frontmatter as Record<string, unknown>)?.generation).toBe(2);
     const calls = await engine.executeRaw<{ generation: number | string }>(

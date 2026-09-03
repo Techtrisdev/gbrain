@@ -11,11 +11,13 @@
  */
 
 import express from 'express';
-import type { Request, Response, NextFunction } from 'express';
+import type { Express, Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash } from 'crypto';
+import { BlockList, isIP } from 'node:net';
+import { hashToken } from '../core/utils.ts';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -73,6 +75,96 @@ import '../core/connectors/registry.ts';
  * 3s leaves 2s of headroom for TCP, response framing, and clock skew.
  */
 export const HEALTH_TIMEOUT_MS = 3000;
+
+export interface OAuthTokenRateLimitOptions {
+  windowMs?: number;
+  clientMax?: number;
+  ipMax?: number;
+}
+
+const trustedRailwayProxyAddresses = new BlockList();
+trustedRailwayProxyAddresses.addSubnet('127.0.0.0', 8, 'ipv4');
+trustedRailwayProxyAddresses.addSubnet('10.0.0.0', 8, 'ipv4');
+trustedRailwayProxyAddresses.addSubnet('172.16.0.0', 12, 'ipv4');
+trustedRailwayProxyAddresses.addSubnet('192.168.0.0', 16, 'ipv4');
+trustedRailwayProxyAddresses.addSubnet('100.64.0.0', 10, 'ipv4');
+trustedRailwayProxyAddresses.addSubnet('::1', 128, 'ipv6');
+trustedRailwayProxyAddresses.addSubnet('fc00::', 7, 'ipv6');
+trustedRailwayProxyAddresses.addSubnet('fe80::', 10, 'ipv6');
+
+function normalizedSocketAddress(raw: string | undefined): string {
+  const value = raw?.trim() ?? '';
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(value);
+  return mapped?.[1] ?? value;
+}
+
+export function isTrustedRailwayProxyAddress(raw: string | undefined): boolean {
+  const address = normalizedSocketAddress(raw);
+  const version = isIP(address);
+  if (version === 4) return trustedRailwayProxyAddresses.check(address, 'ipv4');
+  if (version === 6) return trustedRailwayProxyAddresses.check(address, 'ipv6');
+  return false;
+}
+
+/**
+ * The public Railway service is reached through Railway's private reverse
+ * proxies. Trust only loopback/private proxy hops so Express derives req.ip
+ * from the forwarded chain without accepting spoofed headers from an
+ * untrusted direct peer.
+ */
+export function configureTrustedProxy(app: Express): void {
+  app.set('trust proxy', isTrustedRailwayProxyAddress);
+}
+
+/** Accept Railway's edge-set X-Real-IP only from an expected proxy peer. */
+export function resolveOAuthTokenClientIp(req: Request): string {
+  const socketAddress = normalizedSocketAddress(req.socket.remoteAddress);
+  const railwayClientIp = req.get('x-real-ip')?.trim() ?? '';
+  if (isTrustedRailwayProxyAddress(socketAddress) && isIP(railwayClientIp)) return railwayClientIp;
+  return socketAddress || 'unknown-client-ip';
+}
+
+/**
+ * Protect /token on two independent dimensions. The IP budget prevents a
+ * caller from bypassing protection with made-up client IDs; the hashed-client
+ * budget prevents one legitimate but noisy connector from locking out every
+ * other OAuth client behind the same machine or office address.
+ *
+ * The client limiter must run after urlencoded form parsing.
+ */
+export function createOAuthTokenRateLimiters(options: OAuthTokenRateLimitOptions = {}) {
+  const windowMs = options.windowMs ?? 15 * 60 * 1000;
+  const message = {
+    error: 'too_many_requests',
+    error_description: 'Rate limit exceeded. Retry after the advertised reset time.',
+  };
+  const common = {
+    windowMs,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message,
+  } as const;
+
+  return {
+    ip: rateLimit({
+      ...common,
+      max: options.ipMax ?? 300,
+      identifier: 'oauth-token-ip',
+      keyGenerator: resolveOAuthTokenClientIp,
+    }),
+    client: rateLimit({
+      ...common,
+      max: options.clientMax ?? 50,
+      identifier: 'oauth-token-client',
+      skip: (req: Request) => req.body?.grant_type !== 'client_credentials',
+      keyGenerator: (req: Request) => {
+        const rawClientId = typeof req.body?.client_id === 'string' ? req.body.client_id.trim() : '';
+        if (!rawClientId) return 'missing-client-id';
+        return `${hashToken(rawClientId)}:${resolveOAuthTokenClientIp(req)}`;
+      },
+    }),
+  };
+}
 
 /**
  * v0.36.1.x #1024: bootstrap token resolution.
@@ -695,7 +787,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // Express 5 app
   const app = express();
-  app.set('trust proxy', 'loopback'); // Caddy/Tailscale reverse proxy on localhost
+  configureTrustedProxy(app);
 
   // ---------------------------------------------------------------------------
   // Cookie parsing — required for /admin auth (express 5 has no built-in)
@@ -715,13 +807,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Custom client_credentials handler (before mcpAuthRouter)
   // SDK's token handler only supports authorization_code and refresh_token
   // ---------------------------------------------------------------------------
-  const ccRateLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 50,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'too_many_requests', error_description: 'Rate limit exceeded. Try again in 15 minutes.' },
-  });
+  const tokenRateLimiters = createOAuthTokenRateLimiters();
+  const tokenFormParser = express.urlencoded({ extended: false, limit: '16kb', parameterLimit: 16 });
 
   // Magic-link rate limiter: 10 requests/min/IP. The bootstrap token is
   // 64-char hex (unguessable) so brute-forcing is computationally
@@ -736,7 +823,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     message: 'Too many magic-link attempts. Wait a minute before trying again.',
   });
 
-  app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
+  app.post('/token', tokenFormParser, tokenRateLimiters.client, tokenRateLimiters.ip, async (req, res, next) => {
     if (req.body?.grant_type !== 'client_credentials') {
       return next(); // Fall through to confidential-client handler or SDK
     }
@@ -767,7 +854,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Public clients (token_endpoint_auth_method='none') fall through to
   // the SDK's handler — the v0.34.1.0 PKCE path stays canonical.
   // ---------------------------------------------------------------------------
-  app.post('/token', ccRateLimiter, async (req, res, next) => {
+  app.post('/token', async (req, res, next) => {
     const grantType = req.body?.grant_type;
     if (grantType !== 'authorization_code' && grantType !== 'refresh_token') {
       return next();

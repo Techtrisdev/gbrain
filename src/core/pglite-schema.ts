@@ -892,6 +892,8 @@ CREATE TABLE IF NOT EXISTS connector_promotion_events (
   resulting_state TEXT NOT NULL,
   outcome TEXT NOT NULL CHECK (outcome IN ('applied','stale','rejected','unresolved')),
   reason_code TEXT,
+  actor TEXT,
+  reason TEXT,
   occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS connector_promotion_events_correlation_idx
@@ -1020,6 +1022,10 @@ CREATE TABLE IF NOT EXISTS context_mirror_generations (
   is_current BOOLEAN NOT NULL DEFAULT true,
   requires_human_review BOOLEAN NOT NULL DEFAULT false,
   recovery_hold BOOLEAN NOT NULL DEFAULT false,
+  rollback_actor TEXT,
+  rollback_reason TEXT,
+  rollback_rejected_candidates INTEGER,
+  rolled_back_at TIMESTAMPTZ,
   completed_at TIMESTAMPTZ,
   superseded_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1089,6 +1095,7 @@ CREATE TABLE IF NOT EXISTS context_mirror_recovery_holds (
   source_id TEXT PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
   active BOOLEAN NOT NULL DEFAULT false,
   reason TEXT NOT NULL DEFAULT '',
+  acted_by TEXT NOT NULL DEFAULT 'system',
   held_at TIMESTAMPTZ,
   released_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),

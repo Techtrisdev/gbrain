@@ -8,7 +8,7 @@
  *
  * FIX. Distill each COMPLETED conversation into a FEW (0–6) durable memory
  * statements about Jonathan's decisions / preferences / standards / durable
- * project facts, written as `distilled/<session-slug>/mem-K` pages. A separate
+ * project facts, written as immutable `distilled/<session-slug>/g-N/mem-K` pages. A separate
  * connector (context_mirror configured with read_slug_prefix='distilled/')
  * consolidates ONLY those `distilled/` pages — so the queue gets a handful of
  * clean candidates instead of one-per-turn. THIS module is the distiller that
@@ -80,6 +80,7 @@ import {
   finishSession,
   markContextGenerationQuarantined,
   markProviderCallFailed,
+  markProviderCallAmbiguous,
   markProviderCallInflight,
   openCircuit,
   persistProviderResult,
@@ -190,6 +191,8 @@ export interface DistillOptions {
   model?: string;
   /** Maximum sessions selected for this run. Default 5. */
   maxSessions?: number;
+  /** Exact opaque sessions to lease. Missing/unavailable targets fail closed; no backlog fallback. */
+  sessionIds?: string[];
   /** Maximum provider calls for this run. Default 5. */
   maxCalls?: number;
   /** Conservative cumulative input-token reservation. Default 100k. */
@@ -231,6 +234,8 @@ export type DistillStopReason =
   | 'memory_limit'
   | 'cost_limit'
   | 'systemic_failure'
+  | 'ambiguous_provider_outcome'
+  | 'target_unavailable'
   | 'chat_unavailable'
   | 'session_failures';
 
@@ -291,7 +296,7 @@ interface GenerationProvenance {
   requiresHumanReview: boolean;
 }
 
-type DistillConversationOutcome =
+export type DistillConversationOutcome =
   | { status: 'distilled'; memories: string[]; usage: ChatResult['usage'] }
   | { status: 'session_rejected'; errorClass: 'content' | 'validation'; error: string }
   | {
@@ -757,6 +762,58 @@ async function hydrateCapturePages(
   return pages;
 }
 
+interface BoundedCaptureHydration {
+  pages: Page[];
+  bytes: number;
+  memoryLimitExceeded: boolean;
+  runtimeLimitExceeded: boolean;
+}
+
+/** Hydrate only one durable session in stable, source-confined batches. The
+ * byte and wall-clock ceilings are enforced while rows are assembled, so a
+ * long session cannot cause one query per turn or allocate its whole history
+ * before the safety limit is noticed. */
+async function hydrateDurableSessionPages(
+  engine: BrainEngine,
+  sourceId: string,
+  slugPrefix: string,
+  maxBytes: number,
+  deadlineMs: number,
+): Promise<BoundedCaptureHydration> {
+  const pages: Page[] = [];
+  let bytes = 0;
+  let after = '';
+  const batchSize = 100;
+  for (;;) {
+    if (Date.now() >= deadlineMs) {
+      return { pages, bytes, memoryLimitExceeded: false, runtimeLimitExceeded: true };
+    }
+    const batch = await engine.executeRaw<Page>(
+      `SELECT id, source_id, slug, type, page_kind, title, compiled_truth, timeline,
+              frontmatter, content_hash, created_at, updated_at, deleted_at
+         FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL
+          AND slug LIKE $2::text || '%' AND slug > $3
+        ORDER BY slug ASC
+        LIMIT $4`,
+      [sourceId, slugPrefix, after, batchSize],
+    );
+    for (const page of batch) {
+      if (Date.now() >= deadlineMs) {
+        return { pages, bytes, memoryLimitExceeded: false, runtimeLimitExceeded: true };
+      }
+      bytes += Buffer.byteLength(`${page.compiled_truth ?? ''}${page.timeline ?? ''}`, 'utf8');
+      pages.push(page);
+      if (bytes > maxBytes) {
+        return { pages, bytes, memoryLimitExceeded: true, runtimeLimitExceeded: false };
+      }
+    }
+    if (batch.length < batchSize) break;
+    after = batch[batch.length - 1].slug;
+  }
+  return { pages, bytes, memoryLimitExceeded: false, runtimeLimitExceeded: false };
+}
+
 function generationProvenance(
   pages: Page[],
   conversation: string,
@@ -890,11 +947,31 @@ export async function distillCaptureSessions(
   const maxMemoryBytes = finiteInt('maxMemoryBytes', opts.maxMemoryBytes, DEFAULT_MAX_MEMORY_BYTES, 1);
   const requestTimeoutMs = finiteInt('requestTimeoutMs', opts.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 1);
   const maxRetries = finiteInt('maxRetries', opts.maxRetries, 0, 0);
+  if (maxRetries !== 0) {
+    throw new Error('maxRetries must be 0: durable provider sends require operator reconciliation after ambiguity');
+  }
+  const requestedSessionIds = opts.sessionIds === undefined
+    ? undefined
+    : opts.sessionIds.map((sessionId) => sessionId.trim());
+  if (requestedSessionIds !== undefined) {
+    if (requestedSessionIds.length === 0 || requestedSessionIds.some((sessionId) => sessionId.length === 0)) {
+      throw new Error('sessionIds must contain at least one non-empty session id');
+    }
+    if (new Set(requestedSessionIds).size !== requestedSessionIds.length) {
+      throw new Error('sessionIds must not contain duplicates');
+    }
+    if (requestedSessionIds.length > maxSessions) {
+      throw new Error('sessionIds cannot exceed maxSessions');
+    }
+  }
   if (opts.maxCostUsd !== undefined && (!Number.isFinite(opts.maxCostUsd) || opts.maxCostUsd <= 0)) {
     throw new Error('maxCostUsd must be a finite number > 0');
   }
 
   const durable = !dryRun && supportsContextMirrorOperationalState(engine);
+  if (requestedSessionIds && !dryRun && !durable) {
+    throw new Error('exact-session distillation requires durable operational state');
+  }
   let durableRunId: string | null = null;
   let durableHeads = new Map<string, DurableSessionHead>();
   let durableEligible = 0;
@@ -997,7 +1074,64 @@ export async function distillCaptureSessions(
       return report;
     }
     const claimLimit = circuit.state === 'open' ? 1 : maxSessions;
-    const claimed = await claimPendingSessionHeads(engine, sourceId, claimLimit, now);
+    const claimed = await claimPendingSessionHeads(
+      engine,
+      sourceId,
+      requestedSessionIds ? requestedSessionIds.length : claimLimit,
+      now,
+      requestedSessionIds,
+    );
+    if (requestedSessionIds && claimed.length !== requestedSessionIds.length) {
+      await Promise.all(claimed.map((head) => releaseSessionClaim(engine, {
+        sourceId,
+        sessionId: head.sessionId,
+        claimId: head.claimId,
+      })));
+      const unavailable = requestedSessionIds.filter(
+        (sessionId) => !claimed.some((head) => head.sessionId === sessionId),
+      );
+      const report: DistillReport = {
+        status: 'failed',
+        stop_reason: 'target_unavailable',
+        source_id: sourceId,
+        idle_hours_threshold: idleHours,
+        dry_run: false,
+        total_sessions: durableTotal,
+        eligible: durableEligible,
+        selected: 0,
+        deferred: durableEligible,
+        distilled: 0,
+        memories_written: 0,
+        pages_written: 0,
+        skipped_already: 0,
+        skipped_active: 0,
+        failed: unavailable.length,
+        calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_cost_usd: null,
+        elapsed_ms: Date.now() - startedAt,
+        chat_available: isAvailable('chat'),
+        sessions: unavailable.map((sessionId) => ({
+          session_id: sessionId,
+          session_slug: toSessionSlug(sessionId),
+          turns: 0,
+          idle_hours: 0,
+          status: 'failed',
+          error: 'requested session is not pending and eligible',
+          error_class: 'validation',
+        })),
+      };
+      await finishDistillRun(engine, durableRunId, {
+        status: report.status,
+        stopReason: report.stop_reason,
+        selected: 0,
+        completed: 0,
+        failed: report.failed,
+        deferred: report.deferred,
+      });
+      return report;
+    }
     durableHeads = new Map(claimed.map((head) => [head.sessionId, head]));
     summaries = claimed.map((head) => ({
       sessionId: head.sessionId,
@@ -1013,7 +1147,9 @@ export async function distillCaptureSessions(
       listCaptureSessionSummaries(engine, sourceId),
       enumerateAllSlugs(engine, sourceId, DISTILL_STATE_PREFIX),
     ]);
-    summaries = legacySummaries;
+    summaries = requestedSessionIds
+      ? legacySummaries.filter((summary) => requestedSessionIds.includes(summary.sessionId))
+      : legacySummaries;
     done = doneSlugsFrom(markerSlugs);
   }
 
@@ -1158,13 +1294,16 @@ export async function distillCaptureSessions(
     });
   let reservedInputTokens = 0;
   let reservedOutputTokens = 0;
+  let circuitClosedThisRun = false;
 
   const deferRemaining = (from: number, reason: DistillStopReason): void => {
     for (let i = from; i < selected.length; i++) {
       report.deferred += 1;
       report.sessions.push({ ...sessionBase(selected[i]), status: 'deferred' });
     }
-    report.status = reason === 'systemic_failure' || reason === 'cost_limit' ? 'failed' : 'partial';
+    report.status = reason === 'systemic_failure' || reason === 'ambiguous_provider_outcome' || reason === 'cost_limit'
+      ? 'failed'
+      : 'partial';
     report.stop_reason = reason;
   };
 
@@ -1180,12 +1319,33 @@ export async function distillCaptureSessions(
       break;
     }
 
-    const captureSlugs = await enumerateAllSlugs(engine, sourceId, summary.captureSlugPrefix);
-    const sessionPages = await hydrateCapturePages(engine, captureSlugs, sourceId);
-    const transcriptBytes = sessionPages.reduce(
-      (sum, page) => sum + Buffer.byteLength(`${page.compiled_truth ?? ''}${page.timeline ?? ''}`, 'utf8'),
-      0,
-    );
+    const hydration = durable
+      ? await hydrateDurableSessionPages(
+          engine,
+          sourceId,
+          summary.captureSlugPrefix,
+          maxMemoryBytes,
+          startedAt + maxRuntimeMs,
+        )
+      : await (async (): Promise<BoundedCaptureHydration> => {
+          const captureSlugs = await enumerateAllSlugs(engine, sourceId, summary.captureSlugPrefix);
+          const pages = await hydrateCapturePages(engine, captureSlugs, sourceId);
+          const bytes = pages.reduce(
+            (sum, page) => sum + Buffer.byteLength(`${page.compiled_truth ?? ''}${page.timeline ?? ''}`, 'utf8'),
+            0,
+          );
+          return { pages, bytes, memoryLimitExceeded: bytes > maxMemoryBytes, runtimeLimitExceeded: false };
+        })();
+    if (hydration.runtimeLimitExceeded) {
+      const durableHead = durableHeads.get(sessionId);
+      if (durable && durableHead) {
+        await releaseSessionClaim(engine, { sourceId, sessionId, claimId: durableHead.claimId });
+      }
+      deferRemaining(index, 'runtime_limit');
+      break;
+    }
+    const sessionPages = hydration.pages;
+    const transcriptBytes = hydration.bytes;
     const convo = assembleConversation(sessionPages);
     const estimatedInput = estimateTokens(convo);
     const durableHead = durableHeads.get(sessionId);
@@ -1204,7 +1364,7 @@ export async function distillCaptureSessions(
         requiresHumanReview: provenance.requiresHumanReview,
       });
     }
-    if (transcriptBytes > maxMemoryBytes) {
+    if (hydration.memoryLimitExceeded || transcriptBytes > maxMemoryBytes) {
       report.failed += 1;
       report.sessions.push({
         ...base,
@@ -1297,8 +1457,19 @@ export async function distillCaptureSessions(
           },
         };
       } else {
-        let retry = 0;
         for (;;) {
+          const remainingRuntimeMs = maxRuntimeMs - (Date.now() - startedAt);
+          if (remainingRuntimeMs <= 0) {
+            report.calls -= 1;
+            reservedInputTokens -= estimatedInput;
+            reservedOutputTokens -= DISTILL_MAX_TOKENS;
+            if (durable && durableHead) {
+              await releaseReviewReservation(engine, sourceId, sessionId, generation, 'released');
+              await releaseSessionClaim(engine, { sourceId, sessionId, claimId: durableHead.claimId });
+            }
+            deferRemaining(index, 'runtime_limit');
+            return;
+          }
           correlationId = null;
           if (durable && durableRunId) {
             correlationId = await prepareProviderCall(engine, {
@@ -1313,34 +1484,33 @@ export async function distillCaptureSessions(
           outcome = await distillConversation(convo, {
             model: opts.model,
             abortSignal: opts.abortSignal,
-            requestTimeoutMs,
-            // The durable loop here is the sole retry owner.
+            requestTimeoutMs: Math.min(requestTimeoutMs, remainingRuntimeMs),
+            // A durable provider send is never retried automatically: a timeout
+            // or transport failure may conceal a successful, billable request.
             maxRetries: 0,
           });
           if (outcome.status === 'distilled' && durable && correlationId) {
             await persistProviderResult(engine, correlationId, outcome.memories, outcome.usage);
           }
           if (outcome.status !== 'distilled' && durable && correlationId) {
-            await markProviderCallFailed(engine, correlationId, outcome.errorClass, outcome.error);
+            const ambiguous = outcome.status === 'systemic_failure' &&
+              (outcome.errorClass === 'transient' || outcome.errorClass === 'unknown');
+            if (ambiguous) {
+              await markProviderCallAmbiguous(engine, {
+                correlationId,
+                sourceId,
+                sessionId,
+                generation,
+                errorClass: outcome.errorClass,
+                errorMessage: outcome.error,
+              });
+            } else {
+              await markProviderCallFailed(engine, correlationId, outcome.errorClass, outcome.error);
+            }
           }
-          const canRetry = outcome.status === 'systemic_failure' &&
-            outcome.errorClass === 'transient' && retry < maxRetries;
-          if (!canRetry) break;
-          if (report.calls >= maxCalls ||
-              reservedInputTokens + estimatedInput > maxInputTokens ||
-              reservedOutputTokens + DISTILL_MAX_TOKENS > maxOutputTokens ||
-              Date.now() - startedAt >= maxRuntimeMs) {
-            break;
-          }
-          const delay = outcome.status === 'systemic_failure'
-            ? outcome.retryAfterMs ?? Math.min(1_000 * (2 ** retry), 30_000)
-            : 0;
-          if (Date.now() - startedAt + delay >= maxRuntimeMs) break;
-          await waitForRetry(delay, opts.abortSignal);
-          retry += 1;
-          report.calls += 1;
-          reservedInputTokens += estimatedInput;
-          reservedOutputTokens += DISTILL_MAX_TOKENS;
+          // Never replay a durable provider request automatically. Retry policy
+          // is operator reconciliation against this correlation ledger.
+          break;
         }
       }
       if (outcome.status === 'systemic_failure') {
@@ -1351,6 +1521,7 @@ export async function distillCaptureSessions(
           error: outcome.error,
           error_class: outcome.errorClass,
         });
+        const ambiguous = outcome.errorClass === 'transient' || outcome.errorClass === 'unknown';
         if (durable && durableHead) {
           await releaseSessionClaim(engine, {
             sourceId,
@@ -1367,7 +1538,14 @@ export async function distillCaptureSessions(
             new Date(nowMs + 60 * 60_000),
           );
         }
-        deferRemaining(index + 1, outcome.errorClass === 'budget' ? 'cost_limit' : 'systemic_failure');
+        deferRemaining(
+          index + 1,
+          outcome.errorClass === 'budget'
+            ? 'cost_limit'
+            : ambiguous
+              ? 'ambiguous_provider_outcome'
+              : 'systemic_failure',
+        );
         break;
       }
       if (outcome.status === 'session_rejected') {
@@ -1399,8 +1577,8 @@ export async function distillCaptureSessions(
       const written: string[] = [];
       const partitions: Array<{ partitionKey: string; distilledSlug: string; contentHash: string }> = [];
       for (let i = 0; i < memories.length; i++) {
-        const slug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${i + 1}`;
         const partitionKey = `mem-${i + 1}`;
+        const slug = `${DISTILLED_PREFIX}${sessionSlug}/g-${generation}/${partitionKey}`;
         const page = buildMemoryPage(memories[i], sessionId, generation, partitionKey, provenance, nowIso);
         await engine.putPage(slug, page, { sourceId });
         // putPage upserts the `pages` row ONLY — it creates no `content_chunks`.
@@ -1456,7 +1634,7 @@ export async function distillCaptureSessions(
       // memory writes and the marker write below, and the re-run's LLM returns
       // fewer memories.
       for (let k = memories.length + 1; k <= memories.length + ORPHAN_PROBE_LIMIT; k++) {
-        const orphanSlug = `${DISTILLED_PREFIX}${sessionSlug}/mem-${k}`;
+        const orphanSlug = `${DISTILLED_PREFIX}${sessionSlug}/g-${generation}/mem-${k}`;
         if ((await engine.getPage(orphanSlug, { sourceId })) === null) break;
         await engine.deletePage(orphanSlug, { sourceId });
       }
@@ -1508,7 +1686,10 @@ export async function distillCaptureSessions(
           state: 'complete',
           disposition: memories.length === 0 ? 'no_signal' : 'distilled',
         });
-        await closeCircuit(engine, sourceId, 'chat');
+        if (!circuitClosedThisRun) {
+          await closeCircuit(engine, sourceId, 'chat');
+          circuitClosedThisRun = true;
+        }
       }
     } catch (err) {
       if (isAbort(err)) throw err; // shutdown propagates

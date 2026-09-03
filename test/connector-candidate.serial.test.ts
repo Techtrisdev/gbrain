@@ -502,7 +502,12 @@ describe('review queue: approveCandidate + promotion seam (AC3 / TECH-2037 retri
     expect(res.row!.status).toBe('accepted'); // committed before the bridge ran
     expect(res.promotion.invoked).toBe(false);
     expect(res.promotion.pending).toBe(true);
-    expect(res.promotion.error).toContain('503');
+    expect(res.promotion.error).toBe('dispatch_hook_failed');
+    const [transition] = await engine.executeRaw<{ failure_code: string | null }>(
+      `SELECT failure_code FROM connector_promotion_transitions WHERE candidate_id = $1`,
+      [row.id],
+    );
+    expect(transition?.failure_code).toBe('dispatch_hook_failed');
   });
 
   test('approving a non-pending id is a guarded no-op (row null)', async () => {

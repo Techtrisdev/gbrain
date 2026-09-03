@@ -59,6 +59,26 @@ function readAudit(): Array<Record<string, unknown>> {
 }
 
 describe('BudgetTracker.reserve', () => {
+  test('rejects a provider attempt before it crosses the call ceiling', () => {
+    const t = new BudgetTracker({ maxCalls: 1, label: 'canary', auditPath });
+    const estimate = {
+      modelId: 'claude-haiku-4-5-20251001',
+      estimatedInputTokens: 1000,
+      maxOutputTokens: 1000,
+      kind: 'chat' as const,
+    };
+    t.reserve(estimate);
+    expect(t.snapshot().callsReserved).toBe(1);
+    try {
+      t.reserve(estimate);
+      throw new Error('expected the second provider reservation to be rejected');
+    } catch (error) {
+      expect(error).toBeInstanceOf(BudgetExhausted);
+      expect((error as BudgetExhausted).reason).toBe('calls');
+    }
+    expect(t.snapshot().callsReserved).toBe(1);
+  });
+
   test('passes when under cap with known pricing', () => {
     const t = new BudgetTracker({ maxCostUsd: 1.0, label: 'test', auditPath });
     expect(() =>
@@ -359,5 +379,8 @@ describe('BudgetTracker.snapshot', () => {
     expect(s.maxRuntimeMs).toBe(60_000);
     expect(s.elapsedMs).toBeGreaterThanOrEqual(0);
     expect(s.callsRecorded).toBe(0);
+    expect(s.callsReserved).toBe(0);
+    expect(s.inputTokensRecorded).toBe(0);
+    expect(s.outputTokensRecorded).toBe(0);
   });
 });

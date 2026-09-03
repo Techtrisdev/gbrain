@@ -1,6 +1,11 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { contextMirrorConnector } from '../src/core/connectors/context-mirror.ts';
+import {
+  consolidateContextMirrorGeneration,
+  contextMirrorConnector,
+} from '../src/core/connectors/context-mirror.ts';
 import { distillCaptureSessions } from '../src/core/connectors/distill.ts';
 import {
   admitWaitingCandidates,
@@ -8,6 +13,7 @@ import {
   completeContextGeneration,
   ensureContextGeneration,
   readContextMirrorRecoveryHold,
+  rollbackContextGeneration,
   reserveReviewCapacity,
   reviewCapacitySnapshot,
   setContextMirrorRecoveryHold,
@@ -73,7 +79,7 @@ async function seedGeneration(sessionId: string, partitions: string[]): Promise<
       `INSERT INTO context_mirror_partitions (
          source_id, session_id, generation, partition_key, distilled_slug, content_hash
        ) VALUES ($1,$2,1,$3,$4,$5)`,
-      [SOURCE_ID, sessionId, partition, `distilled/${sessionId}/${partition}`, `hash-${partition}`],
+      [SOURCE_ID, sessionId, partition, `distilled/${sessionId}/g-1/${partition}`, `hash-${partition}`],
     );
   }
 }
@@ -93,6 +99,123 @@ async function seedCapture(sessionId: string, suffix: string, body: string, turn
 }
 
 describe('Context Mirror generation and review ledgers', () => {
+  test('historical repair rollback reactivates the prior immutable page generation', async () => {
+    await seedGeneration('repair-rollback', ['mem-1']);
+    await engine.putPage(
+      'distilled/repair-rollback/g-1/mem-1',
+      {
+        type: 'note', title: 'generation one', compiled_truth: 'Verified generation one memory.', timeline: '',
+        frontmatter: { session_id: 'repair-rollback', generation: 1, partition: 'mem-1' },
+      } as never,
+      { sourceId: SOURCE_ID },
+    );
+    await engine.upsertChunks(
+      'distilled/repair-rollback/g-1/mem-1',
+      [{ chunk_index: 0, chunk_text: 'Verified generation one memory.', chunk_source: 'compiled_truth' }],
+      { sourceId: SOURCE_ID },
+    );
+    const prior = await engine.getPage('distilled/repair-rollback/g-1/mem-1', { sourceId: SOURCE_ID });
+    await engine.executeRaw(
+      `UPDATE context_mirror_partitions SET content_hash = $4
+        WHERE source_id = $1 AND session_id = $2 AND generation = 1 AND partition_key = $3`,
+      [SOURCE_ID, 'repair-rollback', 'mem-1', prior!.content_hash],
+    );
+    await engine.executeRaw(
+      `UPDATE context_mirror_generations
+          SET state = 'superseded', is_current = false, superseded_at = now()
+        WHERE source_id = $1 AND session_id = $2 AND generation = 1`,
+      [SOURCE_ID, 'repair-rollback'],
+    );
+    await engine.executeRaw(
+      `UPDATE context_mirror_session_heads SET current_generation = 2
+        WHERE source_id = $1 AND session_id = $2`,
+      [SOURCE_ID, 'repair-rollback'],
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_generations (
+         source_id, session_id, generation, input_hash, transform_version, model,
+         expected_partitions, materialized_partitions, state, is_current, requires_human_review, completed_at
+       ) VALUES ($1,$2,2,'corrected-input','test-v2','test:stub',1,1,'complete',true,true,now())`,
+      [SOURCE_ID, 'repair-rollback'],
+    );
+    await engine.putPage(
+      'distilled/repair-rollback/g-2/mem-1',
+      {
+        type: 'note', title: 'generation two', compiled_truth: 'Rejected generation two memory.', timeline: '',
+        frontmatter: { session_id: 'repair-rollback', generation: 2, partition: 'mem-1' },
+      } as never,
+      { sourceId: SOURCE_ID },
+    );
+    await engine.upsertChunks(
+      'distilled/repair-rollback/g-2/mem-1',
+      [{ chunk_index: 0, chunk_text: 'Rejected generation two memory.', chunk_source: 'compiled_truth' }],
+      { sourceId: SOURCE_ID },
+    );
+    const replacement = await engine.getPage('distilled/repair-rollback/g-2/mem-1', { sourceId: SOURCE_ID });
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_partitions (
+         source_id,session_id,generation,partition_key,distilled_slug,content_hash
+       ) VALUES ($1,$2,2,'mem-1','distilled/repair-rollback/g-2/mem-1',$3)`,
+      [SOURCE_ID, 'repair-rollback', replacement!.content_hash],
+    );
+
+    const result = await rollbackContextGeneration(engine, {
+      sourceId: SOURCE_ID,
+      sessionId: 'repair-rollback',
+      generation: 2,
+      rollbackGeneration: 1,
+    });
+    expect(result).toMatchObject({
+      status: 'rolled_back',
+      source_id: SOURCE_ID,
+      session_id: 'repair-rollback',
+      generation: 2,
+      rollback_generation: 1,
+      rejected_candidates: 0,
+      actor: 'system',
+      reason: 'legacy_operator_request',
+      verification: {
+        current_generation: 1,
+        rolled_back_generation_state: 'superseded',
+        restored_generation_state: 'complete',
+      },
+    });
+    expect(result.rolled_back_at).toBeTruthy();
+    const rows = await engine.executeRaw<{ generation: number | string; state: string; is_current: boolean }>(
+      `SELECT generation,state,is_current FROM context_mirror_generations
+        WHERE source_id = $1 AND session_id = $2 ORDER BY generation`,
+      [SOURCE_ID, 'repair-rollback'],
+    );
+    expect(rows).toEqual([
+      { generation: 1, state: 'complete', is_current: true },
+      { generation: 2, state: 'superseded', is_current: false },
+    ]);
+    const [head] = await engine.executeRaw<{ current_generation: number | string; disposition: string }>(
+      `SELECT current_generation,disposition FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [SOURCE_ID, 'repair-rollback'],
+    );
+    expect(head).toEqual({ current_generation: 1, disposition: 'generation_rollback' });
+    expect((await engine.getPage('distilled/repair-rollback/g-1/mem-1', { sourceId: SOURCE_ID }))?.compiled_truth)
+      .toBe('Verified generation one memory.');
+    expect((await engine.getPage('distilled/repair-rollback/g-2/mem-1', { sourceId: SOURCE_ID }))?.compiled_truth)
+      .toBe('Rejected generation two memory.');
+    const claims = await claimContextPartitions(engine, SOURCE_ID, 10, new Date());
+    expect(claims.map((claim) => claim.distilledSlug)).toEqual([
+      'distilled/repair-rollback/g-1/mem-1',
+    ]);
+  });
+
+  test('generation rollback refuses ordinary or already-promoted work', async () => {
+    await seedGeneration('ordinary-generation', ['mem-1']);
+    await expect(rollbackContextGeneration(engine, {
+      sourceId: SOURCE_ID,
+      sessionId: 'ordinary-generation',
+      generation: 1,
+      rollbackGeneration: 0,
+    })).rejects.toThrow(/generation must be greater than one/);
+  });
+
   test('a timestamp-only legacy watermark imports equal-time pages as held, never current or actionable', async () => {
     const timestamp = '2026-08-01T12:00:00.000Z';
     await engine.putPage(
@@ -158,6 +281,101 @@ describe('Context Mirror generation and review ledgers', () => {
     const remainder = await claimContextPartitions(engine, SOURCE_ID, 3, now);
     const allKeys = [...keys, ...remainder.map((claim) => claim.partitionKey)];
     expect(new Set(allKeys)).toEqual(new Set(['mem-1', 'mem-2', 'mem-3', 'mem-4']));
+  });
+
+  test('an exact generation lease never claims an older unrelated partition', async () => {
+    await seedGeneration('older-unrelated', ['mem-1']);
+    await seedGeneration('named-canary', ['mem-1']);
+
+    const claims = await claimContextPartitions(engine, SOURCE_ID, 1, new Date(), {
+      sessionId: 'named-canary',
+      generation: 1,
+    });
+
+    expect(claims).toHaveLength(1);
+    expect(claims[0]).toMatchObject({ sessionId: 'named-canary', generation: 1, partitionKey: 'mem-1' });
+    const [unrelated] = await engine.executeRaw<{ state: string; attempt_count: number | string }>(
+      `SELECT state, attempt_count FROM context_mirror_partitions
+        WHERE source_id = $1 AND session_id = 'older-unrelated' AND generation = 1`,
+      [SOURCE_ID],
+    );
+    expect(unrelated.state).toBe('pending');
+    expect(Number(unrelated.attempt_count)).toBe(0);
+  });
+
+  test('targeted consolidation reaches one exact decision inside its own one-call ceiling', async () => {
+    await setContextConfig({ enabled: true, consolidation_enabled: true });
+    await seedGeneration('named-canary', ['mem-1']);
+    await engine.putPage(
+      'distilled/named-canary/g-1/mem-1',
+      {
+        type: 'note',
+        title: 'named canary',
+        compiled_truth: 'A bounded canary memory records a durable decision that is long enough for review admission.',
+        timeline: '',
+        frontmatter: {
+          session_id: 'named-canary', generation: 1, partition: 'mem-1',
+          evidence_trust: 'untrusted_transcript',
+        },
+      } as never,
+      { sourceId: SOURCE_ID },
+    );
+    const [page] = await engine.executeRaw<{ content_hash: string }>(
+      `SELECT content_hash FROM pages WHERE source_id = $1 AND slug = 'distilled/named-canary/g-1/mem-1'`,
+      [SOURCE_ID],
+    );
+    await engine.executeRaw(
+      `UPDATE context_mirror_partitions SET content_hash = $3
+        WHERE source_id = $1 AND session_id = $2 AND generation = 1`,
+      [SOURCE_ID, 'named-canary', page.content_hash],
+    );
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      return {
+        text: JSON.stringify({ facts: ['A bounded canary memory.'], confidence: 0.9 }),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'claude-haiku-4-5-20251001',
+        providerId: 'test',
+      };
+    });
+
+    const auditDir = mkdtempSync('D:/Temp/gbrain-targeted-canary-');
+    let report;
+    try {
+      report = await consolidateContextMirrorGeneration(
+        engine,
+        { id: SOURCE_ID, config: { connectors: { context_mirror: { enabled: true, consolidation_enabled: true } } } },
+        {
+          sessionId: 'named-canary',
+          generation: 1,
+          maxPartitions: 1,
+          maxCalls: 1,
+          maxCostUsd: 0.1,
+          maxRuntimeMs: 60_000,
+          budgetAuditPath: join(auditDir, 'budget.jsonl'),
+        },
+      );
+    } finally {
+      rmSync(auditDir, { recursive: true, force: true });
+    }
+
+    expect(report).toMatchObject({
+      status: 'ok',
+      stop_reason: 'completed',
+      selected_partitions: 1,
+      provider_calls_reserved: 1,
+      provider_calls_recorded: 1,
+    });
+    expect(calls).toBe(1);
+    const [partition] = await engine.executeRaw<{ state: string }>(
+      `SELECT state FROM context_mirror_partitions
+        WHERE source_id = $1 AND session_id = 'named-canary' AND generation = 1`,
+      [SOURCE_ID],
+    );
+    expect(partition.state).toBe('decided');
   });
 
   test('a lower-key late row is claimed from the ledger even after the scan cursor advanced', async () => {

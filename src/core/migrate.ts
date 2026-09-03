@@ -5457,23 +5457,24 @@ export const MIGRATIONS: Migration[] = [
       SELECT c.id, c.source_id,
              'cm-promo-v2-c' || c.id::text || '-g' || COALESCE(c.context_generation, 0)::text,
              CASE
-               WHEN c.promotion_status = 'indexed' THEN 'indexed'
+               WHEN c.promotion_status = 'indexed' THEN 'unresolved_legacy'
                WHEN c.promotion_status = 'pr_opened' THEN 'pr_opened'
                WHEN c.promotion_status IS NULL THEN 'dispatch_failed'
                ELSE 'unresolved_legacy'
              END,
              CASE
-               WHEN c.promotion_status = 'indexed' THEN 'indexed'
+               WHEN c.promotion_status = 'indexed' THEN 'accepted'
                WHEN c.promotion_status = 'pr_opened' THEN 'pr_opened'
                ELSE 'accepted'
              END,
              CASE
+               WHEN c.promotion_status = 'indexed' THEN 'legacy_index_proof_unverified'
                WHEN c.promotion_status IS NULL THEN 'legacy_dispatch_outcome_unknown'
                WHEN c.promotion_status NOT IN ('pr_opened','indexed') THEN 'legacy_stage_unresolved'
                ELSE NULL
              END,
              CASE
-               WHEN c.promotion_status = 'indexed' THEN 'none'
+               WHEN c.promotion_status = 'indexed' THEN 'resolve_legacy'
                WHEN c.promotion_status = 'pr_opened' THEN 'await_merge'
                WHEN c.promotion_status IS NULL THEN 'reconcile_dispatch'
                ELSE 'resolve_legacy'
@@ -5483,7 +5484,7 @@ export const MIGRATIONS: Migration[] = [
              c.promoted_at,
              COALESCE(c.acted_at, c.proposed_at),
              CASE WHEN c.promotion_status IN ('pr_opened','indexed') THEN c.promoted_at ELSE NULL END,
-             CASE WHEN c.promotion_status = 'indexed' THEN c.promoted_at ELSE NULL END,
+             NULL,
              c.promotion_pr_url, c.promotion_branch
         FROM connector_candidates c
        WHERE c.status = 'accepted'
@@ -5520,6 +5521,41 @@ export const MIGRATIONS: Migration[] = [
       );
       const frozen = await engine.getConfig('connectors.promotion_dispatch_frozen');
       return new Set(rows.map((row) => row.table_name)).size === 3 && frozen === 'true';
+    },
+  },
+  {
+    version: 113,
+    name: 'context_mirror_admin_control_audit',
+    // Durable operator attribution for the source-confined recovery MCP
+    // controls. The state-machine mutations remain in their owning helpers;
+    // these columns make the reason/actor and idempotent rollback result
+    // verifiable after process restarts.
+    idempotent: true,
+    sql: `
+      ALTER TABLE connector_promotion_events ADD COLUMN IF NOT EXISTS actor TEXT;
+      ALTER TABLE connector_promotion_events ADD COLUMN IF NOT EXISTS reason TEXT;
+
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rollback_actor TEXT;
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rollback_reason TEXT;
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rollback_rejected_candidates INTEGER;
+      ALTER TABLE context_mirror_generations ADD COLUMN IF NOT EXISTS rolled_back_at TIMESTAMPTZ;
+
+      ALTER TABLE context_mirror_recovery_holds
+        ADD COLUMN IF NOT EXISTS acted_by TEXT NOT NULL DEFAULT 'system';
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ table_name: string; column_name: string }>(
+        `SELECT table_name, column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND (
+              (table_name = 'connector_promotion_events' AND column_name IN ('actor','reason'))
+              OR (table_name = 'context_mirror_generations' AND column_name IN (
+                'rollback_actor','rollback_reason','rollback_rejected_candidates','rolled_back_at'
+              ))
+              OR (table_name = 'context_mirror_recovery_holds' AND column_name = 'acted_by')
+            )`,
+      );
+      return new Set(rows.map((row) => `${row.table_name}.${row.column_name}`)).size === 7;
     },
   },
 ];

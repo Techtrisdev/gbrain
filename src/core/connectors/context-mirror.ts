@@ -43,6 +43,8 @@ import type { ConnectorCandidateItem } from './candidate.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page } from '../types.ts';
 import { computeContentHash } from '../ingestion/types.ts';
+import { withBudgetTracker } from '../ai/gateway.ts';
+import { BudgetTracker } from '../budget/budget-tracker.ts';
 import {
   admitWaitingCandidates,
   claimContextPartitions,
@@ -462,6 +464,176 @@ async function processClaimedPartitions(
 }
 
 // ── The connector ─────────────────────────────────────────────────────────────────
+
+export interface TargetedConsolidationOptions {
+  sessionId: string;
+  generation: number;
+  maxPartitions: number;
+  maxCalls: number;
+  maxCostUsd: number;
+  maxRuntimeMs: number;
+  budgetAuditPath?: string;
+  now?: Date;
+}
+
+export interface TargetedConsolidationReport {
+  status: 'ok' | 'failed';
+  stop_reason: 'completed' | 'target_unavailable' | 'partition_limit' | 'consolidation_disabled' | 'processing_failed';
+  source_id: string;
+  session_id: string;
+  generation: number;
+  eligible_partitions: number;
+  selected_partitions: number;
+  partition_keys: string[];
+  landed: number;
+  provider_calls_reserved: number;
+  provider_calls_recorded: number;
+  input_tokens: number;
+  output_tokens: number;
+  estimated_cost_usd: number;
+  elapsed_ms: number;
+  diagnostics: ConnectorDiagnostic[];
+}
+
+function targetedFailure(
+  source: ConnectorSource,
+  options: TargetedConsolidationOptions,
+  stopReason: TargetedConsolidationReport['stop_reason'],
+  code: string,
+  message: string,
+  eligiblePartitions = 0,
+): TargetedConsolidationReport {
+  return {
+    status: 'failed',
+    stop_reason: stopReason,
+    source_id: source.id,
+    session_id: options.sessionId,
+    generation: options.generation,
+    eligible_partitions: eligiblePartitions,
+    selected_partitions: 0,
+    partition_keys: [],
+    landed: 0,
+    provider_calls_reserved: 0,
+    provider_calls_recorded: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    estimated_cost_usd: 0,
+    elapsed_ms: 0,
+    diagnostics: [{ stage: 'consolidate', code, message }],
+  };
+}
+
+/** Process exactly one current generation through the ordinary partition and
+ * candidate path. This is a one-off canary seam, not a scheduler bypass: the
+ * source must explicitly enable Context Mirror consolidation, and the caller
+ * supplies independent provider call, cost, and runtime ceilings. */
+export async function consolidateContextMirrorGeneration(
+  engine: BrainEngine,
+  source: ConnectorSource,
+  options: TargetedConsolidationOptions,
+): Promise<TargetedConsolidationReport> {
+  const startedAt = Date.now();
+  if (!supportsContextMirrorOperationalState(engine)) {
+    return targetedFailure(source, options, 'processing_failed', 'operational_state_unavailable', 'durable operational state is required');
+  }
+  const cfg = contextMirrorConfig(source);
+  if (cfg?.enabled !== true || cfg.consolidation_enabled !== true) {
+    return targetedFailure(
+      source,
+      options,
+      'consolidation_disabled',
+      'consolidation_disabled',
+      'the exact source must explicitly enable Context Mirror consolidation for the one-off process',
+    );
+  }
+  const rows = await engine.executeRaw<{ count: number | string }>(
+    `SELECT count(*) AS count
+       FROM context_mirror_partitions p
+       JOIN context_mirror_generations g
+         ON g.source_id = p.source_id AND g.session_id = p.session_id AND g.generation = p.generation
+      WHERE p.source_id = $1 AND p.session_id = $2 AND p.generation = $3
+        AND p.state IN ('pending','failed') AND g.is_current AND g.state = 'complete'`,
+    [source.id, options.sessionId, options.generation],
+  );
+  const eligible = Number(rows[0]?.count ?? 0);
+  if (eligible === 0) {
+    return targetedFailure(
+      source,
+      options,
+      'target_unavailable',
+      'target_unavailable',
+      'the named current generation has no eligible partitions',
+    );
+  }
+  if (eligible > options.maxPartitions) {
+    return targetedFailure(
+      source,
+      options,
+      'partition_limit',
+      'partition_limit',
+      `${eligible} eligible partitions exceed the declared limit ${options.maxPartitions}`,
+      eligible,
+    );
+  }
+  const claims = await claimContextPartitions(
+    engine,
+    source.id,
+    eligible,
+    options.now ?? new Date(),
+    { sessionId: options.sessionId, generation: options.generation },
+  );
+  if (claims.length !== eligible) {
+    await Promise.all(claims.map((claim) => releaseContextPartition(engine, claim)));
+    return targetedFailure(
+      source,
+      options,
+      'target_unavailable',
+      'target_claim_incomplete',
+      `claimed ${claims.length} of ${eligible} named partitions`,
+      eligible,
+    );
+  }
+  const tracker = new BudgetTracker({
+    maxCalls: options.maxCalls,
+    maxCostUsd: options.maxCostUsd,
+    maxRuntimeMs: options.maxRuntimeMs,
+    label: 'context-mirror-targeted-consolidation',
+    ...(options.budgetAuditPath ? { auditPath: options.budgetAuditPath } : {}),
+  });
+  let result: ConnectorBackfillResult;
+  try {
+    result = await withBudgetTracker(
+      tracker,
+      async () => await processClaimedPartitions(engine, source, claims, true),
+    );
+  } catch (err) {
+    await Promise.all(claims.map((claim) => releaseContextPartition(engine, claim)));
+    result = {
+      status: 'failed',
+      landed: 0,
+      diagnostics: [{ stage: 'consolidate', code: 'targeted_exception', message: safeDiagnosticMessage(err) }],
+    };
+  }
+  const budget = tracker.snapshot();
+  return {
+    status: result.status === 'ok' ? 'ok' : 'failed',
+    stop_reason: result.status === 'ok' ? 'completed' : 'processing_failed',
+    source_id: source.id,
+    session_id: options.sessionId,
+    generation: options.generation,
+    eligible_partitions: eligible,
+    selected_partitions: claims.length,
+    partition_keys: claims.map((claim) => claim.partitionKey),
+    landed: result.landed,
+    provider_calls_reserved: budget.callsReserved,
+    provider_calls_recorded: budget.callsRecorded,
+    input_tokens: budget.inputTokensRecorded,
+    output_tokens: budget.outputTokensRecorded,
+    estimated_cost_usd: budget.cumulativeCostUsd,
+    elapsed_ms: Date.now() - startedAt,
+    diagnostics: result.diagnostics ?? [],
+  };
+}
 
 export const contextMirrorConnector: SaaSConnector = {
   provider: PROVIDER,

@@ -19,7 +19,8 @@ describe('capture distill command safety flags', () => {
 
   test('parses explicit finite limits', () => {
     const parsed = parseDistillArgs([
-      '--max-sessions', '2',
+      '--session-id', 'canary-session',
+      '--max-sessions', '1',
       '--max-calls', '1',
       '--max-cost-usd', '0.05',
       '--request-timeout-ms', '30000',
@@ -27,12 +28,13 @@ describe('capture distill command safety flags', () => {
       '--model', 'claude-test',
     ]);
     expect(parsed).toMatchObject({
-      maxSessions: 2,
+      maxSessions: 1,
       maxCalls: 1,
       maxCostUsd: 0.05,
       requestTimeoutMs: 30_000,
       maxRetries: 0,
       model: 'claude-test',
+      sessionId: 'canary-session',
     });
   });
 
@@ -42,5 +44,10 @@ describe('capture distill command safety flags', () => {
     expect(() => parseDistillArgs(['--max-sessions', 'Infinity'])).toThrow(/finite integer/);
     expect(() => parseDistillArgs(['--max-cost-usd', '0'])).toThrow(/finite number/);
     expect(() => parseDistillArgs(['--max-retries', '-1'])).toThrow(/finite integer/);
+    expect(() => parseDistillArgs(['--session-id'])).toThrow(/requires a value/);
+    expect(() => parseDistillArgs(['--session-id', 'canary-session'])).toThrow(/--max-sessions 1/);
+    expect(() => parseDistillArgs([
+      '--session-id', 'canary-session', '--max-sessions', '1', '--max-calls', '2',
+    ])).toThrow(/--max-calls 1/);
   });
 });

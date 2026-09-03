@@ -4,7 +4,7 @@
  * The distiller groups RAW per-turn `capture/<session>/…` pages by session and,
  * for each COMPLETED session (newest capture older than --idle-hours), makes ONE
  * gateway chat() call that emits 0–6 durable memory statements, written as
- * `distilled/<session-slug>/mem-K` pages + a `distill-state/<session-slug>`
+ * immutable `distilled/<session-slug>/g-N/mem-K` pages + a `distill-state/<session-slug>`
  * idempotency marker.
  *
  * Mirrors connector-context-mirror.test.ts (a fake engine capturing listPages +
@@ -335,7 +335,7 @@ describe('distillCaptureSessions — happy path', () => {
     // two mem pages + one marker
     const memPuts = puts.filter((p) => p.slug.startsWith('distilled/'));
     const markerPuts = puts.filter((p) => p.slug.startsWith('distill-state/'));
-    expect(memPuts.map((p) => p.slug)).toEqual(['distilled/sess-1/mem-1', 'distilled/sess-1/mem-2']);
+    expect(memPuts.map((p) => p.slug)).toEqual(['distilled/sess-1/g-1/mem-1', 'distilled/sess-1/g-1/mem-2']);
     expect(markerPuts.map((p) => p.slug)).toEqual(['distill-state/sess-1']);
 
     // Each memory page must ALSO be chunked. A page written without chunks is
@@ -343,8 +343,8 @@ describe('distillCaptureSessions — happy path', () => {
     // the defect that left 83 production distilled pages invisible. The marker
     // page is deliberately NOT chunked: it is idempotency state, not content.
     expect(chunkWrites.map((c) => c.slug)).toEqual([
-      'distilled/sess-1/mem-1',
-      'distilled/sess-1/mem-2',
+      'distilled/sess-1/g-1/mem-1',
+      'distilled/sess-1/g-1/mem-2',
     ]);
     expect(chunkWrites.every((c) => c.count > 0)).toBe(true);
     // Chunk writes must be SOURCE-SCOPED. upsertChunks resolves the page by
@@ -478,7 +478,7 @@ describe('distillCaptureSessions — failure tolerance', () => {
     expect(puts.some((p) => p.slug === 'distill-state/bad')).toBe(false);
     expect(puts.some((p) => p.slug === 'distill-state/good')).toBe(true);
     expect(puts.some((p) => p.slug.startsWith('distilled/bad/'))).toBe(false);
-    expect(puts.some((p) => p.slug === 'distilled/good/mem-1')).toBe(true);
+    expect(puts.some((p) => p.slug === 'distilled/good/g-1/mem-1')).toBe(true);
   });
 
   test('chat gateway unavailable → eligible session fails (not marked done), nothing written', async () => {
@@ -496,7 +496,7 @@ describe('distillCaptureSessions — failure tolerance', () => {
     expect(puts.length).toBe(0);
   });
 
-  test('the durable executor owns the only bounded transient retry', async () => {
+  test('a transient provider outcome is never replayed automatically', async () => {
     const { engine } = makeFakeEngine([
       mkCapture({ slug: 'capture/retry/prompt-1', session_id: 'retry', updated_at: OLD }),
     ]);
@@ -505,32 +505,22 @@ describe('distillCaptureSessions — failure tolerance', () => {
     __setChatTransportForTests(async (chatOpts): Promise<ChatResult> => {
       calls += 1;
       sdkRetries.push(chatOpts.maxRetries);
-      if (calls === 1) {
-        throw new AITransientError('rate limited', { status: 429, retryAfterMs: 0 });
-      }
-      return {
-        text: JSON.stringify(['retry succeeded once']),
-        blocks: [],
-        stopReason: 'end',
-        usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
-        model: 'test:stub',
-        providerId: 'test',
-      };
+      throw new AITransientError('provider result was not received', { status: 503 });
     });
 
     const report = await distillCaptureSessions(engine, {
       now: NOW,
-      maxRetries: 1,
       maxCalls: 2,
       maxInputTokens: 100_000,
       maxOutputTokens: 3_000,
     });
 
-    expect(calls).toBe(2);
-    expect(sdkRetries).toEqual([0, 0]);
-    expect(report.calls).toBe(2);
-    expect(report.status).toBe('ok');
-    expect(report.distilled).toBe(1);
+    expect(calls).toBe(1);
+    expect(sdkRetries).toEqual([0]);
+    expect(report.calls).toBe(1);
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('ambiguous_provider_outcome');
+    expect(report.distilled).toBe(0);
   });
 
   test('a systemic provider/config failure stops the batch after one call and stays visible', async () => {
@@ -558,6 +548,19 @@ describe('distillCaptureSessions — failure tolerance', () => {
 });
 
 describe('distillCaptureSessions — bounded work selection', () => {
+  test('exact-session execution requires the durable operational queue', async () => {
+    const { engine } = makeFakeEngine([
+      mkCapture({ slug: 'capture/canary/prompt-1', session_id: 'canary', updated_at: OLD }),
+    ]);
+
+    await expect(distillCaptureSessions(engine, {
+      now: NOW,
+      sessionIds: ['canary'],
+      maxSessions: 1,
+      maxCalls: 1,
+    })).rejects.toThrow(/durable operational state/);
+  });
+
   test('a session cap selects the oldest sessions and hydrates only their capture pages', async () => {
     const seeded: Page[] = [];
     for (let i = 0; i < 10; i++) {
@@ -661,17 +664,17 @@ describe('distillCaptureSessions — orphaned mem-K pruning', () => {
     // RETRIEVABLE stale memory.
     const { engine, deletes, chunkWrites, store } = makeFakeEngine([
       mkCapture({ slug: 'capture/sess-1/prompt-1', session_id: 'sess-1', kind: 'prompt', turn: 1, updated_at: OLD }),
-      mkCapture({ slug: 'distilled/sess-1/mem-2', compiled_truth: 'STALE memory from the longer previous run', updated_at: OLD }),
+      mkCapture({ slug: 'distilled/sess-1/g-1/mem-2', compiled_truth: 'STALE memory from the longer previous run', updated_at: OLD }),
     ]);
     stubChat(() => JSON.stringify(['The one memory this run produced.']));
 
     await distillCaptureSessions(engine, { now: NOW });
 
-    expect(deletes.map((d) => d.slug)).toEqual(['distilled/sess-1/mem-2']);
+    expect(deletes.map((d) => d.slug)).toEqual(['distilled/sess-1/g-1/mem-2']);
     expect(deletes.every((d) => d.sourceId === 'capture-events')).toBe(true);
     // and it is not left chunked/retrievable
-    expect(chunkWrites.map((c) => c.slug)).toEqual(['distilled/sess-1/mem-1']);
-    expect(store.has('distilled/sess-1/mem-2')).toBe(false);
+    expect(chunkWrites.map((c) => c.slug)).toEqual(['distilled/sess-1/g-1/mem-1']);
+    expect(store.has('distilled/sess-1/g-1/mem-2')).toBe(false);
   });
 
   test('no deletes when the run produces the same number of memories', async () => {

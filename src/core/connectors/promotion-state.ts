@@ -234,7 +234,9 @@ export async function finishPromotionDispatchAttempt(
         WHERE candidate_id = $1 AND attempt_no = $2 AND outcome = 'prepared'`,
       [candidateId, attemptNo, errorCode == null ? 'succeeded' : 'failed', errorCode],
     );
-    const failureCanApply = errorCode != null && row.state !== 'indexed';
+    // A signed callback may advance the lifecycle while the outbound fetch is still
+    // settling. Only the state that began this attempt can accept its late failure.
+    const failureCanApply = errorCode != null && row.state === 'accepted_dispatching';
     const resultingState: PromotionLifecycleState = failureCanApply ? 'dispatch_failed' : row.state;
     if (failureCanApply) {
       await tx.executeRaw(
@@ -393,6 +395,7 @@ export async function assertPromotionRetryFresh(
 export async function preparePromotionRetry(
   engine: BrainEngine,
   candidateId: number,
+  audit?: { actor: string; reason: string },
 ): Promise<PromotionTransitionRow> {
   return engine.transaction(async (tx) => {
     const rows = await tx.executeRaw<PromotionTransitionRow>(
@@ -413,9 +416,14 @@ export async function preparePromotionRetry(
     await tx.executeRaw(
       `INSERT INTO connector_promotion_events (
          candidate_id, correlation_id, event_type, from_state, requested_state,
-         resulting_state, outcome
-       ) VALUES ($1,$2,'retry','dispatch_failed','accepted_dispatching','accepted_dispatching','applied')`,
-      [candidateId, row.correlation_id],
+         resulting_state, outcome, actor, reason
+       ) VALUES ($1,$2,'retry','dispatch_failed','accepted_dispatching','accepted_dispatching','applied',$3,$4)`,
+      [
+        candidateId,
+        row.correlation_id,
+        audit?.actor.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120) || 'system',
+        audit?.reason.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240) || 'operator_retry',
+      ],
     );
     return { ...row, state: 'accepted_dispatching', failure_code: null, next_action: 'dispatch' };
   });

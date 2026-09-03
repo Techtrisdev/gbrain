@@ -285,4 +285,87 @@ describe('context_mirror_status read contract', () => {
     expect(indexed.promotion.post_approval_indexing_latency_seconds).toBeGreaterThanOrEqual(0);
     expect(indexed.promotion.proof_state).toBe('recorded');
   });
+
+  test('a failed promotion dispatch is broken even when every capture queue is empty', async () => {
+    await configureSource('default');
+    await engine.setConfig('connectors.promotion_dispatch_frozen', 'false');
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_checkpoints (source_id, checkpoint_kind, cursor, completed)
+       VALUES ('default','capture_session_scan_v1','{}'::jsonb,true)`,
+    );
+    const { row } = await toRow(engine, {
+      source_id: 'default',
+      source_record_id: 'failed-dispatch-status',
+      provider: 'context_mirror',
+      proposed_markdown: '# Failed dispatch',
+      status: 'accepted',
+      context_generation: 2,
+    });
+    await ensurePromotionTransition(engine, row);
+    await engine.executeRaw(
+      `UPDATE connector_promotion_transitions
+          SET state = 'dispatch_failed', failure_code = 'dispatch_outcome_unknown',
+              next_action = 'reconcile_dispatch'
+        WHERE candidate_id = $1`,
+      [row.id],
+    );
+
+    const result = await status(context(), 'default');
+    expect(result.overall).toEqual({
+      state: 'broken',
+      reason_codes: ['promotion_dispatch_failed'],
+      next_action: 'reconcile_or_retry_failed_promotion_dispatch',
+    });
+  });
+
+  test('review service margin is fail-closed after 14 days and accepts the exact 1.2 boundary', async () => {
+    await configureSource('default');
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_checkpoints (source_id, checkpoint_kind, cursor, completed)
+       VALUES ('default','capture_session_scan_v1','{}'::jsonb,true)`,
+    );
+    const anchor = await toRow(engine, {
+      source_id: 'default', source_record_id: 'service-anchor', provider: 'context_mirror',
+      proposed_markdown: 'historical anchor', requires_human_review: true, status: 'rejected',
+    });
+    await engine.executeRaw(
+      `UPDATE connector_candidates SET proposed_at = now() - INTERVAL '15 days',
+              acted_at = now() - INTERVAL '15 days'
+        WHERE id = $1`,
+      [anchor.row.id],
+    );
+    for (let index = 0; index < 2; index++) {
+      await toRow(engine, {
+        source_id: 'default', source_record_id: `fresh-pending-${index}`, provider: 'context_mirror',
+        proposed_markdown: 'fresh pending work', requires_human_review: false, status: 'pending',
+      });
+    }
+    const insufficient = await status(context(), 'default');
+    expect(insufficient.review.service_window.margin_state).toBe('insufficient');
+    expect(insufficient.overall.state).toBe('degraded');
+    expect(insufficient.overall.reason_codes).toContain('review_service_margin_insufficient');
+
+    await engine.executeRaw(
+      `UPDATE connector_candidates SET status = 'rejected', acted_at = now()
+        WHERE source_id = 'default' AND source_record_id LIKE 'fresh-pending-%'`,
+    );
+    for (let index = 0; index < 3; index++) {
+      const fresh = await toRow(engine, {
+        source_id: 'default', source_record_id: `fresh-complete-${index}`, provider: 'context_mirror',
+        proposed_markdown: 'fresh completed work', requires_human_review: false, status: 'rejected',
+      });
+      await engine.executeRaw(`UPDATE connector_candidates SET acted_at = now() WHERE id = $1`, [fresh.row.id]);
+    }
+    const historical = await toRow(engine, {
+      source_id: 'default', source_record_id: 'historical-complete', provider: 'context_mirror',
+      proposed_markdown: 'historical completed work', requires_human_review: true, status: 'rejected',
+    });
+    await engine.executeRaw(`UPDATE connector_candidates SET acted_at = now() WHERE id = $1`, [historical.row.id]);
+
+    const boundary = await status(context(), 'default');
+    expect(boundary.review.service_window.fresh_arrivals).toBe(5);
+    expect(boundary.review.service_window.completed_reviews).toBe(6);
+    expect(boundary.review.service_window.margin_state).toBe('sufficient');
+    expect(boundary.overall.reason_codes).not.toContain('review_service_margin_insufficient');
+  });
 });

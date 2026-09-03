@@ -37,7 +37,7 @@ import { isoWeekFilename, resolveAuditDir } from '../audit-week-file.ts';
 
 export type BudgetKind = 'chat' | 'embed' | 'rerank';
 
-export type BudgetReason = 'cost' | 'runtime' | 'no_pricing';
+export type BudgetReason = 'cost' | 'runtime' | 'no_pricing' | 'calls';
 
 export interface BudgetEstimate {
   modelId: string;
@@ -64,7 +64,11 @@ export interface BudgetSnapshot {
   elapsedMs: number;
   maxCostUsd?: number;
   maxRuntimeMs?: number;
+  maxCalls?: number;
+  callsReserved: number;
   callsRecorded: number;
+  inputTokensRecorded: number;
+  outputTokensRecorded: number;
 }
 
 export interface BudgetTrackerOpts {
@@ -72,6 +76,8 @@ export interface BudgetTrackerOpts {
   maxCostUsd?: number;
   /** Wall-clock cap in milliseconds. When undefined, runtime gate disabled. */
   maxRuntimeMs?: number;
+  /** Provider-attempt ceiling, enforced before the next gateway call. */
+  maxCalls?: number;
   /** Phase/command label used in audit rows. */
   label: string;
   /** Override the audit file path (tests + custom installers). */
@@ -162,13 +168,21 @@ function costForUsage(modelId: string, inputTokens: number, outputTokens: number
 
 export class BudgetTracker {
   private cumulativeUsd = 0;
+  private callsReserved = 0;
   private callsRecorded = 0;
+  private inputTokensRecorded = 0;
+  private outputTokensRecorded = 0;
   private readonly startedAt: number;
   private readonly auditPath: string;
   private readonly onExhaustedCbs: Array<() => void> = [];
   private exhaustedFired = false;
 
   constructor(private readonly opts: BudgetTrackerOpts) {
+    if (opts.maxCalls !== undefined && (
+      !Number.isFinite(opts.maxCalls) || !Number.isInteger(opts.maxCalls) || opts.maxCalls < 1
+    )) {
+      throw new Error('BudgetTracker maxCalls must be a finite integer >= 1');
+    }
     this.startedAt = Date.now();
     this.auditPath = opts.auditPath ?? defaultAuditPath();
   }
@@ -201,6 +215,30 @@ export class BudgetTracker {
    */
   reserve(estimate: BudgetEstimate): void {
     this.assertRuntime(estimate.modelId);
+    if (this.opts.maxCalls !== undefined && this.callsReserved >= this.opts.maxCalls) {
+      appendAuditLine(this.auditPath, {
+        schema_version: 1,
+        ts: new Date().toISOString(),
+        event: 'reserve_denied',
+        label: this.opts.label,
+        kind: estimate.kind,
+        model: estimate.modelId,
+        sub_label: estimate.label,
+        reason: 'calls',
+        calls_reserved: this.callsReserved,
+        max_calls: this.opts.maxCalls,
+      });
+      this.fireExhausted();
+      throw new BudgetExhausted(
+        `${this.opts.label}: provider call ceiling ${this.opts.maxCalls} exhausted before the next ${estimate.kind} call`,
+        {
+          reason: 'calls',
+          spent: this.callsReserved,
+          cap: this.opts.maxCalls,
+          modelId: estimate.modelId,
+        },
+      );
+    }
 
     const projected = costForUsage(
       estimate.modelId,
@@ -233,6 +271,7 @@ export class BudgetTracker {
             `Cost gate disabled for this call.\n`,
         );
       }
+      this.callsReserved++;
       appendAuditLine(this.auditPath, {
         schema_version: 1,
         ts: new Date().toISOString(),
@@ -271,6 +310,7 @@ export class BudgetTracker {
       }
     }
 
+    this.callsReserved++;
     appendAuditLine(this.auditPath, {
       schema_version: 1,
       ts: new Date().toISOString(),
@@ -296,6 +336,8 @@ export class BudgetTracker {
    */
   record(actual: BudgetActualUsage & { kind?: BudgetKind }): void {
     this.callsRecorded++;
+    this.inputTokensRecorded += actual.inputTokens;
+    this.outputTokensRecorded += actual.outputTokens ?? 0;
     const kind: BudgetKind = actual.kind ?? 'chat';
     const cost = costForUsage(actual.modelId, actual.inputTokens, actual.outputTokens ?? 0, kind);
 
@@ -352,7 +394,11 @@ export class BudgetTracker {
       elapsedMs: Date.now() - this.startedAt,
       maxCostUsd: this.opts.maxCostUsd,
       maxRuntimeMs: this.opts.maxRuntimeMs,
+      maxCalls: this.opts.maxCalls,
+      callsReserved: this.callsReserved,
       callsRecorded: this.callsRecorded,
+      inputTokensRecorded: this.inputTokensRecorded,
+      outputTokensRecorded: this.outputTokensRecorded,
     };
   }
 
