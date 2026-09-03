@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
@@ -342,7 +343,7 @@ describe('Context Mirror generation and review ledgers', () => {
       };
     });
 
-    const auditDir = mkdtempSync('D:/Temp/gbrain-targeted-canary-');
+    const auditDir = mkdtempSync(join(tmpdir(), 'gbrain-targeted-canary-'));
     let report;
     try {
       report = await consolidateContextMirrorGeneration(
