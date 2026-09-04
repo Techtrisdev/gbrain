@@ -667,13 +667,23 @@ async function reconciliationCounts(
     heads: number | string;
     pending: number | string;
   }>(
-    `SELECT
-       (SELECT count(*) FROM context_mirror_capture_membership WHERE source_id = $1) AS membership,
-       (SELECT count(*) FROM context_mirror_capture_membership
-         WHERE source_id = $1 AND identity_status = 'ambiguous') AS ambiguous,
-       (SELECT count(*) FROM context_mirror_reconciliation_heads WHERE source_id = $1) AS heads,
-       (SELECT count(*) FROM context_mirror_session_heads
-         WHERE source_id = $1 AND state = 'pending' AND current_eligible_at IS NOT NULL) AS pending`,
+    `WITH membership_counts AS (
+       SELECT count(*) AS membership,
+              count(*) FILTER (WHERE identity_status = 'ambiguous') AS ambiguous
+         FROM context_mirror_capture_membership
+        WHERE source_id = $1
+     ), head_counts AS (
+       SELECT count(*) AS heads
+         FROM context_mirror_reconciliation_heads
+        WHERE source_id = $1
+     ), pending_counts AS (
+       SELECT count(*) AS pending
+         FROM context_mirror_session_heads
+        WHERE source_id = $1 AND state = 'pending' AND current_eligible_at IS NOT NULL
+     )
+     SELECT membership_counts.membership, membership_counts.ambiguous,
+            head_counts.heads, pending_counts.pending
+       FROM membership_counts CROSS JOIN head_counts CROSS JOIN pending_counts`,
     [sourceId],
   );
   return {

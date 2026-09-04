@@ -3907,17 +3907,14 @@ const run_context_mirror_bootstrap: Operation = {
     if (!latest) {
       throw new OperationError('operation_timeout', 'Context Mirror bootstrap runtime expired before the first batch');
     }
-    const status = latest.status === 'partial' && Date.now() - started >= maxRuntimeMs
-      ? 'partial'
-      : latest.status;
     ctx.logger.info(
       `[context-mirror-admin] operation=run_context_mirror_bootstrap source=${sourceId} ` +
-      `status=${status} batches=${batches} scanned=${scanned} actor=${actor}`,
+      `status=${latest.status} batches=${batches} scanned=${scanned} actor=${actor}`,
     );
     return {
       schema_version: 2,
       source_id: sourceId,
-      status,
+      status: latest.status,
       batches,
       scanned,
       inserted_membership: insertedMembership,
