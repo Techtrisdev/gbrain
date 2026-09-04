@@ -40,6 +40,7 @@ import {
   type PhantomPassResult,
 } from './phantom-redirect.ts';
 import { embed, isAvailable } from '../ai/gateway.ts';
+import { isRawCapturePage } from '../derived-index-policy.ts';
 
 export interface ExtractFactsOpts {
   /** Subset of slugs to reconcile. undefined = walk every page in the brain. */
@@ -186,6 +187,7 @@ export async function runExtractFacts(
 
   // ── Reconcile each page ───────────────────────────────────────
   for (const slug of slugs) {
+    if (isRawCapturePage(sourceId, slug)) continue;
     result.pagesScanned += 1;
 
     const page = await engine.getPage(slug, { sourceId });

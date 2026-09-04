@@ -27,6 +27,7 @@ import { extractCodeRefs } from '../core/link-extraction.ts';
 import { slugifyCodePath } from '../core/sync.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
+import { isRawCapturePage } from '../core/derived-index-policy.ts';
 
 export interface ReconcileLinksResult {
   status: 'ok' | 'auto_link_disabled';
@@ -76,11 +77,16 @@ export async function runReconcileLinks(
   // Walk all markdown slugs. listPages(markdown-only filter) isn't exposed,
   // so filter at call time via page_kind. Not using getAllSlugs because we
   // also need compiled_truth + timeline for extractCodeRefs.
-  const mdSlugs = (await engine.executeRaw<{ slug: string }>(
-    `SELECT slug FROM pages WHERE page_kind = 'markdown' ORDER BY slug`,
-  )).map(r => r.slug);
+  const mdPages = (await engine.executeRaw<{ slug: string; source_id: string }>(
+    `SELECT slug, source_id
+       FROM pages
+      WHERE page_kind = 'markdown'
+        AND ($1::text IS NULL OR source_id = $1)
+      ORDER BY source_id, slug`,
+    [opts.sourceId ?? null],
+  )).filter(page => !isRawCapturePage(page.source_id, page.slug));
 
-  progress.start('reconcile_links.scan', mdSlugs.length);
+  progress.start('reconcile_links.scan', mdPages.length);
 
   let codeRefsFound = 0;
   let edgesAttempted = 0;
@@ -93,11 +99,9 @@ export async function runReconcileLinks(
   // intended-source row for `default`-vs-`<source>` ambiguity. The link
   // edges below also propagate the same sourceId (Data R1 MED 1: opt was
   // declared on ReconcileLinksOpts but ignored end-to-end).
-  const getPageOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  const linkOpts = opts.sourceId
-    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
-    : undefined;
-  for (const mdSlug of mdSlugs) {
+  for (const { slug: mdSlug, source_id: sourceId } of mdPages) {
+    const getPageOpts = { sourceId };
+    const linkOpts = { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId };
     const page = await engine.getPage(mdSlug, getPageOpts);
     if (!page) {
       progress.tick(1, mdSlug);
@@ -145,7 +149,7 @@ export async function runReconcileLinks(
 
   return {
     status: 'ok',
-    markdownPagesScanned: mdSlugs.length,
+    markdownPagesScanned: mdPages.length,
     codeRefsFound,
     edgesAttempted,
     edgesTargetsMissing,

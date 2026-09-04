@@ -692,6 +692,13 @@ CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS \$\$
 DECLARE
   timeline_text TEXT;
 BEGIN
+  -- Raw Context Mirror evidence is not part of retrieval. Avoid tokenizing
+  -- multi-megabyte tool output in the synchronous capture transaction.
+  IF NEW.source_id = 'capture-events' AND NEW.slug LIKE 'capture/%' THEN
+    NEW.search_vector := NULL;
+    RETURN NEW;
+  END IF;
+
   -- Gather timeline_entries text for this page
   SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
   INTO timeline_text

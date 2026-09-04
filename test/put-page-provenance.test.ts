@@ -134,6 +134,171 @@ describe('put_page provenance — trusted local caller (ctx.remote === false)', 
 });
 
 describe('put_page provenance — CV6 spoofing guard (ctx.remote !== false)', () => {
+  test('capture-events writes keep the full page but skip derived search data', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    const ctx = makeCtx({ remote: true, sourceId: 'capture-events' });
+    const rawOutput = `Raw tool output.\n${'x'.repeat(2_500_000)}`;
+
+    const result = await putPageOp.handler(ctx, {
+      slug: 'capture/session-1/tool-call-1',
+      content: `---\ntype: note\ntitle: Raw Capture\nsource_id: capture-events\ntags: [untrusted-tool-tag]\n---\n\n${rawOutput}`,
+    });
+
+    const page = await engine.getPage(
+      'capture/session-1/tool-call-1',
+      { sourceId: 'capture-events' },
+    );
+    const chunks = await engine.getChunks(
+      'capture/session-1/tool-call-1',
+      { sourceId: 'capture-events' },
+    );
+    expect(page?.compiled_truth).toContain('Raw tool output.');
+    expect(Buffer.byteLength(page?.compiled_truth ?? '', 'utf8')).toBeGreaterThan(2_500_000);
+    expect(chunks).toEqual([]);
+    expect(await engine.getTags('capture/session-1/tool-call-1', { sourceId: 'capture-events' })).toEqual([]);
+    expect(result).toMatchObject({
+      chunks: 0,
+      auto_links: { skipped: 'raw_capture' },
+      auto_timeline: { skipped: 'raw_capture' },
+      facts_backstop: { skipped: 'raw_capture' },
+      writer_lint: { skipped: 'raw_capture' },
+      write_through: { written: false, skipped: 'raw_capture' },
+    });
+    const derived = await engine.executeRaw<{
+      search_vector: unknown;
+      contextual_retrieval_mode: string | null;
+    }>(
+      `SELECT search_vector, contextual_retrieval_mode
+         FROM pages WHERE source_id = $1 AND slug = $2`,
+      ['capture-events', 'capture/session-1/tool-call-1'],
+    );
+    expect(derived[0]?.search_vector).toBeNull();
+    expect(derived[0]?.contextual_retrieval_mode).toBe('none');
+  });
+
+  test('capture-events retry removes stale chunks and generated links but preserves manual links', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    const slug = 'capture/session-1/tool-call-stale';
+    const target = 'code/test-target';
+    const content = '---\ntype: note\ntitle: Raw Capture\nsource_id: capture-events\n---\n\nPreviously indexed raw output.';
+    const ctx = makeCtx({ remote: true, sourceId: 'capture-events' });
+    await putPageOp.handler(ctx, { slug, content });
+    await engine.putPage(target, {
+      type: 'code',
+      title: 'Target',
+      compiled_truth: 'target',
+      timeline: '',
+      frontmatter: {},
+    }, { sourceId: 'capture-events' });
+    await engine.upsertChunks(slug, [{
+      chunk_index: 0,
+      chunk_text: 'stale searchable raw output',
+      chunk_source: 'compiled_truth',
+    }], { sourceId: 'capture-events' });
+    await engine.addTag(slug, 'legacy-raw-tag', { sourceId: 'capture-events' });
+    const linkOpts = {
+      fromSourceId: 'capture-events',
+      toSourceId: 'capture-events',
+      originSourceId: 'capture-events',
+    };
+    await engine.addLink(slug, target, 'generated forward', 'documents', 'markdown', slug, 'compiled_truth', linkOpts);
+    await engine.addLink(target, slug, 'generated reverse', 'documented_by', 'markdown', slug, 'compiled_truth', linkOpts);
+    // General DB extraction emits markdown links without origin provenance.
+    // Raw replay must remove those too, while retaining manual edges.
+    await engine.addLink(slug, target, 'generated without origin', 'references', 'markdown', undefined, undefined, linkOpts);
+    await engine.addLink(slug, target, 'operator link', 'related', 'manual', undefined, undefined, {
+      fromSourceId: 'capture-events',
+      toSourceId: 'capture-events',
+    });
+    expect((await engine.getChunks(slug, { sourceId: 'capture-events' })).length).toBeGreaterThan(0);
+
+    await putPageOp.handler(ctx, { slug, content });
+
+    expect(await engine.getChunks(slug, { sourceId: 'capture-events' })).toEqual([]);
+    expect(await engine.getTags(slug, { sourceId: 'capture-events' })).toEqual([]);
+    const authored = await engine.executeRaw<{ count: string | number }>(
+      `SELECT COUNT(*)::bigint AS count
+         FROM links
+        WHERE link_source IN ('markdown', 'frontmatter')
+          AND (
+            origin_page_id = (
+              SELECT id FROM pages WHERE source_id = $1 AND slug = $2
+            )
+            OR from_page_id = (
+              SELECT id FROM pages WHERE source_id = $1 AND slug = $2
+            )
+          )`,
+      ['capture-events', slug],
+    );
+    expect(Number(authored[0]?.count ?? 0)).toBe(0);
+    expect(await engine.getLinks(slug, { sourceId: 'capture-events' })).toEqual([
+      expect.objectContaining({
+        to_slug: target,
+        link_type: 'related',
+        link_source: 'manual',
+      }),
+    ]);
+  });
+
+  test('oversized raw capture reports the storage rejection explicitly', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    const ctx = makeCtx({ remote: true, sourceId: 'capture-events' });
+    const result = await putPageOp.handler(ctx, {
+      slug: 'capture/session-1/tool-call-oversized',
+      content: `---\ntype: note\ntitle: Too Large\n---\n\n${'x'.repeat(5_000_000)}`,
+    });
+
+    expect(result).toMatchObject({
+      status: 'skipped',
+      chunks: 0,
+      error: expect.stringContaining('Content too large'),
+      facts_backstop: { skipped: 'raw_capture' },
+    });
+    expect(await engine.getPage(
+      'capture/session-1/tool-call-oversized',
+      { sourceId: 'capture-events' },
+    )).toBeNull();
+  });
+
+  test('capture slugs outside capture-events still receive derived search data', async () => {
+    const ctx = makeCtx({ remote: true, sourceId: 'default' });
+
+    await putPageOp.handler(ctx, {
+      slug: 'capture/session-1/tool-call-1',
+      content: '---\ntype: note\ntitle: Ordinary Page\nsource_id: default\n---\n\nSearchable content.',
+    });
+
+    const chunks = await engine.getChunks(
+      'capture/session-1/tool-call-1',
+      { sourceId: 'default' },
+    );
+    expect(chunks.length).toBeGreaterThan(0);
+  });
+
+  test('distilled pages in capture-events still receive derived search data', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    const ctx = makeCtx({ remote: true, sourceId: 'capture-events' });
+
+    await putPageOp.handler(ctx, {
+      slug: 'distilled/session-1/memory-1',
+      content: '---\ntype: note\ntitle: Distilled Memory\nsource_id: capture-events\n---\n\nA durable memory.',
+    });
+
+    const chunks = await engine.getChunks(
+      'distilled/session-1/memory-1',
+      { sourceId: 'capture-events' },
+    );
+    expect(chunks.length).toBeGreaterThan(0);
+  });
+
   test('remote caller cannot redirect explicit source_id away from authenticated source', async () => {
     const ctx = makeCtx({ remote: true, sourceId: 'default' });
 

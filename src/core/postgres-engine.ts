@@ -30,7 +30,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import type {
-  Page, PageInput, PageFilters, PageType,
+  Page, PageInput, PageFilters, PageType, PageWriteMetadata,
   Chunk, ChunkInput, StaleChunkRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
@@ -55,6 +55,7 @@ import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildIdfRankedKeyword } from './search/sql-ranking.ts';
 import { refreshCorpusTermStats as refreshCorpusTermStatsHelper } from './search/corpus-term-stats.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { RAW_CAPTURE_SLUG_LIKE, RAW_CAPTURE_SOURCE_ID } from './derived-index-policy.ts';
 
 function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
@@ -860,6 +861,23 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page> {
+    return await this.writePage(slug, page, opts, false) as Page;
+  }
+
+  async putPageMetadata(
+    slug: string,
+    page: PageInput,
+    opts?: { sourceId?: string },
+  ): Promise<PageWriteMetadata> {
+    return await this.writePage(slug, page, opts, true) as PageWriteMetadata;
+  }
+
+  private async writePage(
+    slug: string,
+    page: PageInput,
+    opts: { sourceId?: string } | undefined,
+    metadataOnly: boolean,
+  ): Promise<Page | PageWriteMetadata> {
     slug = validateSlug(slug);
     const sql = this.sql;
     const hash = page.content_hash || contentHash(page);
@@ -915,8 +933,24 @@ export class PostgresEngine implements BrainEngine {
         source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
         ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
         ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-      RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at
+      RETURNING id, source_id, slug, type, title,
+        CASE WHEN ${metadataOnly} THEN '' ELSE compiled_truth END AS compiled_truth,
+        CASE WHEN ${metadataOnly} THEN '' ELSE timeline END AS timeline,
+        CASE WHEN ${metadataOnly} THEN '{}'::jsonb ELSE frontmatter END AS frontmatter,
+        content_hash, created_at, updated_at, effective_date, effective_date_source,
+        import_filename, source_kind, source_uri, ingested_via, ingested_at
     `;
+    if (metadataOnly) {
+      const row = rows[0] as Record<string, unknown>;
+      return {
+        id: Number(row.id),
+        source_id: String(row.source_id),
+        slug: String(row.slug),
+        content_hash: row.content_hash == null ? undefined : String(row.content_hash),
+        created_at: new Date(row.created_at as string | Date),
+        updated_at: new Date(row.updated_at as string | Date),
+      };
+    }
     return rowToPage(rows[0]);
   }
 
@@ -1076,6 +1110,9 @@ export class PostgresEngine implements BrainEngine {
     const deletedCondition = filters?.includeDeleted === true
       ? sql``
       : sql`AND p.deleted_at IS NULL`;
+    const rawCaptureCondition = filters?.excludeRawCapture === true
+      ? sql`AND NOT (p.source_id = ${RAW_CAPTURE_SOURCE_ID} AND p.slug LIKE ${RAW_CAPTURE_SLUG_LIKE})`
+      : sql``;
 
     // v0.29: ORDER BY threading via PAGE_SORT_SQL whitelist (no SQL injection).
     // postgres.js sql.unsafe lets us splice the literal fragment safely.
@@ -1085,7 +1122,7 @@ export class PostgresEngine implements BrainEngine {
     const rows = await sql`
       SELECT p.* FROM pages p
       ${tagJoin}
-      WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition}
+      WHERE 1=1 ${typeCondition} ${tagCondition} ${updatedCondition} ${slugCondition} ${sourceCondition} ${deletedCondition} ${rawCaptureCondition}
       ORDER BY ${orderBy} LIMIT ${limit} OFFSET ${offset}
     `;
 

@@ -23,6 +23,7 @@
 import type { BrainEngine } from './engine.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { lookupEmbeddingPrice, estimateCostFromChars } from './embedding-pricing.ts';
+import { RAW_CAPTURE_SLUG_LIKE, RAW_CAPTURE_SOURCE_ID } from './derived-index-policy.ts';
 
 export interface ReembedEstimate {
   pendingCount: number;
@@ -48,8 +49,9 @@ export async function computeReembedEstimate(
        FROM pages
       WHERE page_kind = 'markdown'
         AND chunker_version < $1
+        AND NOT (source_id = $2 AND slug LIKE $3)
         AND deleted_at IS NULL`,
-    [MARKDOWN_CHUNKER_VERSION],
+    [MARKDOWN_CHUNKER_VERSION, RAW_CAPTURE_SOURCE_ID, RAW_CAPTURE_SLUG_LIKE],
   );
   const pendingCount = Number(rows[0]?.pending_count ?? 0);
   const pendingChars = Number(rows[0]?.pending_chars ?? 0);

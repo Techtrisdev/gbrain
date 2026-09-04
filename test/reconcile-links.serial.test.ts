@@ -128,4 +128,25 @@ describe('Layer 8 D3 — reconcile-links', () => {
     // In PGLite that's counted as edgesAttempted without an error.
     expect(result.codeRefsFound).toBeGreaterThan(0);
   });
+
+  test('skips raw capture pages but still reconciles distilled pages in the same source', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    await engine.putPage('src-core-sync-ts', {
+      type: 'code', page_kind: 'code', title: 'sync', compiled_truth: 'code', timeline: '',
+    }, { sourceId: 'capture-events' });
+    await engine.putPage('capture/session-raw/tool-1', {
+      type: 'note', title: 'raw', compiled_truth: 'See src/core/sync.ts:10.', timeline: '',
+    }, { sourceId: 'capture-events' });
+    await engine.putPage('distilled/session-raw/memory-1', {
+      type: 'note', title: 'distilled', compiled_truth: 'See src/core/sync.ts:20.', timeline: '',
+    }, { sourceId: 'capture-events' });
+
+    await runReconcileLinks(engine, { sourceId: 'capture-events' });
+
+    expect(await engine.getLinks('capture/session-raw/tool-1', { sourceId: 'capture-events' })).toEqual([]);
+    expect((await engine.getLinks('distilled/session-raw/memory-1', { sourceId: 'capture-events' }))
+      .map(link => link.to_slug)).toContain('src-core-sync-ts');
+  });
 });

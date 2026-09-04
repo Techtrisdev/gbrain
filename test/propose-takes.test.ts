@@ -243,6 +243,29 @@ describe('extractExistingTakesForDedup', () => {
 // ─── Phase integration ──────────────────────────────────────────────
 
 describe('runPhaseProposeTakes — phase integration', () => {
+  test('excludes raw capture evidence before the paid proposal budget', async () => {
+    const pages = [
+      buildPage({ slug: 'capture/session-1/tool-call-1', body: 'untrusted raw output', sourceId: 'capture-events' }),
+      buildPage({ slug: 'distilled/session-1/memory-1', body: 'durable memory', sourceId: 'capture-events' }),
+    ];
+    const { engine } = buildMockEngine({ pages });
+    const filters: unknown[] = [];
+    const originalListPages = engine.listPages.bind(engine);
+    engine.listPages = async (value) => {
+      filters.push(value);
+      return originalListPages(value);
+    };
+    const seen: string[] = [];
+    const result = await runPhaseProposeTakes(
+      { ...buildCtx(engine), sourceId: 'capture-events' },
+      { extractor: async ({ pagePath }) => { seen.push(pagePath); return []; } },
+    );
+
+    expect(filters).toEqual([expect.objectContaining({ excludeRawCapture: true })]);
+    expect(seen).toEqual(['distilled/session-1/memory-1']);
+    expect(result.details.pages_scanned).toBe(1);
+  });
+
   test('happy path: scans pages, extracts proposals, writes via INSERT', async () => {
     const pages = [buildPage({ slug: 'wiki/concepts/network-effects', body: 'Marketplaces with cold-start liquidity always win.' })];
     const { engine, captured } = buildMockEngine({ pages });

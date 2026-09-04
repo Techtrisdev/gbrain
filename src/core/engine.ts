@@ -1,5 +1,5 @@
 import type {
-  Page, PageInput, PageFilters, GetPageOpts,
+  Page, PageInput, PageFilters, GetPageOpts, PageWriteMetadata,
   Chunk, ChunkInput, StaleChunkRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
@@ -623,6 +623,8 @@ export interface BrainEngine {
    * duplicate at (default, slug). Multi-source brains MUST pass sourceId.
    */
   putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page>;
+  /** Write a page without echoing its potentially large body back from the database. */
+  putPageMetadata(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<PageWriteMetadata>;
   /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,
    * chunk_relations via existing FK ON DELETE CASCADE.

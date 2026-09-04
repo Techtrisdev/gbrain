@@ -10,6 +10,7 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
+import { isRawCapturePage } from './derived-index-policy.ts';
 import { parseMarkdown, serializePageToMarkdown, resolvePageFilePath } from './markdown.ts';
 import { isValidSourceId } from './source-id.ts';
 import { mkdirSync, writeFileSync, existsSync, statSync } from 'fs';
@@ -676,7 +677,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries.',
+  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. Raw capture/ pages in capture-events are stored without derived search data.',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -795,8 +796,10 @@ const put_page: Operation = {
     // Skip embedding when the AI gateway has no embedding provider configured.
     // Checks all auth env vars for the resolved provider, not just OPENAI_API_KEY,
     // so Gemini / Ollama / Voyage brains don't silently drop embeddings (Codex C2).
-    const { isAvailable } = await import('./ai/gateway.ts');
-    const noEmbed = !isAvailable('embedding');
+    const skipDerivedIndex = isRawCapturePage(ctx.sourceId, slug);
+    const noEmbed = skipDerivedIndex
+      ? true
+      : !(await import('./ai/gateway.ts')).isAvailable('embedding');
     // v0.31.8 (D7 / codex OV-1): thread ctx.sourceId so put_page on a
     // multi-source brain lands in the intended source instead of the
     // default-source clobber path. importFromContent already accepts
@@ -807,21 +810,24 @@ const put_page: Operation = {
     // page_types. Best-effort: pack load failure falls back to legacy inferType
     // (parity gate preserved). Federated-read closure correction is T19's scope.
     let activePack: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> } | undefined;
-    try {
-      const { loadActivePack } = await import('./schema-pack/load-active.ts');
-      const { loadConfig } = await import('./config.ts');
-      const resolved = await loadActivePack({
-        cfg: loadConfig(),
-        remote: ctx.remote === false ? false : true,
-        sourceId: ctx.sourceId,
-      });
-      activePack = { page_types: resolved.manifest.page_types };
-    } catch {
-      // Pack load failed; fall through to legacy inferType behavior.
-      activePack = undefined;
+    if (!skipDerivedIndex) {
+      try {
+        const { loadActivePack } = await import('./schema-pack/load-active.ts');
+        const { loadConfig } = await import('./config.ts');
+        const resolved = await loadActivePack({
+          cfg: loadConfig(),
+          remote: ctx.remote === false ? false : true,
+          sourceId: ctx.sourceId,
+        });
+        activePack = { page_types: resolved.manifest.page_types };
+      } catch {
+        // Pack load failed; fall through to legacy inferType behavior.
+        activePack = undefined;
+      }
     }
     const result = await importFromContent(ctx.engine, slug, p.content as string, {
       noEmbed,
+      skipDerivedIndex,
       ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
       // v0.39.0.0 T1.5: pack-aware type inference (loaded above; legacy
       // inferType behavior when undefined).
@@ -884,7 +890,9 @@ const put_page: Operation = {
     let writeThrough: { written: boolean; path?: string; skipped?: string; error?: string } | undefined;
     const isSandboxSubagent = ctx.viaSubagent === true
       && !(Array.isArray(ctx.allowedSlugPrefixes) && ctx.allowedSlugPrefixes.length > 0);
-    if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
+    if (skipDerivedIndex) {
+      writeThrough = { written: false, skipped: 'raw_capture' };
+    } else if (!ctx.dryRun && result.status !== 'error' && !isSandboxSubagent) {
       try {
         const repoPath = await ctx.engine.getConfig('sync.repo_path');
         if (!repoPath) {
@@ -937,9 +945,9 @@ const put_page: Operation = {
     let autoLinks:
       | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
       | { error: string }
-      | { skipped: 'remote' }
+      | { skipped: 'remote' | 'raw_capture' }
       | undefined;
-    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' } | undefined;
+    let autoTimeline: { created: number } | { error: string } | { skipped: 'remote' | 'raw_capture' } | undefined;
     // Trusted-workspace path (v0.23 dream cycle) re-enables auto-link/timeline
     // even though ctx.remote=true, because the allow-list bounds the slug and
     // the synthesis prompt is itself the trusted dispatcher. Without this,
@@ -949,7 +957,10 @@ const put_page: Operation = {
     const trustedWorkspace = ctx.viaSubagent === true
       && Array.isArray(ctx.allowedSlugPrefixes)
       && ctx.allowedSlugPrefixes.length > 0;
-    if (ctx.remote !== false && !trustedWorkspace) {
+    if (skipDerivedIndex) {
+      autoLinks = { skipped: 'raw_capture' };
+      autoTimeline = { skipped: 'raw_capture' };
+    } else if (ctx.remote !== false && !trustedWorkspace) {
       autoLinks = { skipped: 'remote' };
       autoTimeline = { skipped: 'remote' };
     } else if (result.parsedPage) {
@@ -1000,37 +1011,37 @@ const put_page: Operation = {
     // (MEDIUM facts wait for the dream cycle but DO land via put_page,
     // matching the pre-fix behavior on this surface).
     let factsQueued: { queued: boolean } | { skipped: string } | undefined;
-    try {
-      const { runFactsBackstop } = await import('./facts/backstop.ts');
-      const r = await runFactsBackstop(
-        {
-          slug,
-          type: result.parsedPage!.type,
-          compiled_truth: result.parsedPage!.compiled_truth,
-          frontmatter: result.parsedPage!.frontmatter,
-        },
-        {
-          engine: ctx.engine,
-          sourceId: ctx.sourceId ?? 'default',
-          sessionId: (ctx as { source_session?: string }).source_session ?? null,
-          source: 'mcp:put_page',
-          mode: 'queue',
-        },
-      );
-      if (r.mode === 'queue' && r.enqueued) {
-        factsQueued = { queued: true };
-      } else if (r.mode === 'queue' && r.skipped) {
-        // Preserve the pre-v0.31.2 response shape for MCP clients:
-        // 'kind:guide' / 'too_short' / 'subagent_namespace' / 'dream_generated'
-        // (bare reasons), not the helper's namespaced 'eligibility_failed:...'
-        // discriminator. Map back here.
-        const bare = r.skipped.startsWith('eligibility_failed:')
-          ? r.skipped.slice('eligibility_failed:'.length)
-          : r.skipped;
-        factsQueued = { skipped: bare };
+    if (skipDerivedIndex) {
+      factsQueued = { skipped: 'raw_capture' };
+    } else if (result.parsedPage) {
+      try {
+        const { runFactsBackstop } = await import('./facts/backstop.ts');
+        const r = await runFactsBackstop(
+          {
+            slug,
+            type: result.parsedPage.type,
+            compiled_truth: result.parsedPage.compiled_truth,
+            frontmatter: result.parsedPage.frontmatter,
+          },
+          {
+            engine: ctx.engine,
+            sourceId: ctx.sourceId ?? 'default',
+            sessionId: (ctx as { source_session?: string }).source_session ?? null,
+            source: 'mcp:put_page',
+            mode: 'queue',
+          },
+        );
+        if (r.mode === 'queue' && r.enqueued) {
+          factsQueued = { queued: true };
+        } else if (r.mode === 'queue' && r.skipped) {
+          const bare = r.skipped.startsWith('eligibility_failed:')
+            ? r.skipped.slice('eligibility_failed:'.length)
+            : r.skipped;
+          factsQueued = { skipped: bare };
+        }
+      } catch {
+        factsQueued = { skipped: 'backstop_error' };
       }
-    } catch {
-      factsQueued = { skipped: 'backstop_error' };
     }
 
     // Post-write validator lint (PR 2.5): feature-flag-gated, non-blocking.
@@ -1039,25 +1050,30 @@ const put_page: Operation = {
     // ingest_log + ~/.gbrain/validator-lint.jsonl. Does NOT reject the
     // write — that's the deferred strict-mode flip after the 7-day soak.
     let writerLint: { error_count: number; warning_count: number } | { skipped: string } | undefined;
-    try {
-      const { runPostWriteLint } = await import('./output/post-write.ts');
-      const lint = await runPostWriteLint(ctx.engine, result.slug);
-      if (lint.ran) {
-        writerLint = {
-          error_count: lint.findings.filter(f => f.severity === 'error').length,
-          warning_count: lint.findings.filter(f => f.severity === 'warning').length,
-        };
-      } else if (lint.skippedReason) {
-        writerLint = { skipped: lint.skippedReason };
+    if (skipDerivedIndex) {
+      writerLint = { skipped: 'raw_capture' };
+    } else {
+      try {
+        const { runPostWriteLint } = await import('./output/post-write.ts');
+        const lint = await runPostWriteLint(ctx.engine, result.slug);
+        if (lint.ran) {
+          writerLint = {
+            error_count: lint.findings.filter(f => f.severity === 'error').length,
+            warning_count: lint.findings.filter(f => f.severity === 'warning').length,
+          };
+        } else if (lint.skippedReason) {
+          writerLint = { skipped: lint.skippedReason };
+        }
+      } catch {
+        // Non-fatal; never blocks put_page.
       }
-    } catch {
-      // Non-fatal; never blocks put_page.
     }
 
     return {
       slug: result.slug,
       status: result.status === 'imported' ? 'created_or_updated' : result.status,
       chunks: result.chunks,
+      ...(result.error ? { error: result.error } : {}),
       ...(autoLinks ? { auto_links: autoLinks } : {}),
       ...(autoTimeline ? { auto_timeline: autoTimeline } : {}),
       ...(writerLint ? { writer_lint: writerLint } : {}),

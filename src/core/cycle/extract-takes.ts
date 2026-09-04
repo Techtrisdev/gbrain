@@ -24,6 +24,7 @@ import { join, relative, sep } from 'node:path';
 import type { BrainEngine, TakeBatchInput } from '../engine.ts';
 import { parseTakesFence, type ParsedTake } from '../takes-fence.ts';
 import { walkMarkdownFiles } from '../../commands/extract.ts';
+import { isRawCapturePage } from '../derived-index-policy.ts';
 
 export interface ExtractTakesOpts {
   /** Brain repo root. Required for source='fs'. */
@@ -200,6 +201,7 @@ export async function extractTakesFromDb(
   const buffer: TakeBatchInput[] = [];
 
   for (const { slug, source_id } of refs) {
+    if (isRawCapturePage(source_id, slug)) continue;
     result.pagesScanned++;
     const page = await engine.getPage(slug, { sourceId: source_id });
     if (!page) continue;

@@ -158,6 +158,20 @@ export interface Page {
   corpus_generation?: string | null;
 }
 
+/**
+ * Small acknowledgement returned when a caller writes a page but does not
+ * need its body echoed back from the database. This matters for raw captures,
+ * whose compiled_truth can be several megabytes.
+ */
+export interface PageWriteMetadata {
+  id: number;
+  source_id: string;
+  slug: string;
+  content_hash?: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export type EffectiveDateSource =
   | 'event_date'
   | 'date'
@@ -289,6 +303,12 @@ export interface PageFilters {
    * the 72h window before the autopilot purge phase hard-deletes them.
    */
   includeDeleted?: boolean;
+  /**
+   * Exclude raw Context Mirror evidence (`capture-events:capture/*`) before
+   * sorting and LIMIT are applied. Raw evidence feeds the bounded distiller;
+   * it must not consume maintenance budgets intended for durable pages.
+   */
+  excludeRawCapture?: boolean;
   /**
    * v0.29: ORDER BY enum. Default `updated_desc` matches pre-v0.29 behavior
    * (engines hardcoded `ORDER BY updated_at DESC`). New options: `updated_asc`,

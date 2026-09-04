@@ -42,6 +42,7 @@ import {
 import { loadStorageConfig } from '../core/storage-config.ts';
 import { getDefaultSourcePath } from '../core/source-resolver.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
+import { isRawCapturePage } from '../core/derived-index-policy.ts';
 
 export interface SyncResult {
   status: 'up_to_date' | 'synced' | 'first_sync' | 'dry_run' | 'blocked_by_failures';
@@ -1115,17 +1116,21 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
   });
 
+  const derivationPagesAffected = pagesAffected.filter(
+    slug => !isRawCapturePage(opts.sourceId ?? 'default', slug),
+  );
+
   // Auto-extract links + timeline (always, extraction is cheap CPU).
   // Thread opts.sourceId so the extract phase reconciles edges + timeline
   // entries against the right source — pre-fix (Data R1 HIGH 1) this phase
   // bypassed sourceId entirely and the bare-slug subquery in addTimelineEntry
   // (Data R1 HIGH 2) crashed with 21000 in multi-source brains.
   const extractOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
-  if (!opts.noExtract && pagesAffected.length > 0) {
+  if (!opts.noExtract && derivationPagesAffected.length > 0) {
     try {
       const { extractLinksForSlugs, extractTimelineForSlugs } = await import('./extract.ts');
-      const linksCreated = await extractLinksForSlugs(engine, repoPath, pagesAffected, extractOpts);
-      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, pagesAffected, extractOpts);
+      const linksCreated = await extractLinksForSlugs(engine, repoPath, derivationPagesAffected, extractOpts);
+      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, derivationPagesAffected, extractOpts);
       if (linksCreated > 0 || timelineCreated > 0) {
         slog(`  Extracted: ${linksCreated} links, ${timelineCreated} timeline entries`);
       }
@@ -1140,10 +1145,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // ('conversation'/'transcript'/'therapy'/'call' aren't real
   // PageTypes), (b) a divergent eligibility shape from put_page,
   // and (c) raw extract→insert without dedup/supersede.
-  if (!opts.noExtract && pagesAffected.length > 0 && pagesAffected.length <= 50) {
+  if (!opts.noExtract && derivationPagesAffected.length > 0 && derivationPagesAffected.length <= 50) {
     const { runFactsBackstop } = await import('../core/facts/backstop.ts');
     const factsSourceId = opts.sourceId ?? 'default';
-    for (const slug of pagesAffected) {
+    for (const slug of derivationPagesAffected) {
       try {
         // v0.40 D21: source-scoped getPage. Pre-v0.40 this called
         // engine.getPage(slug) WITHOUT sourceId, then wrote facts under
@@ -1183,14 +1188,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // sync. Non-mismatch errors stay best-effort (rate limits, transient
   // network) — those shouldn't break sync.
   let embedded = 0;
-  if (!noEmbed && pagesAffected.length > 0 && pagesAffected.length <= 100) {
+  if (!noEmbed && derivationPagesAffected.length > 0 && derivationPagesAffected.length <= 100) {
     try {
       const { runEmbedCore } = await import('./embed.ts');
       const embedOpts = opts.sourceId
-        ? { slugs: pagesAffected, sourceId: opts.sourceId }
-        : { slugs: pagesAffected };
+        ? { slugs: derivationPagesAffected, sourceId: opts.sourceId }
+        : { slugs: derivationPagesAffected };
       await runEmbedCore(engine, embedOpts);
-      embedded = pagesAffected.length;
+      embedded = derivationPagesAffected.length;
     } catch (e: unknown) {
       const { EmbeddingDimMismatchError } = await import('./embed.ts');
       if (e instanceof EmbeddingDimMismatchError) {
