@@ -75,13 +75,11 @@ describe('safeCompare', () => {
     expect(safeCompare('0.32.0', '0.31.11')).toBe(1);
     expect(safeCompare('1.0.0', '0.99.99')).toBe(1);
   });
-  test('4-segment versions parse (4th segment ignored by underlying comparator)', () => {
-    // Underlying compareVersions from src/commands/migrations/index.ts only
-    // compares segments 0-2 — the 4th segment is intentionally ignored. This
-    // matches gbrain's actual 3-segment release practice (VERSION file).
+  test('4-segment versions compare the fourth release segment', () => {
     expect(safeCompare('0.31.4.0', '0.31.4.0')).toBe(0);
-    expect(safeCompare('0.31.4.1', '0.31.4.2')).toBe(0); // 4th segment ignored
-    expect(safeCompare('0.31.4.0', '0.31.5.0')).toBe(-1); // segment 2 differs
+    expect(safeCompare('0.31.4.1', '0.31.4.2')).toBe(-1);
+    expect(safeCompare('0.31.4.2', '0.31.4.1')).toBe(1);
+    expect(safeCompare('0.31.4.0', '0.31.5.0')).toBe(-1);
   });
   test('empty / missing / non-numeric returns null', () => {
     expect(safeCompare('', '0.31.4')).toBe(null);

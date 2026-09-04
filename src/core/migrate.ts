@@ -5804,6 +5804,67 @@ export const MIGRATIONS: Migration[] = [
       return new Set(rows.map((row) => row.table_name)).size === 4;
     },
   },
+  {
+    version: 116,
+    name: 'durable_application_migration_snapshots',
+    idempotent: true,
+    sql: '',
+    sqlFor: {
+      postgres: `
+        CREATE TABLE IF NOT EXISTS migration_page_snapshots (
+          migration_id       TEXT        NOT NULL,
+          source_id          TEXT        NOT NULL,
+          slug               TEXT        NOT NULL,
+          pre_state_hash     TEXT        NOT NULL,
+          pre_frontmatter    JSONB       NOT NULL,
+          pre_content_hash   TEXT,
+          post_content_hash  TEXT,
+          snapshot_format    TEXT        NOT NULL DEFAULT 'database_exact'
+                                           CHECK (snapshot_format IN ('database_exact','legacy_jsonl')),
+          applied_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (migration_id, source_id, slug, pre_state_hash)
+        );
+        DO $$
+        DECLARE
+          has_bypass BOOLEAN;
+        BEGIN
+          SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+          IF has_bypass THEN
+            ALTER TABLE migration_page_snapshots ENABLE ROW LEVEL SECURITY;
+          ELSE
+            RAISE EXCEPTION 'v116 durable snapshots: role % lacks BYPASSRLS; refusing to create unprotected rollback evidence', current_user;
+          END IF;
+        END $$;
+      `,
+      pglite: `
+        CREATE TABLE IF NOT EXISTS migration_page_snapshots (
+          migration_id       TEXT        NOT NULL,
+          source_id          TEXT        NOT NULL,
+          slug               TEXT        NOT NULL,
+          pre_state_hash     TEXT        NOT NULL,
+          pre_frontmatter    JSONB       NOT NULL,
+          pre_content_hash   TEXT,
+          post_content_hash  TEXT,
+          snapshot_format    TEXT        NOT NULL DEFAULT 'database_exact'
+                                           CHECK (snapshot_format IN ('database_exact','legacy_jsonl')),
+          applied_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (migration_id, source_id, slug, pre_state_hash)
+        );
+      `,
+    },
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'migration_page_snapshots'
+            AND column_name IN (
+              'migration_id','source_id','slug','pre_state_hash','pre_frontmatter',
+              'pre_content_hash','post_content_hash','snapshot_format','applied_at'
+            )`,
+      );
+      return new Set(rows.map((row) => row.column_name)).size === 9;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -2,6 +2,14 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.40.9] - 2026-09-04
+
+- Makes the v0.13.1 `validate:false` repair lossless and resumable with database-backed, source-qualified rollback snapshots.
+- Adds a current-version repair pass so installations that already recorded the earlier migration still receive the corrected repair.
+- Restores post-rollout pages that an older repair incorrectly exempted, but only when the exact legacy rollback record matches the current page; mismatches fail closed without mutation.
+- Initializes schema migrations before the application repair, fails the command when repair is incomplete, and preserves exact JSON values including integers larger than JavaScript's safe range.
+- Carries page creation/update timestamps and rollback evidence through engine migrations, and verifies atomic cleanup, retry idempotency, and cross-timezone timestamps.
+
 ## [0.40.8.1] - 2026-05-23
 
 **The README and tutorials are rewritten for someone who has never touched GBrain.** The front-door docs now read as a story you can understand cold: what GBrain does, what it looks like, how to install it, two real walkthroughs that take you from zero to a working brain. No internal jargon, no version archaeology, no assumed context.

@@ -681,6 +681,26 @@ CREATE INDEX IF NOT EXISTS idx_file_migration_ledger_status
   ON file_migration_ledger(status) WHERE status != 'complete';
 
 -- ============================================================
+-- migration_page_snapshots (v116)
+-- Durable, source-qualified rollback evidence for application-level page
+-- migrations. Intentionally has no FK to pages/sources: rollback evidence
+-- must survive a later page rename, deletion, or source removal.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS migration_page_snapshots (
+  migration_id       TEXT        NOT NULL,
+  source_id          TEXT        NOT NULL,
+  slug               TEXT        NOT NULL,
+  pre_state_hash     TEXT        NOT NULL,
+  pre_frontmatter    JSONB       NOT NULL,
+  pre_content_hash   TEXT,
+  post_content_hash  TEXT,
+  snapshot_format    TEXT        NOT NULL DEFAULT 'database_exact'
+                                 CHECK (snapshot_format IN ('database_exact','legacy_jsonl')),
+  applied_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (migration_id, source_id, slug, pre_state_hash)
+);
+
+-- ============================================================
 -- Trigger-based search_vector (spans pages + timeline_entries)
 -- ============================================================
 ALTER TABLE pages ADD COLUMN IF NOT EXISTS search_vector tsvector;
@@ -1761,6 +1781,7 @@ BEGIN
     ALTER TABLE context_mirror_reconciliation_state ENABLE ROW LEVEL SECURITY;
     ALTER TABLE context_mirror_admin_audit ENABLE ROW LEVEL SECURITY;
     ALTER TABLE file_migration_ledger ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE migration_page_snapshots ENABLE ROW LEVEL SECURITY;
     ALTER TABLE access_tokens ENABLE ROW LEVEL SECURITY;
     ALTER TABLE mcp_request_log ENABLE ROW LEVEL SECURITY;
     ALTER TABLE minion_inbox ENABLE ROW LEVEL SECURITY;
