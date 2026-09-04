@@ -798,6 +798,7 @@ async function hydrateDurableSessionPages(
          ON m.source_id = p.source_id AND m.page_id = p.id
       WHERE p.source_id = $1 AND p.deleted_at IS NULL
         AND m.identity_status = 'resolved' AND m.session_id = $4
+        AND NULLIF(p.frontmatter->>'session_id', '') = m.session_id
         AND p.slug > $2
       ORDER BY p.slug ASC
       LIMIT $3`,
@@ -1358,9 +1359,27 @@ export async function distillCaptureSessions(
     }
     const sessionPages = hydration.pages;
     const transcriptBytes = hydration.bytes;
+    const durableHead = durableHeads.get(sessionId);
+    if (durable && durableHead && !hydration.memoryLimitExceeded
+        && sessionPages.length !== summary.turns) {
+      report.failed += 1;
+      report.sessions.push({
+        ...base,
+        status: 'failed',
+        error: 'capture membership no longer matches active source pages',
+        error_class: 'validation',
+      });
+      await finishSession(engine, {
+        sourceId,
+        sessionId,
+        claimId: durableHead.claimId,
+        state: 'quarantined',
+        disposition: 'capture_membership_mismatch',
+      });
+      continue;
+    }
     const convo = assembleConversation(sessionPages);
     const estimatedInput = estimateTokens(convo);
-    const durableHead = durableHeads.get(sessionId);
     const generation = durableHead?.generation ?? 1;
     const provenance = generationProvenance(sessionPages, convo, opts.model);
     if (durable && durableHead) {

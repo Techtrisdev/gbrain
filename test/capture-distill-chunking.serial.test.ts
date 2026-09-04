@@ -606,6 +606,48 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(head).toEqual({ state: 'quarantined', disposition: 'locator_ownership_conflict' });
   });
 
+  test('a page changed after immutable admission cannot cross into another session transcript', async () => {
+    await seedCapture('capture/chunkgap-sess-1/prompt-1', 'ORIGINAL-SESSION-BODY', 1);
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now,
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      actor: 'test:reconciler',
+      reason: 'admit immutable membership',
+    });
+    await engine.executeRaw(
+      `UPDATE pages
+          SET frontmatter = jsonb_set(frontmatter, '{session_id}', '"foreign-session"'::jsonb),
+              compiled_truth = 'FOREIGN-SESSION-BODY'
+        WHERE source_id = $1 AND slug = 'capture/chunkgap-sess-1/prompt-1'`,
+      [CAPTURE_SOURCE],
+    );
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      throw new Error('must not be called');
+    });
+
+    const report = await distillCaptureSessions(engine, {
+      now,
+      sourceId: CAPTURE_SOURCE,
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+
+    expect(calls).toBe(0);
+    expect(report.failed).toBe(1);
+    expect(report.sessions[0]?.error_class).toBe('validation');
+    const [head] = await engine.executeRaw<{ state: string; disposition: string | null }>(
+      `SELECT state, disposition FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
+    expect(head).toEqual({ state: 'quarantined', disposition: 'capture_membership_mismatch' });
+  });
+
   test('bootstrap completes a head only from an exact-identity legacy marker', async () => {
     await engine.putPage(
       'capture/exact-marker/prompt-1',
