@@ -15,6 +15,7 @@
  * putPage, so it cannot observe chunking at all — passing there proves nothing
  * about the defect. The assertion that matters is `getChunks(page.id).length > 0`.
  */
+import { createHash } from 'node:crypto';
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
@@ -25,7 +26,7 @@ import {
   type ChatResult,
 } from '../src/core/ai/gateway.ts';
 import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
-import { distillCaptureSessions } from '../src/core/connectors/distill.ts';
+import { distillCaptureSessions, toSessionSlug } from '../src/core/connectors/distill.ts';
 import { contextMirrorConnector } from '../src/core/connectors/context-mirror.ts';
 import {
   advanceSessionHeadBootstrap,
@@ -240,6 +241,239 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       'sess-0001', 'sess-0002', 'sess-0003', 'sess-0004', 'sess-0005',
     ]);
   }, 30_000);
+
+  test('lossy-locator collisions keep exact sessions and transcripts separate', async () => {
+    const sessions = [
+      { id: 'a/b', prompt: 'ONLY-SLASH-PROMPT', reply: 'ONLY-SLASH-REPLY' },
+      { id: 'a b', prompt: 'ONLY-SPACE-PROMPT', reply: 'ONLY-SPACE-REPLY' },
+    ];
+    for (const [index, session] of sessions.entries()) {
+      for (const [turn, body] of [session.prompt, session.reply].entries()) {
+        await engine.putPage(
+          `capture/shared/${index}-${turn + 1}`,
+          {
+            type: 'note',
+            title: session.id,
+            compiled_truth: body,
+            timeline: '',
+            frontmatter: { session_id: session.id, kind: turn === 0 ? 'prompt' : 'reply', turn: turn + 1 },
+          } as never,
+          { sourceId: CAPTURE_SOURCE },
+        );
+      }
+    }
+
+    const calls: string[] = [];
+    __setChatTransportForTests(async (opts: ChatOpts): Promise<ChatResult> => {
+      const content = String(opts.messages[0]?.content ?? '');
+      calls.push(content);
+      return {
+        text: JSON.stringify([content.includes('ONLY-SLASH-PROMPT') ? 'slash memory' : 'space memory']),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      };
+    });
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    for (const session of sessions) {
+      const report = await distillCaptureSessions(engine, {
+        now,
+        sourceId: CAPTURE_SOURCE,
+        sessionIds: [session.id],
+        maxSessions: 1,
+        maxCalls: 1,
+      });
+      expect(report.distilled).toBe(1);
+    }
+
+    const heads = await engine.executeRaw<{ session_id: string; session_slug: string; turn_count: number | string }>(
+      `SELECT session_id, session_slug, turn_count
+         FROM context_mirror_session_heads
+        WHERE source_id = $1
+        ORDER BY session_id`,
+      [CAPTURE_SOURCE],
+    );
+    expect(heads).toHaveLength(2);
+    expect(new Set(heads.map((head) => head.session_slug)).size).toBe(2);
+    expect(heads.map((head) => Number(head.turn_count))).toEqual([2, 2]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain('ONLY-SLASH-PROMPT');
+    expect(calls[0]).toContain('ONLY-SLASH-REPLY');
+    expect(calls[0]).not.toContain('ONLY-SPACE');
+    expect(calls[1]).toContain('ONLY-SPACE-PROMPT');
+    expect(calls[1]).toContain('ONLY-SPACE-REPLY');
+    expect(calls[1]).not.toContain('ONLY-SLASH');
+
+    for (const head of heads) {
+      const marker = await engine.getPage(`distill-state/${head.session_slug}`, { sourceId: CAPTURE_SOURCE });
+      expect((marker?.frontmatter as Record<string, unknown>)?.session_id).toBe(head.session_id);
+      expect(await engine.getPage(`distilled/${head.session_slug}/g-1/mem-1`, { sourceId: CAPTURE_SOURCE })).not.toBeNull();
+    }
+  });
+
+  test('an existing locator with conflicting durable artifacts is quarantined before provider work', async () => {
+    await engine.putPage(
+      'capture/legacy/prompt-1',
+      {
+        type: 'note', title: 'legacy', compiled_truth: 'must not be processed', timeline: '',
+        frontmatter: { session_id: 'legacy', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_session_heads (
+         source_id, session_id, session_slug, capture_slug_prefix, newest_capture_at, turn_count
+       ) VALUES ($1, 'legacy', 'legacy', 'capture/legacy/', now() - INTERVAL '1 day', 1)`,
+      [CAPTURE_SOURCE],
+    );
+    await engine.putPage(
+      'distill-state/legacy',
+      {
+        type: 'note', title: 'foreign marker', compiled_truth: 'foreign marker', timeline: '',
+        frontmatter: { session_id: 'different-session', generation: 1, kind: 'distill-marker' },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+
+    await advanceSessionHeadBootstrap(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      idleHours: 6,
+      sessionSlug: (sessionId) => sessionId,
+    });
+
+    const [head] = await engine.executeRaw<{ state: string; disposition: string | null; session_slug: string }>(
+      `SELECT state, disposition, session_slug
+         FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = 'legacy'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(head).toEqual({ state: 'quarantined', disposition: 'locator_ownership_conflict', session_slug: 'legacy' });
+  });
+
+  test('a missing-ID page under a multi-session prefix blocks provider work as ambiguous', async () => {
+    for (const [slug, sessionId] of [
+      ['capture/shared/known-a', 'exact-a'],
+      ['capture/shared/known-b', 'exact-b'],
+    ] as const) {
+      await engine.putPage(
+        slug,
+        {
+          type: 'note', title: sessionId, compiled_truth: sessionId, timeline: '',
+          frontmatter: { session_id: sessionId, kind: 'prompt', turn: 1 },
+        } as never,
+        { sourceId: CAPTURE_SOURCE },
+      );
+    }
+    await engine.putPage(
+      'capture/shared/missing-id',
+      {
+        type: 'note', title: 'unknown', compiled_truth: 'AMBIGUOUS-BODY', timeline: '',
+        frontmatter: { kind: 'reply', turn: 2 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      throw new Error('must not be called');
+    });
+
+    const report = await distillCaptureSessions(engine, {
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      sourceId: CAPTURE_SOURCE,
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('identity_ambiguous');
+    expect(report.calls).toBe(0);
+    expect(calls).toBe(0);
+  });
+
+  test('bootstrap completes a head only from an exact-identity legacy marker', async () => {
+    await engine.putPage(
+      'capture/exact-marker/prompt-1',
+      {
+        type: 'note', title: 'exact marker', compiled_truth: 'already processed', timeline: '',
+        frontmatter: { session_id: 'exact-marker', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    await engine.putPage(
+      'distill-state/exact-marker',
+      {
+        type: 'note', title: 'exact marker', compiled_truth: 'done', timeline: '',
+        frontmatter: { session_id: 'exact-marker', generation: 1, kind: 'distill-marker' },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+
+    await advanceSessionHeadBootstrap(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+    });
+
+    const [head] = await engine.executeRaw<{ state: string; disposition: string | null }>(
+      `SELECT state, disposition FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = 'exact-marker'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(head).toEqual({ state: 'complete', disposition: 'legacy_marker' });
+  });
+
+  test('a conflicting digest locator rolls back without advancing bootstrap', async () => {
+    const sessionId = 'a b';
+    const digest = createHash('sha256').update(sessionId, 'utf8').digest('hex').slice(0, 12);
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_session_heads (
+         source_id, session_id, session_slug, capture_slug_prefix, newest_capture_at, turn_count
+       ) VALUES ($1, 'a/b', 'a-b', 'capture/owner/', now() - INTERVAL '1 day', 1)`,
+      [CAPTURE_SOURCE],
+    );
+    await engine.putPage(
+      `distill-state/a-b--${digest}`,
+      {
+        type: 'note', title: 'foreign marker', compiled_truth: 'foreign marker', timeline: '',
+        frontmatter: { session_id: 'foreign-owner', generation: 1, kind: 'distill-marker' },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    await engine.putPage(
+      'capture/candidate/prompt-1',
+      {
+        type: 'note', title: sessionId, compiled_truth: 'candidate', timeline: '',
+        frontmatter: { session_id: sessionId, kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+
+    await expect(advanceSessionHeadBootstrap(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+    })).rejects.toThrow('context mirror session locator ownership conflict');
+
+    const checkpoints = await engine.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_checkpoints
+        WHERE source_id = $1 AND checkpoint_kind = 'capture_session_scan_v1'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(Number(checkpoints[0]?.count ?? 0)).toBe(0);
+    const candidateHeads = await engine.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, sessionId],
+    );
+    expect(Number(candidateHeads[0]?.count ?? 0)).toBe(0);
+  });
 
   test('an exact canary lease cannot claim or call for an unrelated pending session', async () => {
     for (const sessionId of ['older-unrelated', 'named-canary']) {

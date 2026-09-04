@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
 
@@ -11,6 +11,8 @@ const DEFAULT_PENDING_REVIEW_LIMIT = 10;
 const DEFAULT_STAGING_LIMIT = 50;
 const DEFAULT_STAGING_BYTES = 25 * 1024 * 1024;
 const DEFAULT_REVIEW_MAX_AGE_HOURS = 7 * 24;
+const COLLISION_DIGEST_LENGTH = 12;
+const COLLISION_SESSION_SLUG_LENGTH = 96;
 
 export interface DurableSessionHead {
   sessionId: string;
@@ -26,6 +28,7 @@ export interface DurableSessionHead {
 export interface BootstrapResult {
   scanned: number;
   complete: boolean;
+  ambiguousIdentityPages: number;
   totalHeads: number;
   pendingEligible: number;
 }
@@ -127,6 +130,7 @@ interface CaptureMetadataRow {
 interface ScanCursor {
   updatedAt: string;
   id: number;
+  ambiguousIdentityPages: number;
 }
 
 /** Real Postgres/PGLite engines expose their driver escape hatch; lightweight
@@ -225,17 +229,87 @@ function cursorFrom(value: unknown): ScanCursor {
   const row = parseJsonObject(value);
   const updatedAt = typeof row.updated_at === 'string' ? row.updated_at : '1970-01-01T00:00:00.000Z';
   const id = Number(row.id ?? 0);
-  return { updatedAt, id: Number.isFinite(id) ? id : 0 };
+  const ambiguousIdentityPages = Number(row.ambiguous_identity_pages ?? 0);
+  return {
+    updatedAt,
+    id: Number.isFinite(id) ? id : 0,
+    ambiguousIdentityPages: Number.isFinite(ambiguousIdentityPages) ? ambiguousIdentityPages : 0,
+  };
 }
 
-function sessionIdFor(row: CaptureMetadataRow): { sessionId: string; prefix: string } | null {
+function capturePrefixFor(row: CaptureMetadataRow): string | null {
   const parts = row.slug.split('/');
   if (parts[0] !== 'capture' || !parts[1]) return null;
+  return `capture/${parts[1]}/`;
+}
+
+function sessionIdFor(
+  row: CaptureMetadataRow,
+  explicitIdsByPrefix: Map<string, Set<string>>,
+): { status: 'resolved'; sessionId: string; prefix: string } | { status: 'ambiguous' } | null {
+  const prefix = capturePrefixFor(row);
+  if (!prefix) return null;
   const fm = parseJsonObject(row.frontmatter);
-  const sessionId = typeof fm.session_id === 'string' && fm.session_id.trim()
-    ? fm.session_id.trim()
-    : parts[1];
-  return sessionId ? { sessionId, prefix: `capture/${parts[1]}/` } : null;
+  if (typeof fm.session_id === 'string' && fm.session_id.trim()) {
+    return { status: 'resolved', sessionId: fm.session_id.trim(), prefix };
+  }
+  const explicitIds = explicitIdsByPrefix.get(prefix) ?? new Set<string>();
+  if (explicitIds.size > 1) return { status: 'ambiguous' };
+  const [onlyExplicitId] = explicitIds;
+  const pathSessionId = row.slug.split('/')[1]?.trim();
+  const sessionId = onlyExplicitId ?? pathSessionId;
+  return sessionId ? { status: 'resolved', sessionId, prefix } : null;
+}
+
+function collisionSessionSlug(baseSlug: string, sessionId: string): string {
+  const digest = createHash('sha256').update(sessionId, 'utf8').digest('hex').slice(0, COLLISION_DIGEST_LENGTH);
+  const baseLimit = COLLISION_SESSION_SLUG_LENGTH - digest.length - 2;
+  const boundedBase = baseSlug.slice(0, Math.max(1, baseLimit)).replace(/-+$/g, '') || 'unknown';
+  return `${boundedBase}--${digest}`;
+}
+
+interface SessionLocatorOwnership {
+  headOwners: Set<string>;
+  artifactOwners: Array<string | null>;
+}
+
+function locatorOwnership(
+  ownershipBySlug: Map<string, SessionLocatorOwnership>,
+  sessionSlug: string,
+): SessionLocatorOwnership {
+  const current = ownershipBySlug.get(sessionSlug);
+  if (current) return current;
+  const empty = { headOwners: new Set<string>(), artifactOwners: [] };
+  ownershipBySlug.set(sessionSlug, empty);
+  return empty;
+}
+
+function resolveStoredSessionSlug(
+  sessionId: string,
+  legacySlug: string,
+  existingSlug: string | undefined,
+  ownershipBySlug: Map<string, SessionLocatorOwnership>,
+): { sessionSlug: string; ownershipConflict: boolean } {
+  const compatible = (ownership: SessionLocatorOwnership): boolean =>
+    [...ownership.headOwners].every((owner) => owner === sessionId)
+      && ownership.artifactOwners.every((owner) => owner === sessionId);
+
+  if (existingSlug) {
+    return {
+      sessionSlug: existingSlug,
+      ownershipConflict: !compatible(locatorOwnership(ownershipBySlug, existingSlug)),
+    };
+  }
+
+  if (compatible(locatorOwnership(ownershipBySlug, legacySlug))) {
+    return { sessionSlug: legacySlug, ownershipConflict: false };
+  }
+
+  const sessionSlug = collisionSessionSlug(legacySlug, sessionId);
+  if (!compatible(locatorOwnership(ownershipBySlug, sessionSlug))) {
+    throw new Error('context mirror session locator ownership conflict');
+  }
+  return { sessionSlug, ownershipConflict: false };
 }
 
 /**
@@ -280,6 +354,29 @@ export async function advanceSessionHeadBootstrap(
       LIMIT $4`,
     [opts.sourceId, cursor.updatedAt, cursor.id, batchSize],
   );
+  const missingIdPrefixes = [...new Set(rows.filter((row) => {
+    const fm = parseJsonObject(row.frontmatter);
+    return !(typeof fm.session_id === 'string' && fm.session_id.trim());
+  }).map(capturePrefixFor).filter((prefix): prefix is string => prefix !== null))];
+  const explicitIdentityRows = missingIdPrefixes.length === 0
+    ? []
+    : await engine.executeRaw<{ capture_slug_prefix: string; session_id: string }>(
+        `SELECT DISTINCT
+                'capture/' || split_part(slug, '/', 2) || '/' AS capture_slug_prefix,
+                frontmatter->>'session_id' AS session_id
+           FROM pages
+          WHERE source_id = $1 AND deleted_at IS NULL
+            AND slug LIKE 'capture/%'
+            AND 'capture/' || split_part(slug, '/', 2) || '/' = ANY($2::text[])
+            AND NULLIF(frontmatter->>'session_id', '') IS NOT NULL`,
+        [opts.sourceId, missingIdPrefixes],
+      );
+  const explicitIdsByPrefix = new Map<string, Set<string>>();
+  for (const row of explicitIdentityRows) {
+    const ids = explicitIdsByPrefix.get(row.capture_slug_prefix) ?? new Set<string>();
+    ids.add(row.session_id);
+    explicitIdsByPrefix.set(row.capture_slug_prefix, ids);
+  }
 
   const grouped = new Map<string, {
     sessionId: string;
@@ -288,9 +385,14 @@ export async function advanceSessionHeadBootstrap(
     turns: number;
     newest: Date;
   }>();
+  let ambiguousIdentityPages = 0;
   for (const row of rows) {
-    const identity = sessionIdFor(row);
+    const identity = sessionIdFor(row, explicitIdsByPrefix);
     if (!identity) continue;
+    if (identity.status === 'ambiguous') {
+      ambiguousIdentityPages += 1;
+      continue;
+    }
     const captured = new Date(row.captured_at);
     if (!Number.isFinite(captured.getTime())) continue;
     const current = grouped.get(identity.sessionId);
@@ -309,7 +411,53 @@ export async function advanceSessionHeadBootstrap(
   }
 
   await engine.transaction(async (tx) => {
+    const sessionIds = [...grouped.keys()];
+    const candidateSlugs = [...new Set([...grouped.values()].flatMap((head) => [
+      head.sessionSlug,
+      collisionSessionSlug(head.sessionSlug, head.sessionId),
+    ]))];
+    const existingHeads = sessionIds.length === 0
+      ? []
+      : await tx.executeRaw<{ session_id: string; session_slug: string }>(
+          `SELECT session_id, session_slug
+             FROM context_mirror_session_heads
+            WHERE source_id = $1
+              AND (session_id = ANY($2::text[]) OR session_slug = ANY($3::text[]))`,
+          [opts.sourceId, sessionIds, candidateSlugs],
+        );
+    const artifactRows = candidateSlugs.length === 0
+      ? []
+      : await tx.executeRaw<{ session_slug: string; session_id: string | null }>(
+          `SELECT CASE
+                    WHEN slug LIKE 'distill-state/%'
+                      THEN substr(slug, length('distill-state/') + 1)
+                    ELSE split_part(slug, '/', 2)
+                  END AS session_slug,
+                  NULLIF(frontmatter->>'session_id', '') AS session_id
+             FROM pages
+            WHERE source_id = $1 AND deleted_at IS NULL
+              AND (
+                (slug LIKE 'distill-state/%' AND substr(slug, length('distill-state/') + 1) = ANY($2::text[]))
+                OR (slug LIKE 'distilled/%' AND split_part(slug, '/', 2) = ANY($2::text[]))
+              )`,
+          [opts.sourceId, candidateSlugs],
+        );
+    const existingSlugBySession = new Map(existingHeads.map((row) => [row.session_id, row.session_slug]));
+    const ownershipBySlug = new Map<string, SessionLocatorOwnership>();
+    for (const row of existingHeads) {
+      locatorOwnership(ownershipBySlug, row.session_slug).headOwners.add(row.session_id);
+    }
+    for (const row of artifactRows) {
+      locatorOwnership(ownershipBySlug, row.session_slug).artifactOwners.push(row.session_id);
+    }
+
     for (const head of grouped.values()) {
+      const locator = resolveStoredSessionSlug(
+        head.sessionId,
+        head.sessionSlug,
+        existingSlugBySession.get(head.sessionId),
+        ownershipBySlug,
+      );
       await tx.executeRaw(
         `INSERT INTO context_mirror_session_heads (
            source_id, session_id, session_slug, capture_slug_prefix,
@@ -350,14 +498,35 @@ export async function advanceSessionHeadBootstrap(
              ELSE context_mirror_session_heads.current_generation
            END,
            updated_at = now()`,
-        [opts.sourceId, head.sessionId, head.sessionSlug, head.prefix, head.newest.toISOString(), head.turns],
+        [opts.sourceId, head.sessionId, locator.sessionSlug, head.prefix, head.newest.toISOString(), head.turns],
       );
+      locatorOwnership(ownershipBySlug, locator.sessionSlug).headOwners.add(head.sessionId);
+      if (locator.ownershipConflict) {
+        await tx.executeRaw(
+          `UPDATE context_mirror_session_heads
+              SET state = 'quarantined', disposition = 'locator_ownership_conflict',
+                  claim_id = NULL, lease_expires_at = NULL,
+                  current_eligible_at = NULL, current_cohort_at = NULL,
+                  updated_at = now()
+            WHERE source_id = $1 AND session_id = $2`,
+          [opts.sourceId, head.sessionId],
+        );
+      }
     }
     const last = rows.at(-1);
-    const complete = rows.length < batchSize;
+    const nextAmbiguousIdentityPages = cursor.ambiguousIdentityPages + ambiguousIdentityPages;
+    const complete = rows.length < batchSize && nextAmbiguousIdentityPages === 0;
     const next = last
-      ? { updated_at: new Date(last.updated_at).toISOString(), id: Number(last.id) }
-      : { updated_at: cursor.updatedAt, id: cursor.id };
+      ? {
+          updated_at: new Date(last.updated_at).toISOString(),
+          id: Number(last.id),
+          ambiguous_identity_pages: nextAmbiguousIdentityPages,
+        }
+      : {
+          updated_at: cursor.updatedAt,
+          id: cursor.id,
+          ambiguous_identity_pages: nextAmbiguousIdentityPages,
+        };
     await tx.executeRaw(
       `INSERT INTO context_mirror_checkpoints (source_id, checkpoint_kind, cursor, completed, updated_at)
        VALUES ($1, $2, $3::jsonb, $4, now())
@@ -391,6 +560,7 @@ export async function advanceSessionHeadBootstrap(
                WHERE p.source_id = h.source_id
                  AND p.slug = 'distill-state/' || h.session_slug
                  AND p.deleted_at IS NULL
+                 AND NULLIF(p.frontmatter->>'session_id', '') = h.session_id
                  AND COALESCE(
                    CASE WHEN COALESCE(p.frontmatter->>'generation', '') ~ '^\\d+$'
                      THEN (p.frontmatter->>'generation')::integer END,
@@ -410,7 +580,8 @@ export async function advanceSessionHeadBootstrap(
   );
   return {
     scanned: rows.length,
-    complete: rows.length < batchSize,
+    complete: rows.length < batchSize && cursor.ambiguousIdentityPages + ambiguousIdentityPages === 0,
+    ambiguousIdentityPages: cursor.ambiguousIdentityPages + ambiguousIdentityPages,
     totalHeads: Number(counts[0]?.total ?? 0),
     pendingEligible: Number(counts[0]?.pending ?? 0),
   };

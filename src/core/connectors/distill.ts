@@ -235,6 +235,7 @@ export type DistillStopReason =
   | 'cost_limit'
   | 'systemic_failure'
   | 'ambiguous_provider_outcome'
+  | 'identity_ambiguous'
   | 'target_unavailable'
   | 'chat_unavailable'
   | 'session_failures';
@@ -283,6 +284,7 @@ export interface DistillReport {
 
 interface CaptureSessionSummary {
   sessionId: string;
+  sessionSlug: string;
   captureSlugPrefix: string;
   turns: number;
   newestMs: number;
@@ -776,6 +778,7 @@ interface BoundedCaptureHydration {
 async function hydrateDurableSessionPages(
   engine: BrainEngine,
   sourceId: string,
+  sessionId: string,
   slugPrefix: string,
   maxBytes: number,
   deadlineMs: number,
@@ -794,9 +797,23 @@ async function hydrateDurableSessionPages(
          FROM pages
         WHERE source_id = $1 AND deleted_at IS NULL
           AND slug LIKE $2::text || '%' AND slug > $3
+          AND (
+            NULLIF(frontmatter->>'session_id', '') = $5
+            OR (
+              NULLIF(frontmatter->>'session_id', '') IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM pages peer
+                 WHERE peer.source_id = $1
+                   AND peer.deleted_at IS NULL
+                   AND peer.slug LIKE $2::text || '%'
+                   AND NULLIF(peer.frontmatter->>'session_id', '') IS NOT NULL
+                   AND NULLIF(peer.frontmatter->>'session_id', '') <> $5
+              )
+            )
+          )
         ORDER BY slug ASC
-        LIMIT $4`,
-      [sourceId, slugPrefix, after, batchSize],
+       LIMIT $4`,
+      [sourceId, slugPrefix, after, batchSize, sessionId],
     );
     for (const page of batch) {
       if (Date.now() >= deadlineMs) {
@@ -893,6 +910,7 @@ async function listCaptureSessionSummaries(
   );
   return rows.map((row) => ({
     sessionId: String(row.session_id),
+    sessionSlug: toSessionSlug(String(row.session_id)),
     captureSlugPrefix: String(row.capture_slug_prefix),
     turns: Number(row.turns),
     newestMs: new Date(row.newest_at).getTime(),
@@ -977,6 +995,7 @@ export async function distillCaptureSessions(
   let durableEligible = 0;
   let durableTotal = 0;
   let bootstrapComplete = true;
+  let bootstrapAmbiguousIdentityPages = 0;
   let summaries: CaptureSessionSummary[];
   let done: Set<string>;
 
@@ -989,6 +1008,7 @@ export async function distillCaptureSessions(
       sessionSlug: toSessionSlug,
     });
     bootstrapComplete = bootstrap.complete;
+    bootstrapAmbiguousIdentityPages = bootstrap.ambiguousIdentityPages;
     durableEligible = bootstrap.pendingEligible;
     durableTotal = bootstrap.totalHeads;
     durableRunId = await startDistillRun(engine, sourceId, {
@@ -1039,9 +1059,10 @@ export async function distillCaptureSessions(
       return report;
     }
     if (!bootstrapComplete) {
+      const identityBlocked = bootstrapAmbiguousIdentityPages > 0;
       const report: DistillReport = {
-        status: 'partial',
-        stop_reason: 'session_limit',
+        status: identityBlocked ? 'failed' : 'partial',
+        stop_reason: identityBlocked ? 'identity_ambiguous' : 'session_limit',
         source_id: sourceId,
         idle_hours_threshold: idleHours,
         dry_run: false,
@@ -1065,7 +1086,7 @@ export async function distillCaptureSessions(
       };
       await finishDistillRun(engine, durableRunId, {
         status: report.status,
-        stopReason: 'bootstrap_incomplete',
+        stopReason: identityBlocked ? 'identity_ambiguous' : 'bootstrap_incomplete',
         selected: 0,
         completed: 0,
         failed: 0,
@@ -1135,6 +1156,7 @@ export async function distillCaptureSessions(
     durableHeads = new Map(claimed.map((head) => [head.sessionId, head]));
     summaries = claimed.map((head) => ({
       sessionId: head.sessionId,
+      sessionSlug: head.sessionSlug,
       captureSlugPrefix: head.captureSlugPrefix,
       turns: head.turns,
       newestMs: head.newestMs,
@@ -1186,7 +1208,7 @@ export async function distillCaptureSessions(
 
   const selected: CaptureSessionSummary[] = [];
   for (const summary of summaries) {
-    const sessionSlug = toSessionSlug(summary.sessionId);
+    const sessionSlug = summary.sessionSlug;
     const idleHrs = (nowMs - summary.newestMs) / 3_600_000;
     const base: SessionReport = {
       session_id: summary.sessionId,
@@ -1228,7 +1250,7 @@ export async function distillCaptureSessions(
 
   const sessionBase = (summary: CaptureSessionSummary): SessionReport => ({
     session_id: summary.sessionId,
-    session_slug: toSessionSlug(summary.sessionId),
+    session_slug: summary.sessionSlug,
     turns: summary.turns,
     idle_hours: Math.round(((nowMs - summary.newestMs) / 3_600_000) * 100) / 100,
     status: 'active',
@@ -1311,7 +1333,7 @@ export async function distillCaptureSessions(
     for (let index = 0; index < selected.length; index++) {
     const summary = selected[index];
     const sessionId = summary.sessionId;
-    const sessionSlug = toSessionSlug(sessionId);
+    const sessionSlug = summary.sessionSlug;
     const base = sessionBase(summary);
 
     if (Date.now() - startedAt >= maxRuntimeMs) {
@@ -1323,6 +1345,7 @@ export async function distillCaptureSessions(
       ? await hydrateDurableSessionPages(
           engine,
           sourceId,
+          sessionId,
           summary.captureSlugPrefix,
           maxMemoryBytes,
           startedAt + maxRuntimeMs,
