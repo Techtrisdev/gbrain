@@ -525,6 +525,87 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(calls).toBe(0);
   });
 
+  test('a missing-ID page never inherits a session identity that a later capture can contradict', async () => {
+    await engine.putPage(
+      'capture/shared/known-a',
+      {
+        type: 'note', title: 'exact-a', compiled_truth: 'known session', timeline: '',
+        frontmatter: { session_id: 'exact-a', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    await engine.putPage(
+      'capture/shared/missing-id',
+      {
+        type: 'note', title: 'unknown', compiled_truth: 'MUST-NOT-BE-INFERRED', timeline: '',
+        frontmatter: { kind: 'reply', turn: 2 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      throw new Error('must not be called');
+    });
+
+    const report = await distillCaptureSessions(engine, {
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      sourceId: CAPTURE_SOURCE,
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+
+    expect(report.status).toBe('failed');
+    expect(report.stop_reason).toBe('identity_ambiguous');
+    expect(calls).toBe(0);
+    const membership = await engine.executeRaw<{ identity_status: string; session_id: string | null }>(
+      `SELECT identity_status, session_id
+         FROM context_mirror_capture_membership
+        WHERE source_id = $1 AND page_slug = 'capture/shared/missing-id'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(membership).toEqual([{ identity_status: 'ambiguous', session_id: null }]);
+  });
+
+  test('an ownerless legacy marker quarantines an unseen session instead of allowing repeat provider work', async () => {
+    await engine.putPage(
+      'capture/legacy-unowned/prompt-1',
+      {
+        type: 'note', title: 'legacy unowned', compiled_truth: 'already processed historically', timeline: '',
+        frontmatter: { session_id: 'legacy-unowned', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    await engine.putPage(
+      'distill-state/legacy-unowned',
+      {
+        type: 'note', title: 'legacy marker', compiled_truth: 'done', timeline: '',
+        frontmatter: { generation: 1, kind: 'distill-marker' },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    let calls = 0;
+    __setChatTransportForTests(async (): Promise<ChatResult> => {
+      calls += 1;
+      throw new Error('must not be called');
+    });
+
+    await distillCaptureSessions(engine, {
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      sourceId: CAPTURE_SOURCE,
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+
+    expect(calls).toBe(0);
+    const [head] = await engine.executeRaw<{ state: string; disposition: string | null }>(
+      `SELECT state, disposition FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = 'legacy-unowned'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(head).toEqual({ state: 'quarantined', disposition: 'locator_ownership_conflict' });
+  });
+
   test('bootstrap completes a head only from an exact-identity legacy marker', async () => {
     await engine.putPage(
       'capture/exact-marker/prompt-1',

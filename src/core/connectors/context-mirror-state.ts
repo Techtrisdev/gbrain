@@ -273,7 +273,6 @@ function capturePrefixFor(row: CaptureMetadataRow): string | null {
 
 function sessionIdFor(
   row: CaptureMetadataRow,
-  explicitIdsByPrefix: Map<string, Set<string>>,
 ): { status: 'resolved'; sessionId: string; prefix: string } | { status: 'ambiguous' } | null {
   const prefix = capturePrefixFor(row);
   if (!prefix) return null;
@@ -281,12 +280,7 @@ function sessionIdFor(
   if (typeof fm.session_id === 'string' && fm.session_id.trim()) {
     return { status: 'resolved', sessionId: fm.session_id.trim(), prefix };
   }
-  const explicitIds = explicitIdsByPrefix.get(prefix) ?? new Set<string>();
-  if (explicitIds.size > 1) return { status: 'ambiguous' };
-  const [onlyExplicitId] = explicitIds;
-  const pathSessionId = row.slug.split('/')[1]?.trim();
-  const sessionId = onlyExplicitId ?? pathSessionId;
-  return sessionId ? { status: 'resolved', sessionId, prefix } : null;
+  return { status: 'ambiguous' };
 }
 
 function collisionSessionSlug(baseSlug: string, sessionId: string): string {
@@ -329,15 +323,22 @@ function resolveStoredSessionSlug(
     };
   }
 
-  if (compatible(locatorOwnership(ownershipBySlug, legacySlug))) {
+  const legacyOwnership = locatorOwnership(ownershipBySlug, legacySlug);
+  if (compatible(legacyOwnership)) {
     return { sessionSlug: legacySlug, ownershipConflict: false };
+  }
+
+  const hasOwnerlessArtifact = legacyOwnership.artifactOwners.some((owner) => owner === null);
+  if (hasOwnerlessArtifact && legacyOwnership.headOwners.size === 0
+      && legacyOwnership.artifactOwners.every((owner) => owner === null)) {
+    return { sessionSlug: legacySlug, ownershipConflict: true };
   }
 
   const sessionSlug = collisionSessionSlug(legacySlug, sessionId);
   if (!compatible(locatorOwnership(ownershipBySlug, sessionSlug))) {
     throw new Error('context mirror session locator ownership conflict');
   }
-  return { sessionSlug, ownershipConflict: false };
+  return { sessionSlug, ownershipConflict: hasOwnerlessArtifact };
 }
 
 /**
@@ -382,30 +383,6 @@ export async function advanceSessionHeadBootstrap(
       LIMIT $4`,
     [opts.sourceId, cursor.updatedAt, cursor.id, batchSize],
   );
-  const missingIdPrefixes = [...new Set(rows.filter((row) => {
-    const fm = parseJsonObject(row.frontmatter);
-    return !(typeof fm.session_id === 'string' && fm.session_id.trim());
-  }).map(capturePrefixFor).filter((prefix): prefix is string => prefix !== null))];
-  const explicitIdentityRows = missingIdPrefixes.length === 0
-    ? []
-    : await engine.executeRaw<{ capture_slug_prefix: string; session_id: string }>(
-        `SELECT DISTINCT
-                'capture/' || split_part(slug, '/', 2) || '/' AS capture_slug_prefix,
-                frontmatter->>'session_id' AS session_id
-           FROM pages
-          WHERE source_id = $1 AND deleted_at IS NULL
-            AND slug LIKE 'capture/%'
-            AND 'capture/' || split_part(slug, '/', 2) || '/' = ANY($2::text[])
-            AND NULLIF(frontmatter->>'session_id', '') IS NOT NULL`,
-        [opts.sourceId, missingIdPrefixes],
-      );
-  const explicitIdsByPrefix = new Map<string, Set<string>>();
-  for (const row of explicitIdentityRows) {
-    const ids = explicitIdsByPrefix.get(row.capture_slug_prefix) ?? new Set<string>();
-    ids.add(row.session_id);
-    explicitIdsByPrefix.set(row.capture_slug_prefix, ids);
-  }
-
   const grouped = new Map<string, {
     sessionId: string;
     sessionSlug: string;
@@ -415,7 +392,7 @@ export async function advanceSessionHeadBootstrap(
   }>();
   let ambiguousIdentityPages = 0;
   for (const row of rows) {
-    const identity = sessionIdFor(row, explicitIdsByPrefix);
+    const identity = sessionIdFor(row);
     if (!identity) continue;
     if (identity.status === 'ambiguous') {
       ambiguousIdentityPages += 1;
@@ -868,31 +845,8 @@ export async function runSessionHeadReconciliationV2(
         LIMIT $4`,
       [opts.sourceId, cursorPageId, upperPageId, batchSize],
     );
-    const missingIdPrefixes = [...new Set(rows.filter((row) => {
-      const fm = parseJsonObject(row.frontmatter);
-      return !(typeof fm.session_id === 'string' && fm.session_id.trim());
-    }).map(capturePrefixFor).filter((prefix): prefix is string => prefix !== null))];
-    const explicitIdentityRows = missingIdPrefixes.length === 0
-      ? []
-      : await tx.executeRaw<{ capture_slug_prefix: string; session_id: string }>(
-          `SELECT DISTINCT
-                  'capture/' || split_part(slug, '/', 2) || '/' AS capture_slug_prefix,
-                  frontmatter->>'session_id' AS session_id
-             FROM pages
-            WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE 'capture/%'
-              AND 'capture/' || split_part(slug, '/', 2) || '/' = ANY($2::text[])
-              AND NULLIF(frontmatter->>'session_id', '') IS NOT NULL`,
-          [opts.sourceId, missingIdPrefixes],
-        );
-    const explicitIdsByPrefix = new Map<string, Set<string>>();
-    for (const row of explicitIdentityRows) {
-      const ids = explicitIdsByPrefix.get(row.capture_slug_prefix) ?? new Set<string>();
-      ids.add(row.session_id);
-      explicitIdsByPrefix.set(row.capture_slug_prefix, ids);
-    }
-
     const membershipInput = rows.map((row) => {
-      const identity = sessionIdFor(row, explicitIdsByPrefix);
+      const identity = sessionIdFor(row);
       const capturedAt = new Date(row.captured_at);
       const validCapturedAt = Number.isFinite(capturedAt.getTime()) ? capturedAt : new Date(row.updated_at);
       return identity?.status === 'resolved'
