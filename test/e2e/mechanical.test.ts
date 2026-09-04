@@ -19,6 +19,8 @@ import {
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
+import { runSessionHeadReconciliationV2 } from '../../src/core/connectors/context-mirror-state.ts';
+import { toSessionSlug } from '../../src/core/connectors/distill.ts';
 
 // Skip all E2E tests if no database is configured
 const skip = !hasDatabase();
@@ -1441,4 +1443,90 @@ describeE2E('E2E: Performance Baselines', () => {
     console.log(`    Search p99: ${p99.toFixed(0)}ms`);
     console.log(`    Link + backlink: ${linkMs.toFixed(0)}ms`);
   }, 30_000);
+});
+
+describeE2E('E2E: Context Mirror reconciliation JSONB', () => {
+  const sourceId = 'default';
+
+  async function clearSourceState(): Promise<void> {
+    const engine = getEngine();
+    for (const table of [
+      'context_mirror_admin_audit',
+      'context_mirror_capture_membership',
+      'context_mirror_reconciliation_heads',
+      'context_mirror_reconciliation_state',
+      'context_mirror_session_heads',
+    ]) {
+      await engine.executeRaw(`DELETE FROM ${table} WHERE source_id = $1`, [sourceId]);
+    }
+    await engine.executeRaw(
+      `DELETE FROM pages WHERE source_id = $1 AND slug LIKE 'capture/%'`,
+      [sourceId],
+    );
+  }
+
+  beforeAll(async () => {
+    await setupDB();
+    await clearSourceState();
+  });
+
+  afterAll(async () => {
+    await clearSourceState();
+    await teardownDB();
+  });
+
+  test('passes recordset batches as JSON arrays through the Postgres driver', async () => {
+    const engine = getEngine();
+    await engine.putPage(
+      'capture/example-session/prompt-1',
+      {
+        type: 'note',
+        title: 'Example session',
+        compiled_truth: 'Example prompt',
+        timeline: '',
+        frontmatter: {
+          session_id: 'example-session',
+          kind: 'prompt',
+          turn: 1,
+          captured_at: '2026-01-01T00:00:00.000Z',
+        },
+      } as never,
+      { sourceId },
+    );
+
+    const result = await runSessionHeadReconciliationV2(engine, {
+      sourceId,
+      now: new Date('2026-01-02T00:00:00.000Z'),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:postgres-jsonb',
+      reason: 'verify JSON array binding',
+    });
+
+    expect(result).toMatchObject({
+      status: 'complete',
+      scanned: 1,
+      insertedMembership: 1,
+      membership: 1,
+      totalHeads: 1,
+    });
+
+    const auditKinds = await engine.executeRaw<{
+      operation: string;
+      before_kind: string;
+      after_kind: string;
+    }>(
+      `SELECT operation,
+              jsonb_typeof(before_counts) AS before_kind,
+              jsonb_typeof(after_counts) AS after_kind
+         FROM context_mirror_admin_audit
+        WHERE source_id = $1 AND operation LIKE 'context_mirror_reconcile_v2_%'
+        ORDER BY id`,
+      [sourceId],
+    );
+    expect(auditKinds).toHaveLength(3);
+    expect(auditKinds.every((row) => row.before_kind === 'object')).toBe(true);
+    expect(auditKinds.every((row) => row.after_kind === 'object')).toBe(true);
+  });
 });
