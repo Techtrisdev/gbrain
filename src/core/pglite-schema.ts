@@ -163,6 +163,22 @@ CREATE INDEX IF NOT EXISTS pages_coalesce_date_idx
 CREATE INDEX IF NOT EXISTS pages_last_retrieved_at_idx
   ON pages (last_retrieved_at);
 
+-- Durable rollback evidence for application-level page migrations (v116).
+-- No page/source FK: evidence must survive later rename/delete operations.
+CREATE TABLE IF NOT EXISTS migration_page_snapshots (
+  migration_id       TEXT        NOT NULL,
+  source_id          TEXT        NOT NULL,
+  slug               TEXT        NOT NULL,
+  pre_state_hash     TEXT        NOT NULL,
+  pre_frontmatter    JSONB       NOT NULL,
+  pre_content_hash   TEXT,
+  post_content_hash  TEXT,
+  snapshot_format    TEXT        NOT NULL DEFAULT 'database_exact'
+                                 CHECK (snapshot_format IN ('database_exact','legacy_jsonl')),
+  applied_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (migration_id, source_id, slug, pre_state_hash)
+);
+
 -- ============================================================
 -- content_chunks: chunked content with embeddings
 -- ============================================================

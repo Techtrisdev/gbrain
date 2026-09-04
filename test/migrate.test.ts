@@ -39,6 +39,19 @@ describe('migrate', () => {
   // and are covered in the E2E suite (test/e2e/mechanical.test.ts)
 });
 
+describe('migration v116 durable application migration snapshots', () => {
+  const migration = MIGRATIONS.find((m) => m.version === 116);
+
+  test('ships engine-specific schema and protects PostgreSQL rollback evidence with RLS', () => {
+    expect(migration).toBeDefined();
+    expect(migration?.idempotent).toBe(true);
+    expect(migration?.sqlFor?.postgres).toContain('CREATE TABLE IF NOT EXISTS migration_page_snapshots');
+    expect(migration?.sqlFor?.postgres).toContain('ALTER TABLE migration_page_snapshots ENABLE ROW LEVEL SECURITY');
+    expect(migration?.sqlFor?.postgres).toContain('lacks BYPASSRLS');
+    expect(migration?.sqlFor?.pglite).toContain('CREATE TABLE IF NOT EXISTS migration_page_snapshots');
+  });
+});
+
 describe('migration v114 raw capture derived-index cleanup', () => {
   const migration = MIGRATIONS.find((m) => m.version === 114);
 

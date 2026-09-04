@@ -44,18 +44,21 @@ describe('migration registry', () => {
 describe('compareVersions', () => {
   test('equal versions return 0', () => {
     expect(compareVersions('1.2.3', '1.2.3')).toBe(0);
+    expect(compareVersions('0.40.8.1', '0.40.8.1')).toBe(0);
   });
 
   test('newer returns 1', () => {
     expect(compareVersions('1.2.4', '1.2.3')).toBe(1);
     expect(compareVersions('1.3.0', '1.2.9')).toBe(1);
     expect(compareVersions('2.0.0', '1.99.99')).toBe(1);
+    expect(compareVersions('0.40.8.2', '0.40.8.1')).toBe(1);
   });
 
   test('older returns -1', () => {
     expect(compareVersions('1.2.2', '1.2.3')).toBe(-1);
     expect(compareVersions('0.11.0', '0.11.1')).toBe(-1);
     expect(compareVersions('0.11.0', '0.12.0')).toBe(-1);
+    expect(compareVersions('0.40.8.1', '0.40.8.2')).toBe(-1);
   });
 
   test('handles single-digit versions', () => {

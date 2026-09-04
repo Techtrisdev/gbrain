@@ -15,7 +15,7 @@ import { v0_11_0 } from './v0_11_0.ts';
 import { v0_12_0 } from './v0_12_0.ts';
 import { v0_12_2 } from './v0_12_2.ts';
 import { v0_13_0 } from './v0_13_0.ts';
-import { v0_13_1 } from './v0_13_1.ts';
+import { v0_13_1, v0_40_9 } from './v0_13_1.ts';
 import { v0_14_0 } from './v0_14_0.ts';
 import { v0_16_0 } from './v0_16_0.ts';
 import { v0_18_0 } from './v0_18_0.ts';
@@ -43,6 +43,7 @@ export const migrations: Migration[] = [
   v0_29_1,
   v0_31_0,
   v0_32_2,
+  v0_40_9,
 ];
 
 /** Look up a migration by exact version string. */
@@ -53,14 +54,15 @@ export function getMigration(version: string): Migration | null {
 export type { Migration, FeaturePitch, OrchestratorOpts, OrchestratorResult } from './types.ts';
 
 /**
- * Compare two semver strings (MAJOR.MINOR.PATCH). Returns -1 / 0 / 1.
+ * Compare dotted numeric release versions, including the four-part versions
+ * used by GBrain patch releases. Returns -1 / 0 / 1.
  * Extracted from src/commands/upgrade.ts#isNewerThan for shared use across
  * the migration runner + post-upgrade pitch path.
  */
 export function compareVersions(a: string, b: string): -1 | 0 | 1 {
   const va = a.split('.').map(n => parseInt(n, 10) || 0);
   const vb = b.split('.').map(n => parseInt(n, 10) || 0);
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
     const da = va[i] ?? 0;
     const db = vb[i] ?? 0;
     if (da > db) return 1;

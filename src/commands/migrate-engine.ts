@@ -10,7 +10,7 @@
 import { createEngine } from '../core/engine-factory.ts';
 import { loadConfig, saveConfig, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
-import type { EngineConfig } from '../core/types.ts';
+import type { EngineConfig, Page } from '../core/types.ts';
 import { writeFileSync, readFileSync, existsSync, unlinkSync } from 'fs';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
@@ -55,6 +55,88 @@ interface MigrateManifest {
   started_at: string;
 }
 
+interface MigrationPageSnapshotRow {
+  migration_id: string;
+  source_id: string;
+  slug: string;
+  pre_state_hash: string;
+  pre_frontmatter_text: string;
+  pre_content_hash: string | null;
+  post_content_hash: string | null;
+  snapshot_format: string;
+  applied_at_utc: string;
+}
+
+async function hasMigrationSnapshotTable(engine: BrainEngine): Promise<boolean> {
+  const rows = await engine.executeRaw<{ present: number }>(
+    `SELECT 1 AS present FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_name = 'migration_page_snapshots'`,
+  );
+  return rows.length === 1;
+}
+
+async function countMigrationPageSnapshots(engine: BrainEngine): Promise<number> {
+  if (!await hasMigrationSnapshotTable(engine)) return 0;
+  const rows = await engine.executeRaw<{ count: number | string }>(
+    'SELECT COUNT(*) AS count FROM migration_page_snapshots',
+  );
+  return Number(rows[0]?.count ?? 0);
+}
+
+async function clearMigrationTarget(engine: BrainEngine): Promise<void> {
+  await engine.transaction(async (tx) => {
+    await tx.executeRaw('DELETE FROM pages');
+    await tx.executeRaw('DELETE FROM migration_page_snapshots');
+  });
+}
+
+/** Copy rollback evidence exactly; never round-trip JSONB through JavaScript. */
+async function copyMigrationPageSnapshots(source: BrainEngine, target: BrainEngine): Promise<number> {
+  if (!await hasMigrationSnapshotTable(source)) return 0;
+  if (!await hasMigrationSnapshotTable(target)) {
+    throw new Error('target schema is missing migration_page_snapshots');
+  }
+  const rows = await source.executeRaw<MigrationPageSnapshotRow>(
+    `SELECT migration_id, source_id, slug, pre_state_hash,
+            pre_frontmatter::text AS pre_frontmatter_text,
+            pre_content_hash, post_content_hash, snapshot_format,
+            (applied_at AT TIME ZONE 'UTC')::text AS applied_at_utc
+       FROM migration_page_snapshots
+      ORDER BY migration_id, source_id, slug, pre_state_hash`,
+  );
+  for (const row of rows) {
+    const inserted = await target.executeRaw<{ migration_id: string }>(
+      `INSERT INTO migration_page_snapshots
+         (migration_id, source_id, slug, pre_state_hash, pre_frontmatter,
+          pre_content_hash, post_content_hash, snapshot_format, applied_at)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::timestamp AT TIME ZONE 'UTC')
+       ON CONFLICT (migration_id, source_id, slug, pre_state_hash) DO NOTHING
+       RETURNING migration_id`,
+      [
+        row.migration_id, row.source_id, row.slug, row.pre_state_hash,
+        row.pre_frontmatter_text, row.pre_content_hash, row.post_content_hash,
+        row.snapshot_format, row.applied_at_utc,
+      ],
+    );
+    if (inserted.length === 1) continue;
+    const existing = await target.executeRaw<MigrationPageSnapshotRow>(
+      `SELECT migration_id, source_id, slug, pre_state_hash,
+              pre_frontmatter::text AS pre_frontmatter_text,
+              pre_content_hash, post_content_hash, snapshot_format,
+              (applied_at AT TIME ZONE 'UTC')::text AS applied_at_utc
+         FROM migration_page_snapshots
+        WHERE migration_id = $1 AND source_id = $2 AND slug = $3 AND pre_state_hash = $4`,
+      [row.migration_id, row.source_id, row.slug, row.pre_state_hash],
+    );
+    if (JSON.stringify(existing[0]) !== JSON.stringify(row)) {
+      throw new Error(
+        `target has conflicting migration snapshot: ${row.migration_id}:${row.source_id}:${row.slug}:${row.pre_state_hash}`,
+      );
+    }
+  }
+  return rows.length;
+}
+
 function loadManifest(): MigrateManifest | null {
   const path = getManifestPath();
   if (!existsSync(path)) return null;
@@ -72,6 +154,29 @@ function saveManifest(manifest: MigrateManifest): void {
 function clearManifest(): void {
   const path = getManifestPath();
   if (existsSync(path)) unlinkSync(path);
+}
+
+/** Copy the page body and preserve the timestamps used by era-sensitive repairs. */
+async function copyPageCore(target: BrainEngine, page: Page): Promise<void> {
+  await target.putPage(page.slug, {
+    type: page.type,
+    title: page.title,
+    compiled_truth: page.compiled_truth,
+    timeline: page.timeline,
+    frontmatter: page.frontmatter,
+    content_hash: page.content_hash,
+  }, { sourceId: page.source_id });
+  const preserved = await target.executeRaw<{ id: string }>(
+    `UPDATE pages
+        SET created_at = $3::timestamptz,
+            updated_at = $4::timestamptz
+      WHERE source_id = $1 AND slug = $2
+      RETURNING id`,
+    [page.source_id, page.slug, page.created_at.toISOString(), page.updated_at.toISOString()],
+  );
+  if (preserved.length !== 1) {
+    throw new Error(`failed to preserve page timestamps: ${page.source_id}:${page.slug}`);
+  }
 }
 
 export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]): Promise<void> {
@@ -108,14 +213,18 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
 
   // Check if target has data
   const targetStats = await targetEngine.getStats();
-  if (targetStats.page_count > 0 && !opts.force) {
-    console.error(`Target brain is not empty (${targetStats.page_count} pages).`);
+  const targetSnapshotCount = await countMigrationPageSnapshots(targetEngine);
+  const targetHasData = targetStats.page_count > 0 || targetSnapshotCount > 0;
+  if (targetHasData && !opts.force) {
+    console.error(
+      `Target brain is not empty (${targetStats.page_count} pages, ${targetSnapshotCount} migration snapshots).`,
+    );
     console.error('Run with --force to overwrite, or migrate to an empty brain.');
     await targetEngine.disconnect();
     process.exit(1);
   }
 
-  if (targetStats.page_count > 0 && opts.force) {
+  if (targetHasData && opts.force) {
     console.log('--force: wiping target brain...');
     // v0.18.0+ multi-source: deletePage(slug) is now source-scoped (defaults
     // to 'default'), so per-page iteration would skip non-default-source
@@ -123,7 +232,7 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     // brain — all sources, all pages — so we issue a raw DELETE that matches
     // the original semantic. Cascades through content_chunks / page_links /
     // tags / timeline_entries / page_versions via existing FKs.
-    await targetEngine.executeRaw('DELETE FROM pages');
+    await clearMigrationTarget(targetEngine);
   }
 
   // Load or create manifest for resume
@@ -166,15 +275,8 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     // wrong row.
     const sourceOpts = { sourceId: page.source_id };
 
-    // Copy page (preserve source_id)
-    await targetEngine.putPage(page.slug, {
-      type: page.type,
-      title: page.title,
-      compiled_truth: page.compiled_truth,
-      timeline: page.timeline,
-      frontmatter: page.frontmatter,
-      content_hash: page.content_hash,
-    }, sourceOpts);
+    // Copy the page without losing its original era or source identity.
+    await copyPageCore(targetEngine, page);
 
     // Copy chunks with embeddings.
     const chunks = await sourceEngine.getChunksWithEmbeddings(page.slug, sourceOpts);
@@ -224,6 +326,11 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     progress.tick(1, page.slug);
   }
   progress.finish();
+
+  const snapshotsCopied = await copyMigrationPageSnapshots(sourceEngine, targetEngine);
+  if (snapshotsCopied > 0) {
+    console.log(`Copied ${snapshotsCopied} durable migration rollback snapshot(s).`);
+  }
 
   // Copy links (after all pages exist in target).
   // v0.32.8 F8: thread source_id so cross-source links migrate correctly.
@@ -296,6 +403,13 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
 
   await targetEngine.disconnect();
 }
+
+export const __testing = {
+  copyMigrationPageSnapshots,
+  countMigrationPageSnapshots,
+  clearMigrationTarget,
+  copyPageCore,
+};
 
 /**
  * Lightweight doctor-style verify run against the migrated target.
