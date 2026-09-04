@@ -29,8 +29,8 @@ import { AIConfigError, AITransientError } from '../src/core/ai/errors.ts';
 import { distillCaptureSessions, toSessionSlug } from '../src/core/connectors/distill.ts';
 import { contextMirrorConnector } from '../src/core/connectors/context-mirror.ts';
 import {
-  advanceSessionHeadBootstrap,
   claimPendingSessionHeads,
+  runSessionHeadReconciliationV2,
 } from '../src/core/connectors/context-mirror-state.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
@@ -220,19 +220,21 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
          FROM generate_series(1, 3000) AS i`,
     );
     const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const complete: boolean[] = [];
+    const statuses: string[] = [];
     let last;
-    for (let i = 0; i < 4; i++) {
-      last = await advanceSessionHeadBootstrap(engine, {
+    for (let i = 0; i < 3; i++) {
+      last = await runSessionHeadReconciliationV2(engine, {
         sourceId: CAPTURE_SOURCE,
         now,
         idleHours: 6,
         sessionSlug: (sessionId) => sessionId,
         batchSize: 1_000,
+        actor: 'test:reconciler',
+        reason: 'large inventory',
       });
-      complete.push(last.complete);
+      statuses.push(last.status);
     }
-    expect(complete).toEqual([false, false, false, true]);
+    expect(statuses).toEqual(['partial', 'partial', 'complete']);
     expect(last).toMatchObject({ totalHeads: 3_000, pendingEligible: 3_000 });
 
     const claimed = await claimPendingSessionHeads(engine, CAPTURE_SOURCE, 5, now);
@@ -241,6 +243,132 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       'sess-0001', 'sess-0002', 'sess-0003', 'sess-0004', 'sess-0005',
     ]);
   }, 30_000);
+
+  test('v2 reconciliation counts each immutable page once and tails later arrivals', async () => {
+    await seedCapture('capture/chunkgap-sess-1/prompt-1', 'first prompt', 1);
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    const first = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now,
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'initial inventory',
+    });
+    const replay = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now,
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'idempotency check',
+    });
+
+    expect(first).toMatchObject({ status: 'complete', scanned: 1, membership: 1, totalHeads: 1 });
+    expect(replay).toMatchObject({ status: 'complete', scanned: 0, membership: 1, totalHeads: 1 });
+    let [head] = await engine.executeRaw<{ turn_count: number | string }>(
+      `SELECT turn_count FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
+    expect(Number(head?.turn_count)).toBe(1);
+
+    await seedCapture('capture/chunkgap-sess-1/reply-1', 'later reply', 2);
+    const tail = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(now.getTime() + 60_000),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'tail arrival',
+    });
+    expect(tail).toMatchObject({ status: 'complete', scanned: 1, membership: 2, totalHeads: 1 });
+    [head] = await engine.executeRaw<{ turn_count: number | string }>(
+      `SELECT turn_count FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = $2`,
+      [CAPTURE_SOURCE, SESSION_ID],
+    );
+    expect(Number(head?.turn_count)).toBe(2);
+    const audit = await engine.executeRaw<{ operation: string; actor: string; reason: string }>(
+      `SELECT operation, actor, reason FROM context_mirror_admin_audit
+        WHERE source_id = $1 ORDER BY id`,
+      [CAPTURE_SOURCE],
+    );
+    expect(audit.map((row) => row.operation)).toEqual([
+      'context_mirror_reconcile_v2_initialize',
+      'context_mirror_reconcile_v2_lease',
+      'context_mirror_reconcile_v2_batch',
+      'context_mirror_reconcile_v2_lease',
+      'context_mirror_reconcile_v2_batch',
+      'context_mirror_reconcile_v2_lease',
+      'context_mirror_reconcile_v2_batch',
+    ]);
+    expect(audit.every((row) => row.actor === 'test:reconciler')).toBe(true);
+    expect(audit.some((row) => row.reason === 'tail arrival')).toBe(true);
+    await engine.executeRaw(
+      `DELETE FROM pages WHERE source_id = $1 AND slug = 'capture/chunkgap-sess-1/reply-1'`,
+      [CAPTURE_SOURCE],
+    );
+    const [retained] = await engine.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_capture_membership WHERE source_id = $1`,
+      [CAPTURE_SOURCE],
+    );
+    expect(Number(retained?.count)).toBe(2);
+  });
+
+  test('v2 reconciliation refuses an active writer and fences an expired owner', async () => {
+    await seedCapture('capture/chunkgap-sess-1/prompt-1', 'single prompt', 1);
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id, version, phase, cursor_page_id, scan_upper_page_id,
+         lease_generation, lease_owner, lease_expires_at
+       ) VALUES ($1, 2, 'rebuilding', 0,
+         (SELECT max(id) FROM pages WHERE source_id = $1),
+         7, 'active-owner', now() + INTERVAL '5 minutes')`,
+      [CAPTURE_SOURCE],
+    );
+
+    const busy = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:second-worker',
+      reason: 'concurrent attempt',
+    });
+    expect(busy).toMatchObject({ status: 'busy', scanned: 0, leaseGeneration: 7 });
+
+    await engine.executeRaw(
+      `UPDATE context_mirror_reconciliation_state
+          SET lease_expires_at = now() - INTERVAL '1 second'
+        WHERE source_id = $1`,
+      [CAPTURE_SOURCE],
+    );
+    const replacement = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:replacement-worker',
+      reason: 'expired lease replacement',
+    });
+    expect(replacement.status).toBe('complete');
+    expect(replacement.leaseGeneration).toBe(8);
+    const staleUpdate = await engine.executeRaw<{ source_id: string }>(
+      `UPDATE context_mirror_reconciliation_state
+          SET cursor_page_id = 0
+        WHERE source_id = $1 AND lease_generation = 7 AND lease_owner = 'active-owner'
+        RETURNING source_id`,
+      [CAPTURE_SOURCE],
+    );
+    expect(staleUpdate).toHaveLength(0);
+  });
 
   test('lossy-locator collisions keep exact sessions and transcripts separate', async () => {
     const sessions = [
@@ -338,11 +466,13 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       { sourceId: CAPTURE_SOURCE },
     );
 
-    await advanceSessionHeadBootstrap(engine, {
+    await runSessionHeadReconciliationV2(engine, {
       sourceId: CAPTURE_SOURCE,
       now: new Date(Date.now() + 24 * 60 * 60 * 1000),
       idleHours: 6,
       sessionSlug: (sessionId) => sessionId,
+      actor: 'test:reconciler',
+      reason: 'artifact ownership check',
     });
 
     const [head] = await engine.executeRaw<{ state: string; disposition: string | null; session_slug: string }>(
@@ -413,11 +543,13 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       { sourceId: CAPTURE_SOURCE },
     );
 
-    await advanceSessionHeadBootstrap(engine, {
+    await runSessionHeadReconciliationV2(engine, {
       sourceId: CAPTURE_SOURCE,
       now: new Date(Date.now() + 24 * 60 * 60 * 1000),
       idleHours: 6,
       sessionSlug: toSessionSlug,
+      actor: 'test:reconciler',
+      reason: 'marker identity check',
     });
 
     const [head] = await engine.executeRaw<{ state: string; disposition: string | null }>(
@@ -454,25 +586,41 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       { sourceId: CAPTURE_SOURCE },
     );
 
-    await expect(advanceSessionHeadBootstrap(engine, {
+    await expect(runSessionHeadReconciliationV2(engine, {
       sourceId: CAPTURE_SOURCE,
       now: new Date(Date.now() + 24 * 60 * 60 * 1000),
       idleHours: 6,
       sessionSlug: toSessionSlug,
+      actor: 'test:reconciler',
+      reason: 'locator collision rollback',
     })).rejects.toThrow('context mirror session locator ownership conflict');
 
-    const checkpoints = await engine.executeRaw<{ count: number | string }>(
-      `SELECT count(*) AS count FROM context_mirror_checkpoints
-        WHERE source_id = $1 AND checkpoint_kind = 'capture_session_scan_v1'`,
+    const checkpoints = await engine.executeRaw<{ cursor_page_id: number | string }>(
+      `SELECT cursor_page_id FROM context_mirror_reconciliation_state WHERE source_id = $1`,
       [CAPTURE_SOURCE],
     );
-    expect(Number(checkpoints[0]?.count ?? 0)).toBe(0);
+    expect(Number(checkpoints[0]?.cursor_page_id ?? 0)).toBe(0);
     const candidateHeads = await engine.executeRaw<{ count: number | string }>(
       `SELECT count(*) AS count FROM context_mirror_session_heads
         WHERE source_id = $1 AND session_id = $2`,
       [CAPTURE_SOURCE, sessionId],
     );
     expect(Number(candidateHeads[0]?.count ?? 0)).toBe(0);
+    const [rolledBack] = await engine.executeRaw<{
+      membership: number | string;
+      shadow_heads: number | string;
+      batch_audits: number | string;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM context_mirror_capture_membership WHERE source_id = $1) AS membership,
+         (SELECT count(*) FROM context_mirror_reconciliation_heads WHERE source_id = $1) AS shadow_heads,
+         (SELECT count(*) FROM context_mirror_admin_audit
+           WHERE source_id = $1 AND operation = 'context_mirror_reconcile_v2_batch') AS batch_audits`,
+      [CAPTURE_SOURCE],
+    );
+    expect(Number(rolledBack?.membership)).toBe(0);
+    expect(Number(rolledBack?.shadow_heads)).toBe(0);
+    expect(Number(rolledBack?.batch_audits)).toBe(0);
   });
 
   test('an exact canary lease cannot claim or call for an unrelated pending session', async () => {

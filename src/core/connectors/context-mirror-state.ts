@@ -4,6 +4,8 @@ import type { BrainEngine } from '../engine.ts';
 
 const BOOTSTRAP_CHECKPOINT = 'capture_session_scan_v1';
 const DEFAULT_BOOTSTRAP_BATCH = 5_000;
+const RECONCILIATION_VERSION = 2;
+const DEFAULT_RECONCILIATION_LEASE_MS = 60_000;
 const CLAIM_LEASE_MS = 15 * 60_000;
 const PARTITION_LEASE_MS = 15 * 60_000;
 const REVIEW_RESERVATION_MS = 60 * 60_000;
@@ -31,6 +33,21 @@ export interface BootstrapResult {
   ambiguousIdentityPages: number;
   totalHeads: number;
   pendingEligible: number;
+}
+
+export interface ReconciliationV2Result {
+  status: 'busy' | 'partial' | 'complete' | 'blocked';
+  schemaVersion: 2;
+  scanned: number;
+  insertedMembership: number;
+  membership: number;
+  ambiguousIdentityPages: number;
+  totalHeads: number;
+  pendingEligible: number;
+  cursorPageId: number;
+  scanUpperPageId: number;
+  leaseGeneration: number;
+  resumeFingerprint: string;
 }
 
 export interface CircuitState {
@@ -131,6 +148,17 @@ interface ScanCursor {
   updatedAt: string;
   id: number;
   ambiguousIdentityPages: number;
+}
+
+interface ReconciliationStateRow {
+  phase: 'rebuilding' | 'tailing' | 'blocked';
+  cursor_page_id: number | string;
+  scan_upper_page_id: number | string;
+  lease_generation: number | string;
+  lease_owner: string | null;
+  membership_count: number | string;
+  ambiguous_count: number | string;
+  head_count: number | string;
 }
 
 /** Real Postgres/PGLite engines expose their driver escape hatch; lightweight
@@ -585,6 +613,585 @@ export async function advanceSessionHeadBootstrap(
     totalHeads: Number(counts[0]?.total ?? 0),
     pendingEligible: Number(counts[0]?.pending ?? 0),
   };
+}
+
+function reconciliationFingerprint(value: Record<string, unknown>): string {
+  return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
+function boundedAuditText(value: string, fallback: string, limit: number): string {
+  return value.replace(/[\r\n\t]+/g, ' ').trim().slice(0, limit) || fallback;
+}
+
+function reconciliationResult(
+  state: ReconciliationStateRow,
+  counts: { membership: number; ambiguous: number; heads: number; pending: number },
+  status: ReconciliationV2Result['status'],
+  scanned: number,
+  insertedMembership: number,
+): ReconciliationV2Result {
+  const cursorPageId = Number(state.cursor_page_id);
+  const scanUpperPageId = Number(state.scan_upper_page_id);
+  const leaseGeneration = Number(state.lease_generation);
+  return {
+    status,
+    schemaVersion: 2,
+    scanned,
+    insertedMembership,
+    membership: counts.membership,
+    ambiguousIdentityPages: counts.ambiguous,
+    totalHeads: counts.heads,
+    pendingEligible: counts.pending,
+    cursorPageId,
+    scanUpperPageId,
+    leaseGeneration,
+    resumeFingerprint: reconciliationFingerprint({
+      version: RECONCILIATION_VERSION,
+      status,
+      cursor_page_id: cursorPageId,
+      scan_upper_page_id: scanUpperPageId,
+      membership: counts.membership,
+      ambiguous: counts.ambiguous,
+      heads: counts.heads,
+    }),
+  };
+}
+
+async function reconciliationCounts(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<{ membership: number; ambiguous: number; heads: number; pending: number }> {
+  const rows = await engine.executeRaw<{
+    membership: number | string;
+    ambiguous: number | string;
+    heads: number | string;
+    pending: number | string;
+  }>(
+    `SELECT
+       (SELECT count(*) FROM context_mirror_capture_membership WHERE source_id = $1) AS membership,
+       (SELECT count(*) FROM context_mirror_capture_membership
+         WHERE source_id = $1 AND identity_status = 'ambiguous') AS ambiguous,
+       (SELECT count(*) FROM context_mirror_reconciliation_heads WHERE source_id = $1) AS heads,
+       (SELECT count(*) FROM context_mirror_session_heads
+         WHERE source_id = $1 AND state = 'pending' AND current_eligible_at IS NOT NULL) AS pending`,
+    [sourceId],
+  );
+  return {
+    membership: Number(rows[0]?.membership ?? 0),
+    ambiguous: Number(rows[0]?.ambiguous ?? 0),
+    heads: Number(rows[0]?.heads ?? 0),
+    pending: Number(rows[0]?.pending ?? 0),
+  };
+}
+
+/**
+ * Reconcile raw capture metadata into exact session heads without hydrating a
+ * transcript or calling a provider. Page IDs are admitted once into an
+ * immutable membership ledger. Each affected head is then replaced from the
+ * ledger aggregate, so a retry cannot increment its turn count twice.
+ *
+ * The lease is acquired in its own short transaction. Every work transaction
+ * checks the monotonic generation and owner under row lock before it writes;
+ * an expired worker therefore cannot overwrite a replacement worker.
+ */
+export async function runSessionHeadReconciliationV2(
+  engine: BrainEngine,
+  opts: {
+    sourceId: string;
+    now: Date;
+    idleHours: number;
+    sessionSlug: (sessionId: string) => string;
+    batchSize?: number;
+    leaseMs?: number;
+    actor: string;
+    reason: string;
+  },
+): Promise<ReconciliationV2Result> {
+  const batchSize = opts.batchSize ?? DEFAULT_BOOTSTRAP_BATCH;
+  const leaseMs = opts.leaseMs ?? DEFAULT_RECONCILIATION_LEASE_MS;
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 5_000) {
+    throw new Error('context mirror reconciliation batchSize must be an integer from 1 to 5000');
+  }
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < 1_000 || leaseMs > 5 * 60_000) {
+    throw new Error('context mirror reconciliation leaseMs must be an integer from 1000 to 300000');
+  }
+  if (!Number.isFinite(opts.now.getTime()) || !Number.isFinite(opts.idleHours) || opts.idleHours < 0) {
+    throw new Error('context mirror reconciliation time bounds are invalid');
+  }
+  const actor = boundedAuditText(opts.actor, 'system', 120);
+  const reason = boundedAuditText(opts.reason, 'bounded reconciliation', 240);
+  const owner = randomUUID();
+  const requestFingerprint = reconciliationFingerprint({
+    version: RECONCILIATION_VERSION,
+    source_id: opts.sourceId,
+    batch_size: batchSize,
+    idle_hours: opts.idleHours,
+  });
+
+  await engine.transaction(async (tx) => {
+    const initialized = await tx.executeRaw<{ source_id: string; scan_upper_page_id: number | string }>(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id, version, phase, cursor_page_id, scan_upper_page_id
+       ) VALUES (
+         $1, 2, 'rebuilding', 0,
+         COALESCE((SELECT max(id) FROM pages
+                    WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE 'capture/%'), 0)
+       ) ON CONFLICT (source_id) DO NOTHING
+       RETURNING source_id, scan_upper_page_id`,
+      [opts.sourceId],
+    );
+    if (initialized[0]) {
+      await tx.executeRaw(
+        `INSERT INTO context_mirror_admin_audit (
+           source_id, operation, actor, reason, request_fingerprint,
+           precondition_fingerprint, outcome, before_counts, after_counts, receipt_ref
+         ) VALUES ($1, 'context_mirror_reconcile_v2_initialize', $2, $3, $4, $5,
+                   'initialized', '{}'::jsonb, $6::jsonb, 'reconcile-v2:initialize')`,
+        [
+          opts.sourceId,
+          actor,
+          reason,
+          requestFingerprint,
+          reconciliationFingerprint({ state: 'absent' }),
+          JSON.stringify({ scan_upper_page_id: Number(initialized[0].scan_upper_page_id) }),
+        ],
+      );
+    }
+  });
+
+  const acquired = await engine.transaction(async (tx) => {
+    const beforeRows = await tx.executeRaw<ReconciliationStateRow>(
+      `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
+              lease_owner, membership_count, ambiguous_count, head_count
+         FROM context_mirror_reconciliation_state
+        WHERE source_id = $1 FOR UPDATE`,
+      [opts.sourceId],
+    );
+    const before = beforeRows[0];
+    if (!before) throw new Error('context mirror reconciliation state unavailable');
+    const rows = await tx.executeRaw<ReconciliationStateRow>(
+      `UPDATE context_mirror_reconciliation_state
+          SET lease_generation = lease_generation + 1,
+              lease_owner = $2,
+              lease_expires_at = now() + ($3::text || ' milliseconds')::interval,
+              scan_upper_page_id = CASE
+                WHEN phase IN ('tailing','blocked') THEN GREATEST(
+                  scan_upper_page_id,
+                  COALESCE((SELECT max(id) FROM pages
+                             WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE 'capture/%'), 0)
+                )
+                ELSE scan_upper_page_id
+              END,
+              updated_at = now()
+        WHERE source_id = $1
+          AND (lease_owner IS NULL OR lease_expires_at <= now())
+      RETURNING phase, cursor_page_id, scan_upper_page_id, lease_generation,
+                lease_owner, membership_count, ambiguous_count, head_count`,
+      [opts.sourceId, owner, leaseMs],
+    );
+    const row = rows[0];
+    if (!row) return null;
+    await tx.executeRaw(
+      `INSERT INTO context_mirror_admin_audit (
+         source_id, operation, actor, reason, request_fingerprint,
+         precondition_fingerprint, outcome, before_counts, after_counts, receipt_ref
+       ) VALUES ($1, 'context_mirror_reconcile_v2_lease', $2, $3, $4, $5,
+                 'acquired', $6::jsonb, $7::jsonb, $8)`,
+      [
+        opts.sourceId,
+        actor,
+        reason,
+        requestFingerprint,
+        reconciliationFingerprint({
+          phase: before.phase,
+          cursor_page_id: Number(before.cursor_page_id),
+          lease_generation: Number(before.lease_generation),
+        }),
+        JSON.stringify({ cursor_page_id: Number(before.cursor_page_id), lease_generation: Number(before.lease_generation) }),
+        JSON.stringify({ cursor_page_id: Number(row.cursor_page_id), lease_generation: Number(row.lease_generation) }),
+        `reconcile-v2:${row.lease_generation}`,
+      ],
+    );
+    return row;
+  });
+
+  if (!acquired) {
+    const [state] = await engine.executeRaw<ReconciliationStateRow>(
+      `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
+              lease_owner, membership_count, ambiguous_count, head_count
+         FROM context_mirror_reconciliation_state WHERE source_id = $1`,
+      [opts.sourceId],
+    );
+    if (!state) throw new Error('context mirror reconciliation state unavailable');
+    const counts = await reconciliationCounts(engine, opts.sourceId);
+    return reconciliationResult(state, counts, 'busy', 0, 0);
+  }
+
+  const leaseGeneration = Number(acquired.lease_generation);
+  return await engine.transaction(async (tx) => {
+    const stateRows = await tx.executeRaw<ReconciliationStateRow>(
+      `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
+              lease_owner, membership_count, ambiguous_count, head_count
+         FROM context_mirror_reconciliation_state
+        WHERE source_id = $1 FOR UPDATE`,
+      [opts.sourceId],
+    );
+    const state = stateRows[0];
+    if (!state || state.lease_owner !== owner || Number(state.lease_generation) !== leaseGeneration) {
+      throw new Error('context mirror reconciliation lease lost');
+    }
+
+    const cursorPageId = Number(state.cursor_page_id);
+    const upperPageId = Number(state.scan_upper_page_id);
+    const rows = await tx.executeRaw<CaptureMetadataRow>(
+      `SELECT id, slug, frontmatter,
+              CASE
+                WHEN COALESCE(frontmatter->>'captured_at', '') ~ '^\\d{4}-\\d{2}-\\d{2}T'
+                  THEN (frontmatter->>'captured_at')::timestamptz
+                ELSE updated_at
+              END AS captured_at,
+              updated_at
+         FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE 'capture/%'
+          AND id > $2 AND id <= $3
+        ORDER BY id ASC
+        LIMIT $4`,
+      [opts.sourceId, cursorPageId, upperPageId, batchSize],
+    );
+    const missingIdPrefixes = [...new Set(rows.filter((row) => {
+      const fm = parseJsonObject(row.frontmatter);
+      return !(typeof fm.session_id === 'string' && fm.session_id.trim());
+    }).map(capturePrefixFor).filter((prefix): prefix is string => prefix !== null))];
+    const explicitIdentityRows = missingIdPrefixes.length === 0
+      ? []
+      : await tx.executeRaw<{ capture_slug_prefix: string; session_id: string }>(
+          `SELECT DISTINCT
+                  'capture/' || split_part(slug, '/', 2) || '/' AS capture_slug_prefix,
+                  frontmatter->>'session_id' AS session_id
+             FROM pages
+            WHERE source_id = $1 AND deleted_at IS NULL AND slug LIKE 'capture/%'
+              AND 'capture/' || split_part(slug, '/', 2) || '/' = ANY($2::text[])
+              AND NULLIF(frontmatter->>'session_id', '') IS NOT NULL`,
+          [opts.sourceId, missingIdPrefixes],
+        );
+    const explicitIdsByPrefix = new Map<string, Set<string>>();
+    for (const row of explicitIdentityRows) {
+      const ids = explicitIdsByPrefix.get(row.capture_slug_prefix) ?? new Set<string>();
+      ids.add(row.session_id);
+      explicitIdsByPrefix.set(row.capture_slug_prefix, ids);
+    }
+
+    const membershipInput = rows.map((row) => {
+      const identity = sessionIdFor(row, explicitIdsByPrefix);
+      const capturedAt = new Date(row.captured_at);
+      const validCapturedAt = Number.isFinite(capturedAt.getTime()) ? capturedAt : new Date(row.updated_at);
+      return identity?.status === 'resolved'
+        ? {
+            page_id: Number(row.id), page_slug: row.slug, identity_status: 'resolved',
+            session_id: identity.sessionId, capture_slug_prefix: identity.prefix,
+            captured_at: validCapturedAt.toISOString(),
+          }
+        : {
+            page_id: Number(row.id), page_slug: row.slug, identity_status: 'ambiguous',
+            session_id: null, capture_slug_prefix: capturePrefixFor(row),
+            captured_at: validCapturedAt.toISOString(),
+          };
+    });
+    const inserted = membershipInput.length === 0
+      ? []
+      : await tx.executeRaw<{ page_id: number | string }>(
+          `WITH incoming AS (
+             SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
+               page_id bigint, page_slug text, identity_status text,
+               session_id text, capture_slug_prefix text, captured_at timestamptz
+             )
+           )
+           INSERT INTO context_mirror_capture_membership (
+             source_id, page_id, page_slug, identity_status,
+             session_id, capture_slug_prefix, captured_at
+           )
+           SELECT $1, page_id, page_slug, identity_status,
+                  session_id, capture_slug_prefix, captured_at
+             FROM incoming
+           ON CONFLICT (source_id, page_id) DO NOTHING
+           RETURNING page_id`,
+          [opts.sourceId, JSON.stringify(membershipInput)],
+        );
+
+    const sessionIds = [...new Set(membershipInput
+      .filter((item) => item.identity_status === 'resolved' && item.session_id)
+      .map((item) => item.session_id as string))];
+    const aggregates = sessionIds.length === 0
+      ? []
+      : await tx.executeRaw<{
+          session_id: string;
+          capture_slug_prefix: string;
+          turn_count: number | string;
+          newest_capture_at: Date | string;
+        }>(
+          `SELECT session_id,
+                  min(capture_slug_prefix) AS capture_slug_prefix,
+                  count(*) AS turn_count,
+                  max(captured_at) AS newest_capture_at
+             FROM context_mirror_capture_membership
+            WHERE source_id = $1 AND identity_status = 'resolved'
+              AND session_id = ANY($2::text[])
+            GROUP BY session_id`,
+          [opts.sourceId, sessionIds],
+        );
+    const candidateSlugs = [...new Set(aggregates.flatMap((head) => {
+      const legacy = opts.sessionSlug(head.session_id);
+      return [legacy, collisionSessionSlug(legacy, head.session_id)];
+    }))];
+    const existingHeads = sessionIds.length === 0
+      ? []
+      : await tx.executeRaw<{ session_id: string; session_slug: string }>(
+          `SELECT DISTINCT session_id, session_slug FROM (
+             SELECT session_id, session_slug FROM context_mirror_session_heads
+              WHERE source_id = $1
+                AND (session_id = ANY($2::text[]) OR session_slug = ANY($3::text[]))
+             UNION ALL
+             SELECT session_id, session_slug FROM context_mirror_reconciliation_heads
+              WHERE source_id = $1
+                AND (session_id = ANY($2::text[]) OR session_slug = ANY($3::text[]))
+           ) owned`,
+          [opts.sourceId, sessionIds, candidateSlugs],
+        );
+    const artifactRows = candidateSlugs.length === 0
+      ? []
+      : await tx.executeRaw<{ session_slug: string; session_id: string | null }>(
+          `SELECT CASE
+                    WHEN slug LIKE 'distill-state/%' THEN substr(slug, length('distill-state/') + 1)
+                    ELSE split_part(slug, '/', 2)
+                  END AS session_slug,
+                  NULLIF(frontmatter->>'session_id', '') AS session_id
+             FROM pages
+            WHERE source_id = $1 AND deleted_at IS NULL
+              AND ((slug LIKE 'distill-state/%' AND substr(slug, length('distill-state/') + 1) = ANY($2::text[]))
+                OR (slug LIKE 'distilled/%' AND split_part(slug, '/', 2) = ANY($2::text[])))`,
+          [opts.sourceId, candidateSlugs],
+        );
+    const existingSlugBySession = new Map(existingHeads.map((row) => [row.session_id, row.session_slug]));
+    const ownershipBySlug = new Map<string, SessionLocatorOwnership>();
+    for (const row of existingHeads) locatorOwnership(ownershipBySlug, row.session_slug).headOwners.add(row.session_id);
+    for (const row of artifactRows) locatorOwnership(ownershipBySlug, row.session_slug).artifactOwners.push(row.session_id);
+
+    const headInput = aggregates.map((head) => {
+      const legacySlug = opts.sessionSlug(head.session_id);
+      const locator = resolveStoredSessionSlug(
+        head.session_id,
+        legacySlug,
+        existingSlugBySession.get(head.session_id),
+        ownershipBySlug,
+      );
+      locatorOwnership(ownershipBySlug, locator.sessionSlug).headOwners.add(head.session_id);
+      return {
+        session_id: head.session_id,
+        session_slug: locator.sessionSlug,
+        capture_slug_prefix: head.capture_slug_prefix,
+        newest_capture_at: new Date(head.newest_capture_at).toISOString(),
+        turn_count: Number(head.turn_count),
+        ownership_conflict: locator.ownershipConflict,
+      };
+    });
+    if (headInput.length > 0) {
+      await tx.executeRaw(
+        `WITH incoming AS (
+           SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
+             session_id text, session_slug text, capture_slug_prefix text,
+             newest_capture_at timestamptz, turn_count integer, ownership_conflict boolean
+           )
+         )
+         INSERT INTO context_mirror_reconciliation_heads (
+           source_id, session_id, session_slug, capture_slug_prefix,
+           newest_capture_at, turn_count, state, disposition
+         )
+         SELECT $1, session_id, session_slug, capture_slug_prefix,
+                newest_capture_at, turn_count,
+                CASE WHEN ownership_conflict THEN 'quarantined' ELSE 'ready' END,
+                CASE WHEN ownership_conflict THEN 'locator_ownership_conflict' ELSE NULL END
+           FROM incoming
+         ON CONFLICT (source_id, session_id) DO UPDATE SET
+           session_slug = EXCLUDED.session_slug,
+           capture_slug_prefix = EXCLUDED.capture_slug_prefix,
+           newest_capture_at = EXCLUDED.newest_capture_at,
+           turn_count = EXCLUDED.turn_count,
+           state = EXCLUDED.state,
+           disposition = EXCLUDED.disposition,
+           updated_at = now()`,
+        [opts.sourceId, JSON.stringify(headInput)],
+      );
+    }
+
+    const last = rows.at(-1);
+    const nextCursor = last ? Number(last.id) : cursorPageId;
+    const reachedUpper = nextCursor >= upperPageId;
+    const ambiguousRows = await tx.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_capture_membership
+        WHERE source_id = $1 AND identity_status = 'ambiguous'`,
+      [opts.sourceId],
+    );
+    const ambiguousCount = Number(ambiguousRows[0]?.count ?? 0);
+    const initialActivation = reachedUpper && state.phase !== 'tailing' && ambiguousCount === 0;
+    const updateLiveHeads = initialActivation || state.phase === 'tailing';
+    if (updateLiveHeads) {
+      await tx.executeRaw(
+        `INSERT INTO context_mirror_session_heads (
+           source_id, session_id, session_slug, capture_slug_prefix,
+           newest_capture_at, turn_count, state, disposition
+         )
+         SELECT source_id, session_id, session_slug, capture_slug_prefix,
+                newest_capture_at, turn_count,
+                CASE WHEN state = 'quarantined' THEN 'quarantined' ELSE 'pending' END,
+                disposition
+           FROM context_mirror_reconciliation_heads
+          WHERE source_id = $1
+            AND ($2::boolean OR session_id = ANY($3::text[]))
+         ON CONFLICT (source_id, session_id) DO UPDATE SET
+           capture_slug_prefix = EXCLUDED.capture_slug_prefix,
+           newest_capture_at = EXCLUDED.newest_capture_at,
+           turn_count = EXCLUDED.turn_count,
+           state = CASE
+             WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN 'quarantined'
+             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
+              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN 'pending'
+             ELSE context_mirror_session_heads.state
+           END,
+           disposition = CASE
+             WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN EXCLUDED.disposition
+             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
+              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN NULL
+             ELSE context_mirror_session_heads.disposition
+           END,
+           current_eligible_at = CASE
+             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
+              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN NULL
+             ELSE context_mirror_session_heads.current_eligible_at
+           END,
+           current_cohort_at = CASE
+             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
+              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN NULL
+             ELSE context_mirror_session_heads.current_cohort_at
+           END,
+           current_generation = CASE
+             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
+              AND context_mirror_session_heads.state IN ('complete','quarantined')
+                THEN context_mirror_session_heads.current_generation + 1
+             ELSE context_mirror_session_heads.current_generation
+           END,
+           claim_id = CASE WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN NULL
+                           ELSE context_mirror_session_heads.claim_id END,
+           lease_expires_at = CASE WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN NULL
+                                   ELSE context_mirror_session_heads.lease_expires_at END,
+           updated_at = now()`,
+        [opts.sourceId, initialActivation, sessionIds],
+      );
+    }
+    if (initialActivation) {
+      await tx.executeRaw(
+        `UPDATE context_mirror_session_heads h
+            SET state = 'quarantined', disposition = 'v2_membership_missing',
+                claim_id = NULL, lease_expires_at = NULL,
+                current_eligible_at = NULL, current_cohort_at = NULL, updated_at = now()
+          WHERE h.source_id = $1
+            AND NOT EXISTS (
+              SELECT 1 FROM context_mirror_capture_membership m
+               WHERE m.source_id = h.source_id AND m.session_id = h.session_id
+                 AND m.identity_status = 'resolved'
+            )`,
+        [opts.sourceId],
+      );
+    }
+
+    const threshold = new Date(opts.now.getTime() - opts.idleHours * 3_600_000).toISOString();
+    if (updateLiveHeads) await tx.executeRaw(
+      `UPDATE context_mirror_session_heads
+          SET first_eligible_at = COALESCE(first_eligible_at, $2::timestamptz),
+              cohort_at = COALESCE(cohort_at, $2::timestamptz),
+              current_eligible_at = COALESCE(current_eligible_at, $2::timestamptz),
+              current_cohort_at = COALESCE(current_cohort_at, $2::timestamptz),
+              updated_at = now()
+        WHERE source_id = $1 AND state = 'pending'
+          AND newest_capture_at <= $3::timestamptz`,
+      [opts.sourceId, opts.now.toISOString(), threshold],
+    );
+    if (updateLiveHeads) await tx.executeRaw(
+      `UPDATE context_mirror_session_heads h
+          SET state = 'complete', disposition = COALESCE(disposition, 'legacy_marker'), updated_at = now()
+        WHERE h.source_id = $1 AND h.state IN ('pending','claimed','result_persisted')
+          AND EXISTS (
+            SELECT 1 FROM pages p
+             WHERE p.source_id = h.source_id AND p.slug = 'distill-state/' || h.session_slug
+               AND p.deleted_at IS NULL
+               AND NULLIF(p.frontmatter->>'session_id', '') = h.session_id
+               AND COALESCE(
+                 CASE WHEN COALESCE(p.frontmatter->>'generation', '') ~ '^\\d+$'
+                   THEN (p.frontmatter->>'generation')::integer END, 1
+               ) = h.current_generation
+          )`,
+      [opts.sourceId],
+    );
+
+    const counts = await reconciliationCounts(tx, opts.sourceId);
+    const phase: ReconciliationStateRow['phase'] = counts.ambiguous > 0
+      ? 'blocked'
+      : reachedUpper ? 'tailing' : 'rebuilding';
+    const status: ReconciliationV2Result['status'] = counts.ambiguous > 0
+      ? 'blocked'
+      : reachedUpper ? 'complete' : 'partial';
+    const nextStateRows = await tx.executeRaw<ReconciliationStateRow>(
+      `UPDATE context_mirror_reconciliation_state
+          SET phase = $4,
+              cursor_page_id = $5,
+              membership_count = $6,
+              ambiguous_count = $7,
+              head_count = $8,
+              last_complete_at = CASE WHEN $4 = 'tailing' THEN now() ELSE last_complete_at END,
+              last_tail_at = CASE WHEN $4 IN ('tailing','blocked') THEN now() ELSE last_tail_at END,
+              lease_owner = NULL,
+              lease_expires_at = NULL,
+              updated_at = now()
+        WHERE source_id = $1 AND lease_owner = $2 AND lease_generation = $3
+      RETURNING phase, cursor_page_id, scan_upper_page_id, lease_generation,
+                lease_owner, membership_count, ambiguous_count, head_count`,
+      [
+        opts.sourceId, owner, leaseGeneration, phase, nextCursor,
+        counts.membership, counts.ambiguous, counts.heads,
+      ],
+    );
+    const nextState = nextStateRows[0];
+    if (!nextState) throw new Error('context mirror reconciliation lease lost');
+    await tx.executeRaw(
+      `INSERT INTO context_mirror_admin_audit (
+         source_id, operation, actor, reason, request_fingerprint,
+         precondition_fingerprint, outcome, before_counts, after_counts, receipt_ref
+       ) VALUES ($1, 'context_mirror_reconcile_v2_batch', $2, $3, $4, $5,
+                 $6, $7::jsonb, $8::jsonb, $9)`,
+      [
+        opts.sourceId,
+        actor,
+        reason,
+        requestFingerprint,
+        reconciliationFingerprint({
+          cursor_page_id: cursorPageId,
+          scan_upper_page_id: upperPageId,
+          lease_generation: leaseGeneration,
+        }),
+        status,
+        JSON.stringify({ cursor_page_id: cursorPageId, membership: Number(state.membership_count) }),
+        JSON.stringify({
+          cursor_page_id: nextCursor,
+          membership: counts.membership,
+          ambiguous: counts.ambiguous,
+          heads: counts.heads,
+          scanned: rows.length,
+          inserted_membership: inserted.length,
+        }),
+        `reconcile-v2:${leaseGeneration}`,
+      ],
+    );
+    return reconciliationResult(nextState, counts, status, rows.length, inserted.length);
+  });
 }
 
 /** Mark abandoned sends ambiguous before claiming more work; they cannot be replayed automatically. */

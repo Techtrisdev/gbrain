@@ -149,6 +149,13 @@ export interface ContextMirrorStatusV1 {
     last_downstream_at: string | null;
     bootstrap_complete: boolean | null;
     bootstrap_checkpoint_at: string | null;
+    reconciliation_version: number | null;
+    reconciliation_phase: 'rebuilding' | 'tailing' | 'blocked' | null;
+    membership_records: number;
+    ambiguous_identity_pages: number;
+    cursor_page_id: number | null;
+    scan_upper_page_id: number | null;
+    last_tail_at: string | null;
   };
 }
 
@@ -499,6 +506,28 @@ async function readContextMirrorStatus(
   const bootstrapCheckpoint = checkpointRows.find((row) => row.checkpoint_kind === 'capture_session_scan_v1');
   const legacyCheckpoint = checkpointRows.find((row) => row.checkpoint_kind === 'distilled_legacy_import_v1');
   const legacyCursor = parseCheckpointCursor(legacyCheckpoint?.cursor);
+  const reconciliationRows = await engine.executeRaw<{
+    version: number | string;
+    phase: 'rebuilding' | 'tailing' | 'blocked';
+    cursor_page_id: number | string;
+    scan_upper_page_id: number | string;
+    membership_count: number | string;
+    ambiguous_count: number | string;
+    last_tail_at: Date | string | null;
+    updated_at: Date | string;
+  }>(
+    `SELECT version, phase, cursor_page_id, scan_upper_page_id,
+            membership_count, ambiguous_count, last_tail_at, updated_at
+       FROM context_mirror_reconciliation_state WHERE source_id = $1`,
+    [sourceId],
+  );
+  const reconciliation = reconciliationRows[0];
+  const reconciliationComplete = reconciliation
+    ? reconciliation.phase === 'tailing'
+      && numberValue(reconciliation.ambiguous_count) === 0
+      && numberValue(reconciliation.cursor_page_id) >= numberValue(reconciliation.scan_upper_page_id)
+    : null;
+  const bootstrapComplete = reconciliationComplete ?? bootstrapCheckpoint?.completed ?? null;
 
   const decisionRows = await engine.executeRaw<Record<string, number | string | Date | null>>(
     `SELECT
@@ -605,7 +634,7 @@ async function readContextMirrorStatus(
     distillBeforePoll,
     consolidationEnabled,
     raw: numberValue(capture?.active_records),
-    bootstrapComplete: bootstrapCheckpoint?.completed ?? null,
+    bootstrapComplete,
     eligible: eligiblePending,
     retryableOver24h: numberValue(eligibility.retryable_over_24h),
     ambiguous: numberValue(eligibility.ambiguous),
@@ -830,8 +859,15 @@ async function readContextMirrorStatus(
     },
     progress: {
       last_downstream_at: latestIso([lastGenerationAt, lastDecisionAt, lastCandidateDecisionAt, indexedProgressAt]),
-      bootstrap_complete: bootstrapCheckpoint?.completed ?? null,
-      bootstrap_checkpoint_at: iso(bootstrapCheckpoint?.updated_at),
+      bootstrap_complete: bootstrapComplete,
+      bootstrap_checkpoint_at: iso(reconciliation?.updated_at ?? bootstrapCheckpoint?.updated_at),
+      reconciliation_version: reconciliation ? numberValue(reconciliation.version) : null,
+      reconciliation_phase: reconciliation?.phase ?? null,
+      membership_records: numberValue(reconciliation?.membership_count),
+      ambiguous_identity_pages: numberValue(reconciliation?.ambiguous_count),
+      cursor_page_id: reconciliation ? numberValue(reconciliation.cursor_page_id) : null,
+      scan_upper_page_id: reconciliation ? numberValue(reconciliation.scan_upper_page_id) : null,
+      last_tail_at: iso(reconciliation?.last_tail_at),
     },
   };
 }

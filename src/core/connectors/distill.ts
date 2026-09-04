@@ -71,7 +71,7 @@ import { chunkText } from '../chunkers/recursive.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { Page, PageInput } from '../types.ts';
 import {
-  advanceSessionHeadBootstrap,
+  runSessionHeadReconciliationV2,
   claimPendingSessionHeads,
   closeCircuit,
   completeContextGeneration,
@@ -779,7 +779,6 @@ async function hydrateDurableSessionPages(
   engine: BrainEngine,
   sourceId: string,
   sessionId: string,
-  slugPrefix: string,
   maxBytes: number,
   deadlineMs: number,
 ): Promise<BoundedCaptureHydration> {
@@ -792,28 +791,17 @@ async function hydrateDurableSessionPages(
       return { pages, bytes, memoryLimitExceeded: false, runtimeLimitExceeded: true };
     }
     const batch = await engine.executeRaw<Page>(
-      `SELECT id, source_id, slug, type, page_kind, title, compiled_truth, timeline,
-              frontmatter, content_hash, created_at, updated_at, deleted_at
-         FROM pages
-        WHERE source_id = $1 AND deleted_at IS NULL
-          AND slug LIKE $2::text || '%' AND slug > $3
-          AND (
-            NULLIF(frontmatter->>'session_id', '') = $5
-            OR (
-              NULLIF(frontmatter->>'session_id', '') IS NULL
-              AND NOT EXISTS (
-                SELECT 1 FROM pages peer
-                 WHERE peer.source_id = $1
-                   AND peer.deleted_at IS NULL
-                   AND peer.slug LIKE $2::text || '%'
-                   AND NULLIF(peer.frontmatter->>'session_id', '') IS NOT NULL
-                   AND NULLIF(peer.frontmatter->>'session_id', '') <> $5
-              )
-            )
-          )
-        ORDER BY slug ASC
-       LIMIT $4`,
-      [sourceId, slugPrefix, after, batchSize, sessionId],
+      `SELECT p.id, p.source_id, p.slug, p.type, p.page_kind, p.title, p.compiled_truth, p.timeline,
+              p.frontmatter, p.content_hash, p.created_at, p.updated_at, p.deleted_at
+       FROM pages p
+       JOIN context_mirror_capture_membership m
+         ON m.source_id = p.source_id AND m.page_id = p.id
+      WHERE p.source_id = $1 AND p.deleted_at IS NULL
+        AND m.identity_status = 'resolved' AND m.session_id = $4
+        AND p.slug > $2
+      ORDER BY p.slug ASC
+      LIMIT $3`,
+      [sourceId, after, batchSize, sessionId],
     );
     for (const page of batch) {
       if (Date.now() >= deadlineMs) {
@@ -1001,13 +989,15 @@ export async function distillCaptureSessions(
 
   if (durable) {
     await quarantineAmbiguousInflightCalls(engine, sourceId);
-    const bootstrap = await advanceSessionHeadBootstrap(engine, {
+    const bootstrap = await runSessionHeadReconciliationV2(engine, {
       sourceId,
       now,
       idleHours,
       sessionSlug: toSessionSlug,
+      actor: 'system:distill',
+      reason: 'scheduled no-provider capture reconciliation',
     });
-    bootstrapComplete = bootstrap.complete;
+    bootstrapComplete = bootstrap.status === 'complete';
     bootstrapAmbiguousIdentityPages = bootstrap.ambiguousIdentityPages;
     durableEligible = bootstrap.pendingEligible;
     durableTotal = bootstrap.totalHeads;
@@ -1346,7 +1336,6 @@ export async function distillCaptureSessions(
           engine,
           sourceId,
           sessionId,
-          summary.captureSlugPrefix,
           maxMemoryBytes,
           startedAt + maxRuntimeMs,
         )

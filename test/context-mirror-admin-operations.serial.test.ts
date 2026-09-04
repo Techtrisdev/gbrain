@@ -50,6 +50,7 @@ describe('Context Mirror admin MCP controls', () => {
     for (const name of [
       'retry_candidate_promotion',
       'rollback_context_generation',
+      'run_context_mirror_bootstrap',
       'set_context_mirror_recovery_hold',
     ]) {
       const operation = operationsByName[name];
@@ -76,6 +77,86 @@ describe('Context Mirror admin MCP controls', () => {
       context,
       { active: true, reason: 'source mismatch' },
     )).rejects.toMatchObject({ code: 'permission_denied' });
+  });
+
+  test('runs a bounded counts-only v2 bootstrap in the authenticated source', async () => {
+    await engine.putPage(
+      'capture/admin-session/prompt-1',
+      {
+        type: 'note', title: 'capture', compiled_truth: 'private transcript body', timeline: '',
+        frontmatter: { session_id: 'admin-session', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: 'default' },
+    );
+    const operation = operationsByName.run_context_mirror_bootstrap!;
+    const result = await operation.handler(adminContext(), {
+      batch_size: 10,
+      max_batches: 2,
+      max_runtime_ms: 5_000,
+      reason: 'bounded metadata recovery',
+    }) as Record<string, unknown>;
+
+    expect(result).toMatchObject({
+      schema_version: 2,
+      source_id: 'default',
+      status: 'complete',
+      scanned: 1,
+      membership: 1,
+      total_heads: 1,
+      provider_calls: 0,
+    });
+    expect(JSON.stringify(result)).not.toContain('private transcript body');
+    expect(JSON.stringify(result)).not.toContain('admin-session');
+  });
+
+  test('rejects unbounded bootstrap limits before touching state', async () => {
+    await expect(operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 50_001,
+      max_batches: 2,
+      max_runtime_ms: 5_000,
+      reason: 'invalid oversized request',
+    })).rejects.toMatchObject({ code: 'invalid_params' });
+    const state = await engine.executeRaw<{ count: number | string }>(
+      `SELECT count(*) AS count FROM context_mirror_reconciliation_state`,
+    );
+    expect(Number(state[0]?.count ?? 0)).toBe(0);
+  });
+
+  test('returns a resumable partial result when the request batch cap is reached', async () => {
+    for (const [index, sessionId] of ['bounded-a', 'bounded-b'].entries()) {
+      await engine.putPage(
+        `capture/${sessionId}/prompt-1`,
+        {
+          type: 'note', title: 'capture', compiled_truth: `body-${index}`, timeline: '',
+          frontmatter: { session_id: sessionId, kind: 'prompt', turn: 1 },
+        } as never,
+        { sourceId: 'default' },
+      );
+    }
+    const result = await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 1,
+      max_batches: 1,
+      max_runtime_ms: 5_000,
+      reason: 'bounded partial request',
+    }) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      status: 'partial',
+      batches: 1,
+      scanned: 1,
+      membership: 1,
+      provider_calls: 0,
+    });
+    expect(result.resume_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    const [projection] = await engine.executeRaw<{
+      shadow_heads: number | string;
+      live_heads: number | string;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM context_mirror_reconciliation_heads WHERE source_id = 'default') AS shadow_heads,
+         (SELECT count(*) FROM context_mirror_session_heads WHERE source_id = 'default') AS live_heads`,
+    );
+    expect(Number(projection?.shadow_heads)).toBe(1);
+    expect(Number(projection?.live_heads)).toBe(0);
   });
 
   test('sets and idempotently re-reads an attributed source recovery hold', async () => {
