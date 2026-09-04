@@ -3848,6 +3848,89 @@ function contextMirrorAdminReason(value: unknown): string {
   return reason;
 }
 
+function boundedContextMirrorInteger(
+  name: string,
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const resolved = value === undefined ? fallback : value;
+  if (!Number.isSafeInteger(resolved) || (resolved as number) < min || (resolved as number) > max) {
+    throw new OperationError('invalid_params', `${name} must be an integer from ${min} to ${max}`);
+  }
+  return resolved as number;
+}
+
+const run_context_mirror_bootstrap: Operation = {
+  name: 'run_context_mirror_bootstrap',
+  description:
+    'Admin-only, source-confined, no-provider Context Mirror inventory reconciliation. ' +
+    'Processes immutable raw-page metadata in bounded batches and returns counts and fingerprints only.',
+  params: {
+    batch_size: { type: 'number', description: 'Raw metadata rows per batch (1-5000; default 1000)' },
+    max_batches: { type: 'number', description: 'Maximum batches in this request (1-20; default 1)' },
+    max_runtime_ms: { type: 'number', description: 'Request wall-clock ceiling (1000-45000; default 30000)' },
+    reason: { type: 'string', required: true, description: 'Operator reason recorded in the append-only audit' },
+  },
+  scope: 'admin',
+  mutating: true,
+  handler: async (ctx, p) => {
+    const sourceId = contextMirrorAdminSource(ctx);
+    const batchSize = boundedContextMirrorInteger('batch_size', p.batch_size, 1_000, 1, 5_000);
+    const maxBatches = boundedContextMirrorInteger('max_batches', p.max_batches, 1, 1, 20);
+    const maxRuntimeMs = boundedContextMirrorInteger('max_runtime_ms', p.max_runtime_ms, 30_000, 1_000, 45_000);
+    const reason = contextMirrorAdminReason(p.reason);
+    const actor = contextMirrorAdminActor(ctx);
+    const started = Date.now();
+    let scanned = 0;
+    let insertedMembership = 0;
+    let batches = 0;
+    let latest: import('./connectors/context-mirror-state.ts').ReconciliationV2Result | null = null;
+    const { runSessionHeadReconciliationV2 } = await import('./connectors/context-mirror-state.ts');
+    const { toSessionSlug } = await import('./connectors/distill.ts');
+    while (batches < maxBatches && Date.now() - started < maxRuntimeMs) {
+      latest = await runSessionHeadReconciliationV2(ctx.engine, {
+        sourceId,
+        now: new Date(),
+        idleHours: 6,
+        sessionSlug: toSessionSlug,
+        batchSize,
+        actor,
+        reason,
+      });
+      batches += 1;
+      scanned += latest.scanned;
+      insertedMembership += latest.insertedMembership;
+      if (latest.status !== 'partial') break;
+    }
+    if (!latest) {
+      throw new OperationError('operation_timeout', 'Context Mirror bootstrap runtime expired before the first batch');
+    }
+    ctx.logger.info(
+      `[context-mirror-admin] operation=run_context_mirror_bootstrap source=${sourceId} ` +
+      `status=${latest.status} batches=${batches} scanned=${scanned} actor=${actor}`,
+    );
+    return {
+      schema_version: 2,
+      source_id: sourceId,
+      status: latest.status,
+      batches,
+      scanned,
+      inserted_membership: insertedMembership,
+      membership: latest.membership,
+      ambiguous_identity_pages: latest.ambiguousIdentityPages,
+      total_heads: latest.totalHeads,
+      pending_eligible: latest.pendingEligible,
+      cursor_page_id: latest.cursorPageId,
+      scan_upper_page_id: latest.scanUpperPageId,
+      lease_generation: latest.leaseGeneration,
+      resume_fingerprint: latest.resumeFingerprint,
+      provider_calls: 0,
+    };
+  },
+};
+
 const retry_candidate_promotion: Operation = {
   name: 'retry_candidate_promotion',
   description:
@@ -4976,7 +5059,7 @@ export const operations: Operation[] = [
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
   whoami, sources_add, sources_list, sources_remove, sources_status, context_mirror_status,
-  retry_candidate_promotion, rollback_context_generation, set_context_mirror_recovery_hold,
+  run_context_mirror_bootstrap, retry_candidate_promotion, rollback_context_generation, set_context_mirror_recovery_hold,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.31: hot memory (facts table)

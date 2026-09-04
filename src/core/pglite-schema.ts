@@ -1151,6 +1151,79 @@ CREATE TABLE IF NOT EXISTS context_mirror_checkpoints (
   PRIMARY KEY (source_id, checkpoint_kind)
 );
 
+-- Context Mirror v2 inventory; parity with src/schema.sql.
+CREATE TABLE IF NOT EXISTS context_mirror_capture_membership (
+  source_id           TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  page_id             BIGINT      NOT NULL,
+  page_slug           TEXT        NOT NULL,
+  identity_status     TEXT        NOT NULL CHECK (identity_status IN ('resolved','ambiguous')),
+  session_id          TEXT,
+  capture_slug_prefix TEXT,
+  captured_at         TIMESTAMPTZ NOT NULL,
+  discovered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, page_id),
+  CONSTRAINT context_mirror_capture_membership_identity_shape CHECK (
+    (identity_status = 'resolved' AND session_id IS NOT NULL AND capture_slug_prefix IS NOT NULL)
+    OR (identity_status = 'ambiguous' AND session_id IS NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS context_mirror_capture_membership_session_idx
+  ON context_mirror_capture_membership (source_id, session_id, page_id)
+  WHERE identity_status = 'resolved';
+
+CREATE TABLE IF NOT EXISTS context_mirror_reconciliation_heads (
+  source_id           TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  session_id          TEXT        NOT NULL,
+  session_slug        TEXT        NOT NULL,
+  capture_slug_prefix TEXT        NOT NULL,
+  newest_capture_at   TIMESTAMPTZ NOT NULL,
+  turn_count          INTEGER     NOT NULL CHECK (turn_count >= 0),
+  state               TEXT        NOT NULL DEFAULT 'ready' CHECK (state IN ('ready','quarantined')),
+  disposition         TEXT,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (source_id, session_id),
+  UNIQUE (source_id, session_slug)
+);
+
+CREATE TABLE IF NOT EXISTS context_mirror_reconciliation_state (
+  source_id          TEXT        PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  version            INTEGER     NOT NULL DEFAULT 2 CHECK (version = 2),
+  phase              TEXT        NOT NULL DEFAULT 'rebuilding'
+                                CHECK (phase IN ('rebuilding','tailing','blocked')),
+  cursor_page_id     BIGINT      NOT NULL DEFAULT 0 CHECK (cursor_page_id >= 0),
+  scan_upper_page_id BIGINT      NOT NULL DEFAULT 0 CHECK (scan_upper_page_id >= 0),
+  lease_generation   BIGINT      NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+  lease_owner        TEXT,
+  lease_expires_at   TIMESTAMPTZ,
+  membership_count   BIGINT      NOT NULL DEFAULT 0 CHECK (membership_count >= 0),
+  ambiguous_count    BIGINT      NOT NULL DEFAULT 0 CHECK (ambiguous_count >= 0),
+  head_count         BIGINT      NOT NULL DEFAULT 0 CHECK (head_count >= 0),
+  last_complete_at   TIMESTAMPTZ,
+  last_tail_at       TIMESTAMPTZ,
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT context_mirror_reconciliation_lease_shape CHECK (
+    (lease_owner IS NULL AND lease_expires_at IS NULL)
+    OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS context_mirror_admin_audit (
+  id                       BIGSERIAL   PRIMARY KEY,
+  source_id                TEXT        NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  operation                TEXT        NOT NULL,
+  actor                    TEXT        NOT NULL,
+  reason                   TEXT        NOT NULL,
+  request_fingerprint      TEXT        NOT NULL,
+  precondition_fingerprint TEXT        NOT NULL,
+  outcome                  TEXT        NOT NULL,
+  before_counts            JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  after_counts             JSONB       NOT NULL DEFAULT '{}'::jsonb,
+  receipt_ref              TEXT,
+  created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS context_mirror_admin_audit_source_created_idx
+  ON context_mirror_admin_audit (source_id, created_at DESC, id DESC);
+
 -- ============================================================
 -- access_tokens: legacy bearer tokens for remote MCP access
 -- ============================================================
