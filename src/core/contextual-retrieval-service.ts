@@ -61,6 +61,7 @@ import {
   type SynopsisFailureKind,
 } from './audit-synopsis.ts';
 import type { BrainEngine } from './engine.ts';
+import { isRawCapturePage } from './derived-index-policy.ts';
 import type { ChunkInput, CRMode, Page } from './types.ts';
 import type { SourceRow } from './sources-ops.ts';
 
@@ -209,6 +210,22 @@ const DEFAULT_HAIKU_MODEL = 'anthropic:claude-haiku-4-5-20251001';
 export async function reembedPageWithContextualRetrieval(
   args: ReembedPageArgs,
 ): Promise<ReembedPageResult> {
+  if (isRawCapturePage(args.sourceId, args.pageSlug)) {
+    const rows = await args.engine.executeRaw<{ deleted_at: Date | string | null }>(
+      `SELECT deleted_at FROM pages WHERE source_id = $1 AND slug = $2 LIMIT 1`,
+      [args.sourceId, args.pageSlug],
+    );
+    if (rows.length === 0) return { kind: 'skipped', reason: 'page_missing' };
+    if (rows[0]?.deleted_at != null) return { kind: 'skipped', reason: 'soft_deleted' };
+    await args.engine.deleteChunks(args.pageSlug, { sourceId: args.sourceId });
+    await args.engine.updatePageContextualRetrievalState(
+      args.pageSlug,
+      args.sourceId,
+      'none',
+      null,
+    );
+    return { kind: 'skipped', reason: 'mode_none' };
+  }
   // ── Load page + source + chunks ────────────────────────────────────
   const page = await args.engine.getPage(args.pageSlug, { sourceId: args.sourceId });
   if (!page) {
@@ -217,7 +234,6 @@ export async function reembedPageWithContextualRetrieval(
   if (page.deleted_at != null) {
     return { kind: 'skipped', reason: 'soft_deleted' };
   }
-
   const source = await loadSourceRow(args.engine, args.sourceId);
 
   // ── Resolve effective mode (D5+D6+D15+D18) ─────────────────────────

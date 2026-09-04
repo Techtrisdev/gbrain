@@ -1065,14 +1065,24 @@ export async function sweepCaptureRetention(
   const cutoffMs = nowMs - days * 86_400_000;
   const slugs: string[] = [];
   for (const slugPrefix of CAPTURE_RETENTION_PREFIXES) {
-    // Oldest-first so the most-stale pages are swept first; `listPages` hides
-    // already-soft-deleted rows by default, so the sweep is naturally idempotent.
-    const pages = await engine.listPages({
-      sourceId: CAPTURE_RETENTION_SOURCE,
-      slugPrefix,
-      sort: 'updated_asc',
-      limit: CAPTURE_RETENTION_SWEEP_LIMIT,
-    });
+    // Retention needs only identity and dates. Fetching full Page rows here can
+    // hydrate gigabytes of raw transcript bodies merely to decide their age.
+    // Oldest-first keeps the bounded sweep deterministic; deleted rows are
+    // excluded so repeated runs remain idempotent.
+    const pages = await engine.executeRaw<{
+      slug: string;
+      created_at: Date | string | null;
+      updated_at: Date | string | null;
+    }>(
+      `SELECT slug, created_at, updated_at
+         FROM pages
+        WHERE source_id = $1
+          AND slug LIKE $2
+          AND deleted_at IS NULL
+        ORDER BY updated_at ASC, slug ASC
+        LIMIT $3`,
+      [CAPTURE_RETENTION_SOURCE, `${slugPrefix}%`, CAPTURE_RETENTION_SWEEP_LIMIT],
+    );
     for (const page of pages) {
       const t = page.updated_at ?? page.created_at;
       const ms = t ? new Date(t).getTime() : 0;

@@ -1,6 +1,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
+import { RAW_CAPTURE_SLUG_LIKE, RAW_CAPTURE_SOURCE_ID } from '../core/derived-index-policy.ts';
 import { checkResolvable } from '../core/check-resolvable.ts';
 import { autoFixDryViolations, type AutoFixReport, type FixOutcome } from '../core/dry-fix.ts';
 import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
@@ -671,8 +672,9 @@ export async function checkContextualRetrievalCoverage(engine: BrainEngine): Pro
          COUNT(*) FILTER (WHERE contextual_retrieval_mode IS NULL)::int AS mode_null
        FROM pages
        WHERE page_kind = 'markdown'
+         AND NOT (source_id = $2 AND slug LIKE $3)
          AND deleted_at IS NULL`,
-      [MARKDOWN_CHUNKER_VERSION],
+      [MARKDOWN_CHUNKER_VERSION, RAW_CAPTURE_SOURCE_ID, RAW_CAPTURE_SLUG_LIKE],
     );
     const chunkerDrift = rows[0]?.chunker_drift ?? 0;
     const modeNull = rows[0]?.mode_null ?? 0;

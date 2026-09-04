@@ -45,6 +45,7 @@ import type { Page, PageFilters } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseStatus, CyclePhase } from '../cycle.ts';
+import { isRawCapturePage } from '../derived-index-policy.ts';
 
 /**
  * Bump when the extractor prompt or the JSON output shape changes. Old
@@ -321,6 +322,7 @@ class ProposeTakesPhase extends BaseCyclePhase {
       ...scope,
       limit: pageLimit,
       sort: 'updated_desc',
+      excludeRawCapture: true,
     };
     const pages: Page[] = await engine.listPages(pageFilters);
 
@@ -329,6 +331,10 @@ class ProposeTakesPhase extends BaseCyclePhase {
     }
 
     for (const page of pages) {
+      // Defense in depth for alternate/test engines that do not yet honor the
+      // filter. The real engines filter before LIMIT so raw rows cannot crowd
+      // durable pages out of this paid phase.
+      if (isRawCapturePage(page.source_id, page.slug)) continue;
       result.pages_scanned += 1;
       this.tick(opts);
 

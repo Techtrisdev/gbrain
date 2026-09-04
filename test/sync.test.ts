@@ -367,6 +367,44 @@ describe('performSync dry-run never writes', () => {
     expect(messages.some(m => m.includes('git pull failed'))).toBe(false);
   });
 
+  test('raw capture sync stores evidence without rebuilding derived search data', async () => {
+    rmSync(join(repoPath, 'people'), { recursive: true, force: true });
+    mkdirSync(join(repoPath, 'capture', 'session-1'), { recursive: true });
+    writeFileSync(join(repoPath, 'capture', 'session-1', 'tool-1.md'), [
+      '---',
+      'type: note',
+      'title: Raw Capture',
+      '---',
+      '',
+      'Tool output mentioning [Alice](../../../people/alice.md).',
+      '',
+      '- **2026-09-03** | Tool output date',
+    ].join('\n'));
+    execSync('git add -A && git commit -m "raw capture"', { cwd: repoPath, stdio: 'pipe' });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path)
+       VALUES ('capture-events', 'capture-events', $1)
+       ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+      [repoPath],
+    );
+
+    const { performSync } = await import('../src/commands/sync.ts');
+    const result = await performSync(engine, {
+      repoPath,
+      sourceId: 'capture-events',
+      noPull: true,
+      noEmbed: true,
+    });
+
+    const slug = 'capture/session-1/tool-1';
+    expect(result.status).toBe('first_sync');
+    expect(result.embedded).toBe(0);
+    expect(await engine.getPage(slug, { sourceId: 'capture-events' })).not.toBeNull();
+    expect(await engine.getChunks(slug, { sourceId: 'capture-events' })).toEqual([]);
+    expect(await engine.getLinks(slug, { sourceId: 'capture-events' })).toEqual([]);
+    expect(await engine.getTimeline(slug, { sourceId: 'capture-events' })).toEqual([]);
+  });
+
   test('incremental dry-run does NOT write to DB or advance the bookmark', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     // First do a real sync to seed the bookmark.

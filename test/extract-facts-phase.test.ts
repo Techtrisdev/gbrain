@@ -175,6 +175,29 @@ describe('runExtractFacts — happy path', () => {
     expect(r.pagesScanned).toBe(2);
     expect(r.factsInserted).toBe(2);
   });
+
+  test('raw capture evidence is excluded from fact reconciliation', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    await engine.putPage('capture/session/raw-facts', {
+      title: 'Raw facts',
+      type: 'note',
+      compiled_truth: FACT_FENCE(
+        '| 1 | Raw claim | fact | 1.0 | world | high | 2026-09-03 |  | tool |  |',
+      ),
+      frontmatter: {},
+      timeline: '',
+    }, { sourceId: 'capture-events' });
+
+    const r = await runExtractFacts(engine, {
+      slugs: ['capture/session/raw-facts'],
+      sourceId: 'capture-events',
+    });
+
+    expect(r.pagesScanned).toBe(0);
+    expect(r.factsInserted).toBe(0);
+  });
 });
 
 describe('runExtractFacts — empty-fence guard (Codex R2-#7)', () => {

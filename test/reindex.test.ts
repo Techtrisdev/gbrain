@@ -147,4 +147,35 @@ describe('gbrain reindex --markdown (v0.32.7)', () => {
     expect(result.pending).toBe(1);
     expect(result.reindexed).toBe(1);
   });
+
+  test('raw capture evidence is never selected or re-chunked by maintenance', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO pages (
+         source_id, slug, type, title, compiled_truth, page_kind,
+         chunker_version, contextual_retrieval_mode
+       ) VALUES (
+         'capture-events', 'capture/session/raw', 'note', 'Raw', 'raw evidence',
+         'markdown', 1, NULL
+       )`,
+    );
+    await seedLegacyPage('ordinary-pending', 'ordinary searchable page');
+
+    const result = await runReindex(engine, ['--markdown', '--no-embed']);
+
+    expect(result.pending).toBe(1);
+    expect(result.reindexed).toBe(1);
+    expect(await engine.getChunks('capture/session/raw', { sourceId: 'capture-events' })).toEqual([]);
+    const raw = await engine.executeRaw<{
+      chunker_version: number;
+      contextual_retrieval_mode: string | null;
+    }>(
+      `SELECT chunker_version, contextual_retrieval_mode
+         FROM pages WHERE source_id = 'capture-events' AND slug = 'capture/session/raw'`,
+    );
+    expect(Number(raw[0]?.chunker_version)).toBe(1);
+    expect(raw[0]?.contextual_retrieval_mode).toBeNull();
+  });
 });

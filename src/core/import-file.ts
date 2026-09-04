@@ -24,6 +24,7 @@ import {
 } from './embedding-context.ts';
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
+import { isRawCapturePage } from './derived-index-policy.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -203,6 +204,47 @@ export interface ImportResult {
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
 
+async function clearRawDerivedArtifacts(
+  engine: BrainEngine,
+  slug: string,
+  sourceId: string,
+): Promise<void> {
+  await engine.executeRaw(
+    `WITH target AS (
+       SELECT id FROM pages WHERE slug = $1 AND source_id = $2
+     ), deleted_links AS (
+       DELETE FROM links
+        WHERE link_source IN ('markdown', 'frontmatter')
+          AND (
+            origin_page_id IN (SELECT id FROM target)
+            OR from_page_id IN (SELECT id FROM target)
+          )
+       RETURNING 1
+     ), deleted_chunks AS (
+       DELETE FROM content_chunks WHERE page_id IN (SELECT id FROM target)
+       RETURNING 1
+     ), deleted_tags AS (
+       DELETE FROM tags WHERE page_id IN (SELECT id FROM target)
+       RETURNING 1
+     ), deleted_timeline AS (
+       DELETE FROM timeline_entries WHERE page_id IN (SELECT id FROM target)
+       RETURNING 1
+     ), deleted_takes AS (
+       DELETE FROM takes WHERE page_id IN (SELECT id FROM target)
+       RETURNING 1
+     ), deleted_proposals AS (
+       DELETE FROM take_proposals WHERE source_id = $2 AND page_slug = $1
+       RETURNING 1
+     )
+     UPDATE pages
+        SET search_vector = NULL,
+            contextual_retrieval_mode = 'none',
+            corpus_generation = NULL
+      WHERE id IN (SELECT id FROM target)`,
+    [slug, sourceId],
+  );
+}
+
 /**
  * Import content from a string. Core pipeline:
  * parse -> hash -> embed (external) -> transaction(version + putPage + tags + chunks)
@@ -221,6 +263,8 @@ export async function importFromContent(
   content: string,
   opts: {
     noEmbed?: boolean;
+    /** Store the page and metadata without search chunks, embeddings, or graph links. */
+    skipDerivedIndex?: boolean;
     sourceId?: string;
     /**
      * v0.29.1: basename without extension for filename-date precedence on
@@ -274,6 +318,8 @@ export async function importFromContent(
   // silently fabricated a duplicate at (default, slug) — causing later
   // bare-slug subqueries (getTags, deleteChunks, etc.) to crash with 21000.
   const sourceId = opts.sourceId;
+  const skipDerivedIndex = opts.skipDerivedIndex === true || isRawCapturePage(sourceId ?? 'default', slug);
+  const skipEmbedding = opts.noEmbed === true || skipDerivedIndex;
   // Reject oversized payloads before any parsing, chunking, or embedding happens.
   // Uses Buffer.byteLength to count UTF-8 bytes the same way disk size would,
   // so the network path behaves identically to the file path.
@@ -330,19 +376,38 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
+  // The raw-capture retry path only needs metadata. Avoid round-tripping a
+  // multi-megabyte body from Postgres just to compare its hash and preserve
+  // dates. Normal pages retain getPage so downstream import behavior is
+  // unchanged.
+  const existing = skipDerivedIndex
+    ? (await engine.executeRaw<{
+        content_hash: string | null;
+        created_at: Date | string;
+        updated_at: Date | string;
+      }>(
+        `SELECT content_hash, created_at, updated_at
+           FROM pages
+          WHERE slug = $1 AND source_id = $2 AND deleted_at IS NULL
+          LIMIT 1`,
+        [slug, sourceId ?? 'default'],
+      ))[0]
+    : await engine.getPage(slug, sourceId ? { sourceId } : undefined);
   if (existing?.content_hash === hash && !opts.forceRechunk) {
+    if (skipDerivedIndex) {
+      await clearRawDerivedArtifacts(engine, slug, sourceId ?? 'default');
+    }
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
 
   // Chunk compiled_truth and timeline
   const chunks: ChunkInput[] = [];
-  if (parsed.compiled_truth.trim()) {
+  if (!skipDerivedIndex && parsed.compiled_truth.trim()) {
     for (const c of chunkText(parsed.compiled_truth)) {
       chunks.push({ chunk_index: chunks.length, chunk_text: c.text, chunk_source: 'compiled_truth' });
     }
   }
-  if (parsed.timeline?.trim()) {
+  if (!skipDerivedIndex && parsed.timeline?.trim()) {
     for (const c of chunkText(parsed.timeline)) {
       chunks.push({ chunk_index: chunks.length, chunk_text: c.text, chunk_source: 'timeline' });
     }
@@ -350,7 +415,7 @@ export async function importFromContent(
 
   // v0.20.0 Cathedral II Layer 8 D2 — extract fenced code blocks from
   // compiled_truth as first-class code chunks.
-  if (parsed.compiled_truth.trim()) {
+  if (!skipDerivedIndex && parsed.compiled_truth.trim()) {
     const fenceChunks = await extractFencedChunks(parsed.compiled_truth, chunks.length);
     chunks.push(...fenceChunks);
   }
@@ -370,7 +435,7 @@ export async function importFromContent(
   // - Stored chunk_text stays canonical; only the embedding input is wrapped.
   // - Code chunks (chunk_source='fenced_code') bypass wrapping per D20-T4.
   let effectiveCRMode: 'none' | 'title' | 'per_chunk_synopsis' = 'none';
-  if (!opts.noEmbed) {
+  if (!skipEmbedding) {
     const searchInput = await loadSearchModeConfig(engine);
     const knobs = resolveSearchMode(searchInput);
     // Look up the source row for this import; default to host trust when
@@ -392,7 +457,7 @@ export async function importFromContent(
     effectiveCRMode = resolution.mode === 'per_chunk_synopsis' ? 'title' : resolution.mode;
   }
 
-  if (!opts.noEmbed && chunks.length > 0) {
+  if (!skipEmbedding && chunks.length > 0) {
     const safeTitle = sanitizeTitle(parsed.title);
     const prefix =
       modeRequiresWrapper(effectiveCRMode) && !modeRequiresHaiku(effectiveCRMode)
@@ -414,7 +479,7 @@ export async function importFromContent(
   // Only set when we actually applied a wrapper; 'none' tier writes NULL
   // so the column reflects "no CR shape applied" rather than a stale hash.
   const corpusGeneration =
-    effectiveCRMode === 'none' || opts.noEmbed
+    effectiveCRMode === 'none' || skipEmbedding
       ? null
       : computeCorpusGeneration({
           crMode: effectiveCRMode,
@@ -425,7 +490,7 @@ export async function importFromContent(
   // caller's sourceId so writes target (sourceId, slug) rather than the
   // schema DEFAULT — required for multi-source brains; harmless ('default')
   // for single-source callers.
-  const txOpts = sourceId ? { sourceId } : undefined;
+  const txOpts = { sourceId: sourceId ?? 'default' };
   await engine.transaction(async (tx) => {
     if (existing) await tx.createVersion(slug, txOpts);
 
@@ -442,11 +507,11 @@ export async function importFromContent(
       slug,
       frontmatter: parsed.frontmatter,
       filename: filenameForChain,
-      updatedAt: existing?.updated_at ?? nowDate,
-      createdAt: existing?.created_at ?? nowDate,
+      updatedAt: existing?.updated_at ? new Date(existing.updated_at) : nowDate,
+      createdAt: existing?.created_at ? new Date(existing.created_at) : nowDate,
     });
 
-    await tx.putPage(slug, {
+    const pageInput: PageInput = {
       type: parsed.type,
       title: parsed.title,
       compiled_truth: parsed.compiled_truth,
@@ -470,14 +535,26 @@ export async function importFromContent(
       ingested_via: opts.ingested_via ?? null,
       // ingested_at is server-stamped at the engine layer when any
       // provenance write fires; never client-controlled.
-    }, txOpts);
+    };
+    if (skipDerivedIndex) {
+      await tx.putPageMetadata(slug, pageInput, txOpts);
+    } else {
+      await tx.putPage(slug, pageInput, txOpts);
+    }
 
     // v0.40.3.0: stamp the contextual retrieval state columns alongside
     // the page write. updatePageContextualRetrievalState is a narrow
     // UPDATE that runs after putPage's INSERT/UPDATE so the row exists.
     // For opts.noEmbed callers, we skip stamping — the next embed pass
     // (gbrain embed --stale or contextual reindex Minion) will set it.
-    if (!opts.noEmbed) {
+    if (skipDerivedIndex) {
+      await tx.updatePageContextualRetrievalState(
+        slug,
+        txOpts.sourceId,
+        'none',
+        null,
+      );
+    } else if (!skipEmbedding) {
       await tx.updatePageContextualRetrievalState(
         slug,
         sourceId ?? 'default',
@@ -486,19 +563,25 @@ export async function importFromContent(
       );
     }
 
-    // Tag reconciliation: remove stale, add current
-    const existingTags = await tx.getTags(slug, txOpts);
-    const newTags = new Set(parsed.tags);
-    for (const old of existingTags) {
-      if (!newTags.has(old)) await tx.removeTag(slug, old, txOpts);
-    }
-    for (const tag of parsed.tags) {
-      await tx.addTag(slug, tag, txOpts);
+    // Raw capture frontmatter is evidence, not shared taxonomy. Do not let
+    // untrusted transcript/tool metadata enter derived retrieval tables; clean
+    // artifacts left by an older build when updating an existing raw page.
+    if (skipDerivedIndex && existing) {
+      await clearRawDerivedArtifacts(tx, slug, txOpts.sourceId);
+    } else if (!skipDerivedIndex) {
+      const existingTags = await tx.getTags(slug, txOpts);
+      const newTags = new Set(parsed.tags);
+      for (const old of existingTags) {
+        if (!newTags.has(old)) await tx.removeTag(slug, old, txOpts);
+      }
+      for (const tag of parsed.tags) {
+        await tx.addTag(slug, tag, txOpts);
+      }
     }
 
     if (chunks.length > 0) {
       await tx.upsertChunks(slug, chunks, txOpts);
-    } else {
+    } else if (!skipDerivedIndex) {
       // Content is empty — delete stale chunks so they don't ghost in search results
       await tx.deleteChunks(slug, txOpts);
     }
@@ -509,35 +592,37 @@ export async function importFromContent(
     // this in v0.18.x), so we wrap each pair in try/catch — guides imported
     // before their code repo syncs are common, and the missing edges land
     // later via `gbrain reconcile-links` (Layer 8 D3, v0.21.0).
-    const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
     // For doc↔impl edges, both endpoints are within the same source as the
     // markdown page being imported. Cross-source edges (markdown in one
     // source, code in another) currently fail with "page not found" — a
     // faster failure mode than the pre-fix cross-product fan-out, which
     // silently wired edges to whichever same-slug page Postgres returned
     // first across sources.
-    const linkOpts = sourceId
-      ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
-      : undefined;
-    for (const ref of codeRefs) {
-      const codeSlug = slugifyCodePath(ref.path);
-      // Forward: markdown guide → code page (this guide documents that code)
-      try {
-        await tx.addLink(
-          slug, codeSlug,
-          ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
-          'documents', 'markdown', slug, 'compiled_truth',
-          linkOpts,
-        );
-      } catch { /* code page not yet imported — reconcile-links will catch it */ }
-      // Reverse: code page → markdown guide (this code is documented by the guide)
-      try {
-        await tx.addLink(
-          codeSlug, slug,
-          ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
-          linkOpts,
-        );
-      } catch { /* same reason — silent skip */ }
+    if (!skipDerivedIndex) {
+      const codeRefs = extractCodeRefs(parsed.compiled_truth + '\n' + (parsed.timeline || ''));
+      const linkOpts = sourceId
+        ? { fromSourceId: sourceId, toSourceId: sourceId, originSourceId: sourceId }
+        : undefined;
+      for (const ref of codeRefs) {
+        const codeSlug = slugifyCodePath(ref.path);
+        // Forward: markdown guide → code page (this guide documents that code)
+        try {
+          await tx.addLink(
+            slug, codeSlug,
+            ref.line ? `cited at ${ref.path}:${ref.line}` : ref.path,
+            'documents', 'markdown', slug, 'compiled_truth',
+            linkOpts,
+          );
+        } catch { /* code page not yet imported — reconcile-links will catch it */ }
+        // Reverse: code page → markdown guide (this code is documented by the guide)
+        try {
+          await tx.addLink(
+            codeSlug, slug,
+            ref.path, 'documented_by', 'markdown', slug, 'compiled_truth',
+            linkOpts,
+          );
+        } catch { /* same reason — silent skip */ }
+      }
     }
   });
 

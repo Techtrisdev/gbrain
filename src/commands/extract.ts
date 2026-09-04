@@ -29,6 +29,7 @@ import {
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { pathToSlug, pruneDir, isSyncable } from '../core/sync.ts';
+import { isRawCapturePage } from '../core/derived-index-policy.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -733,6 +734,7 @@ export async function extractLinksForSlugs(
     : undefined;
   let created = 0;
   for (const slug of slugs) {
+    if (isRawCapturePage(opts?.sourceId ?? 'default', slug)) continue;
     const filePath = join(repoPath, slug + '.md');
     if (!existsSync(filePath)) continue;
     try {
@@ -757,6 +759,7 @@ export async function extractTimelineForSlugs(
   const entryOpts = opts?.sourceId ? { sourceId: opts.sourceId } : undefined;
   let created = 0;
   for (const slug of slugs) {
+    if (isRawCapturePage(opts?.sourceId ?? 'default', slug)) continue;
     const filePath = join(repoPath, slug + '.md');
     if (!existsSync(filePath)) continue;
     try {
@@ -806,12 +809,12 @@ async function extractLinksFromDB(
   // cross-source wikilinks (qualified like `[[other-src:slug]]`) can
   // resolve — the filter is on WHICH pages we extract FROM, not what
   // we can resolve TO.
+  const searchableRefs = (await engine.listAllPageRefs())
+    .filter(r => !isRawCapturePage(r.source_id, r.slug));
   const allRefs = sourceIdFilter
-    ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
-    : await engine.listAllPageRefs();
-  const fullRefsForResolver = sourceIdFilter
-    ? await engine.listAllPageRefs()
-    : allRefs;
+    ? searchableRefs.filter(r => r.source_id === sourceIdFilter)
+    : searchableRefs;
+  const fullRefsForResolver = searchableRefs;
   // For backward-compat checks (`allSlugs.has(...)` calls below), we still
   // need a flat slug set. ALSO a per-slug → [sources] map for F10 resolution.
   //
@@ -979,9 +982,9 @@ async function extractTimelineFromDB(
   // v0.37.7.0 #1204: when sourceIdFilter is set, scope the walk to one
   // source so federated brain users can extract per-source.
   const sourceIdFilter = opts?.sourceIdFilter;
-  const allRefs = sourceIdFilter
-    ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
-    : await engine.listAllPageRefs();
+  const allRefs = (await engine.listAllPageRefs())
+    .filter(r => !isRawCapturePage(r.source_id, r.slug))
+    .filter(r => !sourceIdFilter || r.source_id === sourceIdFilter);
   let processed = 0, created = 0;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));

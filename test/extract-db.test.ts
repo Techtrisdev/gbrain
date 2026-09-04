@@ -248,4 +248,22 @@ describe('gbrain extract all --source db', () => {
     const entries = await engine.getTimeline('companies/acme');
     expect(entries.length).toBe(1);
   });
+
+  test('does not derive links or timeline entries from raw capture evidence', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    await engine.putPage('people/alice', personPage('Alice'), { sourceId: 'capture-events' });
+    await engine.putPage('capture/session/raw', {
+      type: 'note',
+      title: 'Raw Evidence',
+      compiled_truth: '[Alice](people/alice) appeared in tool output.',
+      timeline: '- **2026-09-03** | Tool output date',
+    }, { sourceId: 'capture-events' });
+
+    await runExtract(engine, ['all', '--source', 'db', '--source-id', 'capture-events']);
+
+    expect(await engine.getLinks('capture/session/raw', { sourceId: 'capture-events' })).toEqual([]);
+    expect(await engine.getTimeline('capture/session/raw', { sourceId: 'capture-events' })).toEqual([]);
+  });
 });

@@ -5558,6 +5558,161 @@ export const MIGRATIONS: Migration[] = [
       return new Set(rows.map((row) => `${row.table_name}.${row.column_name}`)).size === 7;
     },
   },
+  {
+    version: 114,
+    name: 'raw_capture_search_vector_bypass',
+    // Raw capture pages are evidence for the bounded distiller, not direct
+    // retrieval documents. Keep their full bodies while avoiding synchronous
+    // to_tsvector + GIN maintenance on multi-megabyte tool output.
+    idempotent: true,
+    sql: `
+      CREATE OR REPLACE FUNCTION update_page_search_vector() RETURNS trigger AS $$
+      DECLARE
+        timeline_text TEXT;
+      BEGIN
+        IF NEW.source_id = 'capture-events' AND NEW.slug LIKE 'capture/%' THEN
+          NEW.search_vector := NULL;
+          RETURN NEW;
+        END IF;
+
+        SELECT coalesce(string_agg(summary || ' ' || detail, ' '), '')
+          INTO timeline_text
+          FROM timeline_entries
+         WHERE page_id = NEW.id;
+
+        NEW.search_vector :=
+          setweight(to_tsvector('english', coalesce(NEW.title, '')), 'A') ||
+          setweight(to_tsvector('english', coalesce(NEW.compiled_truth, '')), 'B') ||
+          setweight(to_tsvector('english', coalesce(NEW.timeline, '')), 'C') ||
+          setweight(to_tsvector('english', coalesce(timeline_text, '')), 'C');
+
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql;
+
+      DELETE FROM links l
+       USING pages p
+       WHERE (l.origin_page_id = p.id OR l.from_page_id = p.id)
+         AND l.link_source IN ('markdown', 'frontmatter')
+         AND p.source_id = 'capture-events'
+         AND p.slug LIKE 'capture/%';
+
+      DELETE FROM timeline_entries t
+       USING pages p
+       WHERE t.page_id = p.id
+         AND p.source_id = 'capture-events'
+         AND p.slug LIKE 'capture/%';
+
+      DELETE FROM tags t
+       USING pages p
+       WHERE t.page_id = p.id
+         AND p.source_id = 'capture-events'
+         AND p.slug LIKE 'capture/%';
+
+      DELETE FROM takes t
+       USING pages p
+       WHERE t.page_id = p.id
+         AND p.source_id = 'capture-events'
+         AND p.slug LIKE 'capture/%';
+
+      DELETE FROM take_proposals
+       WHERE source_id = 'capture-events'
+         AND page_slug LIKE 'capture/%';
+
+      DELETE FROM content_chunks c
+       USING pages p
+       WHERE c.page_id = p.id
+         AND p.source_id = 'capture-events'
+         AND p.slug LIKE 'capture/%';
+
+      -- Historical fact rows did not reliably retain the raw page slug:
+      -- thin-client extraction could leave it NULL or point at an entity.
+      -- Facts are a rebuildable derived index, so clear this isolated source
+      -- and allow only non-raw (for example distilled/*) pages to rebuild it.
+      DELETE FROM facts
+       WHERE source_id = 'capture-events';
+
+      -- These statistics summarize the old chunk corpus. Once raw chunks are
+      -- removed, retaining their document/term counts would keep distorting
+      -- keyword ranking for the distilled pages that remain in this source.
+      -- Missing stats safely fall back to unweighted keyword ranking until the
+      -- next explicit corpus-stat refresh.
+      DELETE FROM corpus_term_stats
+       WHERE source_id = 'capture-events';
+
+      DELETE FROM corpus_term_stats_meta
+       WHERE source_id = 'capture-events';
+
+      -- Query-cache scopes may represent federated source sets, so a cache
+      -- row containing a raw capture is not necessarily keyed to this source.
+      -- The cache is rebuildable; invalidate it completely when retrieval
+      -- eligibility changes rather than risk serving a pre-migration result.
+      DELETE FROM query_cache;
+
+      UPDATE pages
+         SET search_vector = NULL,
+             contextual_retrieval_mode = 'none',
+             corpus_generation = NULL
+       WHERE source_id = 'capture-events'
+         AND slug LIKE 'capture/%';
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{
+        indexed_raw: string | number;
+        chunked_raw: string | number;
+        linked_raw: string | number;
+        timeline_raw: string | number;
+        tags_raw: string | number;
+        takes_raw: string | number;
+        proposals_raw: string | number;
+        fact_raw: string | number;
+        term_stats_raw: string | number;
+        term_stats_meta_raw: string | number;
+        query_cache_rows: string | number;
+        pending_raw: string | number;
+      }>(
+        `SELECT
+           COUNT(*) FILTER (WHERE p.search_vector IS NOT NULL)::bigint AS indexed_raw,
+           COUNT(DISTINCT c.id)::bigint AS chunked_raw,
+           COUNT(DISTINCT l.id)::bigint AS linked_raw,
+           COUNT(DISTINCT t.id)::bigint AS timeline_raw,
+           COUNT(DISTINCT tag.id)::bigint AS tags_raw,
+           COUNT(DISTINCT tk.id)::bigint AS takes_raw,
+           (SELECT COUNT(*)::bigint FROM take_proposals tp
+             WHERE tp.source_id = 'capture-events'
+               AND tp.page_slug LIKE 'capture/%') AS proposals_raw,
+           (SELECT COUNT(*)::bigint FROM facts f
+             WHERE f.source_id = 'capture-events') AS fact_raw,
+           (SELECT COUNT(*)::bigint FROM corpus_term_stats cts
+             WHERE cts.source_id = 'capture-events') AS term_stats_raw,
+           (SELECT COUNT(*)::bigint FROM corpus_term_stats_meta ctsm
+             WHERE ctsm.source_id = 'capture-events') AS term_stats_meta_raw,
+           (SELECT COUNT(*)::bigint FROM query_cache) AS query_cache_rows,
+           COUNT(*) FILTER (WHERE p.contextual_retrieval_mode IS DISTINCT FROM 'none')::bigint AS pending_raw
+           FROM pages p
+           LEFT JOIN content_chunks c ON c.page_id = p.id
+           LEFT JOIN links l ON (l.origin_page_id = p.id OR l.from_page_id = p.id)
+             AND l.link_source IN ('markdown', 'frontmatter')
+           LEFT JOIN timeline_entries t ON t.page_id = p.id
+           LEFT JOIN tags tag ON tag.page_id = p.id
+           LEFT JOIN takes tk ON tk.page_id = p.id
+          WHERE p.source_id = 'capture-events'
+            AND p.slug LIKE 'capture/%'`,
+      );
+      return Number(rows[0]?.indexed_raw ?? 0) === 0
+        && Number(rows[0]?.chunked_raw ?? 0) === 0
+        && Number(rows[0]?.linked_raw ?? 0) === 0
+        && Number(rows[0]?.timeline_raw ?? 0) === 0
+        && Number(rows[0]?.tags_raw ?? 0) === 0
+        && Number(rows[0]?.takes_raw ?? 0) === 0
+        && Number(rows[0]?.proposals_raw ?? 0) === 0
+        && Number(rows[0]?.fact_raw ?? 0) === 0
+        && Number(rows[0]?.term_stats_raw ?? 0) === 0
+        && Number(rows[0]?.term_stats_meta_raw ?? 0) === 0
+        && Number(rows[0]?.query_cache_rows ?? 0) === 0
+        && Number(rows[0]?.pending_raw ?? 0) === 0;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

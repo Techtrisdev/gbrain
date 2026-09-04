@@ -28,6 +28,10 @@ import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import { existsSync } from 'fs';
 import { resolve } from 'path';
+import {
+  RAW_CAPTURE_SLUG_LIKE,
+  RAW_CAPTURE_SOURCE_ID,
+} from '../core/derived-index-policy.ts';
 
 interface ReindexOpts {
   /** Cap total pages reindexed. Useful for triage runs on huge brains. */
@@ -100,8 +104,9 @@ async function countPending(engine: BrainEngine): Promise<number> {
        FROM pages
       WHERE page_kind = 'markdown'
         AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
+        AND NOT (source_id = $2 AND slug LIKE $3)
         AND deleted_at IS NULL`,
-    [MARKDOWN_CHUNKER_VERSION],
+    [MARKDOWN_CHUNKER_VERSION, RAW_CAPTURE_SOURCE_ID, RAW_CAPTURE_SLUG_LIKE],
   );
   return Number(rows[0]?.count ?? 0);
 }
@@ -117,10 +122,11 @@ async function readBatch(engine: BrainEngine, batchSize: number): Promise<Array<
        FROM pages
       WHERE page_kind = 'markdown'
         AND (chunker_version < $1 OR contextual_retrieval_mode IS NULL)
+        AND NOT (source_id = $2 AND slug LIKE $3)
         AND deleted_at IS NULL
       ORDER BY id ASC
-      LIMIT $2`,
-    [MARKDOWN_CHUNKER_VERSION, batchSize],
+      LIMIT $4`,
+    [MARKDOWN_CHUNKER_VERSION, RAW_CAPTURE_SOURCE_ID, RAW_CAPTURE_SLUG_LIKE, batchSize],
   );
 }
 

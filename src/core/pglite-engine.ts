@@ -21,7 +21,7 @@ import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
 import type {
-  Page, PageInput, PageFilters, PageType,
+  Page, PageInput, PageFilters, PageType, PageWriteMetadata,
   Chunk, ChunkInput, StaleChunkRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
@@ -53,6 +53,7 @@ import {
   EmbeddingColumnNotRegisteredError,
 } from './search/embedding-column.ts';
 import { hasCJK, escapeLikePattern } from './cjk.ts';
+import { RAW_CAPTURE_SLUG_LIKE, RAW_CAPTURE_SOURCE_ID } from './derived-index-policy.ts';
 
 type PGLiteDB = PGlite;
 
@@ -794,6 +795,23 @@ export class PGLiteEngine implements BrainEngine {
   }
 
   async putPage(slug: string, page: PageInput, opts?: { sourceId?: string }): Promise<Page> {
+    return await this.writePage(slug, page, opts, false) as Page;
+  }
+
+  async putPageMetadata(
+    slug: string,
+    page: PageInput,
+    opts?: { sourceId?: string },
+  ): Promise<PageWriteMetadata> {
+    return await this.writePage(slug, page, opts, true) as PageWriteMetadata;
+  }
+
+  private async writePage(
+    slug: string,
+    page: PageInput,
+    opts: { sourceId?: string } | undefined,
+    metadataOnly: boolean,
+  ): Promise<Page | PageWriteMetadata> {
     slug = validateSlug(slug);
     const hash = page.content_hash || contentHash(page);
     const frontmatter = page.frontmatter || {};
@@ -845,9 +863,25 @@ export class PGLiteEngine implements BrainEngine {
          source_uri            = COALESCE(EXCLUDED.source_uri,            pages.source_uri),
          ingested_via          = COALESCE(EXCLUDED.ingested_via,          pages.ingested_via),
          ingested_at           = COALESCE(EXCLUDED.ingested_at,           pages.ingested_at)
-       RETURNING id, source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, created_at, updated_at, effective_date, effective_date_source, import_filename, source_kind, source_uri, ingested_via, ingested_at`,
-      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt]
+       RETURNING id, source_id, slug, type, title,
+         CASE WHEN $19::boolean THEN '' ELSE compiled_truth END AS compiled_truth,
+         CASE WHEN $19::boolean THEN '' ELSE timeline END AS timeline,
+         CASE WHEN $19::boolean THEN '{}'::jsonb ELSE frontmatter END AS frontmatter,
+         content_hash, created_at, updated_at, effective_date, effective_date_source,
+         import_filename, source_kind, source_uri, ingested_via, ingested_at`,
+      [sourceId, slug, page.type, pageKind, page.title, page.compiled_truth, page.timeline || '', JSON.stringify(frontmatter), hash, effectiveDate, effectiveDateSource, importFilename, chunkerVersion, sourcePath, sourceKind, sourceUri, ingestedVia, ingestedAt, metadataOnly]
     );
+    if (metadataOnly) {
+      const row = rows[0] as Record<string, unknown>;
+      return {
+        id: Number(row.id),
+        source_id: String(row.source_id),
+        slug: String(row.slug),
+        content_hash: row.content_hash == null ? undefined : String(row.content_hash),
+        created_at: new Date(row.created_at as string | Date),
+        updated_at: new Date(row.updated_at as string | Date),
+      };
+    }
     return rowToPage(rows[0] as Record<string, unknown>);
   }
 
@@ -1015,6 +1049,10 @@ export class PGLiteEngine implements BrainEngine {
     // v0.26.5: hide soft-deleted by default; opt in via filters.includeDeleted.
     if (filters?.includeDeleted !== true) {
       where.push('p.deleted_at IS NULL');
+    }
+    if (filters?.excludeRawCapture === true) {
+      params.push(RAW_CAPTURE_SOURCE_ID, RAW_CAPTURE_SLUG_LIKE);
+      where.push(`NOT (p.source_id = $${params.length - 1} AND p.slug LIKE $${params.length})`);
     }
 
     const whereSql = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';

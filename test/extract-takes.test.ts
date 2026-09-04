@@ -57,6 +57,19 @@ afterAll(async () => {
 });
 
 describe('extractTakesFromDb', () => {
+  test('raw capture pages never become canonical takes', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+    );
+    const raw = await engine.putPage('capture/session-raw/tool-call-1', {
+      title: 'Raw', type: 'note', compiled_truth: ALICE_BODY,
+    }, { sourceId: 'capture-events' });
+
+    const result = await extractTakesFromDb(engine);
+    expect(result.pagesScanned).toBe(3);
+    expect(await engine.listTakes({ page_id: raw.id })).toEqual([]);
+  });
+
   test('full walk: parses fenced pages and skips non-fenced', async () => {
     const result = await extractTakesFromDb(engine);
     expect(result.pagesScanned).toBe(3);

@@ -39,6 +39,114 @@ describe('migrate', () => {
   // and are covered in the E2E suite (test/e2e/mechanical.test.ts)
 });
 
+describe('migration v114 raw capture derived-index cleanup', () => {
+  const migration = MIGRATIONS.find((m) => m.version === 114);
+
+  test('replaces the page search trigger and cleans existing derived data', () => {
+    expect(migration).toBeDefined();
+    expect(migration?.idempotent).toBe(true);
+    expect(migration?.sql).toContain("NEW.source_id = 'capture-events'");
+    expect(migration?.sql).toContain("NEW.slug LIKE 'capture/%'");
+    expect(migration?.sql).toContain('DELETE FROM content_chunks');
+    expect(migration?.sql).toContain('DELETE FROM links');
+    expect(migration?.sql).toContain('DELETE FROM timeline_entries');
+    expect(migration?.sql).toContain('DELETE FROM tags');
+    expect(migration?.sql).toContain('DELETE FROM takes');
+    expect(migration?.sql).toContain('DELETE FROM take_proposals');
+    expect(migration?.sql).toContain('DELETE FROM facts');
+    expect(migration?.sql).toContain('DELETE FROM corpus_term_stats');
+    expect(migration?.sql).toContain('DELETE FROM corpus_term_stats_meta');
+    expect(migration?.sql).toContain('DELETE FROM query_cache');
+    expect(migration?.sql).toContain("contextual_retrieval_mode = 'none'");
+  });
+
+  test('removes historical raw-derived rows while preserving manual graph edges', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name) VALUES ('capture-events', 'capture-events') ON CONFLICT DO NOTHING`,
+      );
+      const raw = await engine.putPage('capture/session-old/tool-1', {
+        type: 'note', title: 'Raw', compiled_truth: 'legacy raw', timeline: '',
+      }, { sourceId: 'capture-events' });
+      await engine.putPage('distilled/session-old/memory-1', {
+        type: 'note', title: 'Distilled', compiled_truth: 'memory', timeline: '',
+      }, { sourceId: 'capture-events' });
+      await engine.upsertChunks(raw.slug, [{
+        chunk_index: 0, chunk_text: 'legacy raw', chunk_source: 'compiled_truth',
+      }], { sourceId: 'capture-events' });
+      const linkOpts = { fromSourceId: 'capture-events', toSourceId: 'capture-events' };
+      await engine.addLink(raw.slug, 'distilled/session-old/memory-1', 'generated', 'references', 'markdown', undefined, undefined, linkOpts);
+      await engine.addLink(raw.slug, 'distilled/session-old/memory-1', 'manual', 'related', 'manual', undefined, undefined, linkOpts);
+      await engine.addTimelineEntry(raw.slug, {
+        date: '2026-09-03', source: 'legacy', summary: 'raw-derived', detail: '',
+      }, { sourceId: 'capture-events' });
+      await engine.addTag(raw.slug, 'legacy-raw', { sourceId: 'capture-events' });
+      await engine.addTakesBatch([{
+        page_id: raw.id, row_num: 1, claim: 'raw-derived', kind: 'take', holder: 'brain', weight: 0.5,
+      }]);
+      await engine.executeRaw(
+        `INSERT INTO take_proposals
+           (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+            claim_text, kind, holder, weight, model_id)
+         VALUES ('capture-events', $1, 'hash', 'v1', 'run', 'raw-derived',
+                 'take', 'brain', 0.5, 'test')`,
+        [raw.slug],
+      );
+      await engine.executeRaw(
+        `INSERT INTO facts
+           (source_id, entity_slug, fact, kind, visibility, valid_from, source, source_session)
+         VALUES ('capture-events', NULL, 'raw-derived', 'fact', 'private', now(), 'test', 'raw-session')`,
+      );
+      await engine.executeRaw(
+        `INSERT INTO corpus_term_stats (source_id, lexeme, df)
+         VALUES ('capture-events', 'legacyraw', 1)`,
+      );
+      await engine.executeRaw(
+        `INSERT INTO corpus_term_stats_meta (source_id, n_docs)
+         VALUES ('capture-events', 2)`,
+      );
+      await engine.executeRaw(
+        `INSERT INTO query_cache (id, query_text, source_id, results, meta)
+         VALUES ('cached-raw', 'legacy raw', '__set__:capture-events,shared', '[]', '{}')`,
+      );
+
+      await (engine as any).db.exec(migration!.sql);
+
+      expect(await engine.getChunks(raw.slug, { sourceId: 'capture-events' })).toEqual([]);
+      expect(await engine.getTimeline(raw.slug, { sourceId: 'capture-events' })).toEqual([]);
+      expect(await engine.getTags(raw.slug, { sourceId: 'capture-events' })).toEqual([]);
+      expect(await engine.listTakes({ page_id: raw.id })).toEqual([]);
+      const proposals = await engine.executeRaw<{ count: number | string }>(
+        `SELECT COUNT(*)::bigint AS count FROM take_proposals WHERE source_id = 'capture-events'`,
+      );
+      const facts = await engine.executeRaw<{ count: number | string }>(
+        `SELECT COUNT(*)::bigint AS count FROM facts WHERE source_id = 'capture-events'`,
+      );
+      const termStats = await engine.executeRaw<{ count: number | string }>(
+        `SELECT COUNT(*)::bigint AS count FROM corpus_term_stats WHERE source_id = 'capture-events'`,
+      );
+      const termStatsMeta = await engine.executeRaw<{ count: number | string }>(
+        `SELECT COUNT(*)::bigint AS count FROM corpus_term_stats_meta WHERE source_id = 'capture-events'`,
+      );
+      const queryCache = await engine.executeRaw<{ count: number | string }>(
+        `SELECT COUNT(*)::bigint AS count FROM query_cache`,
+      );
+      expect(Number(proposals[0]?.count ?? 0)).toBe(0);
+      expect(Number(facts[0]?.count ?? 0)).toBe(0);
+      expect(Number(termStats[0]?.count ?? 0)).toBe(0);
+      expect(Number(termStatsMeta[0]?.count ?? 0)).toBe(0);
+      expect(Number(queryCache[0]?.count ?? 0)).toBe(0);
+      expect((await engine.getLinks(raw.slug, { sourceId: 'capture-events' })).map(link => link.link_source)).toEqual(['manual']);
+      expect(await migration!.verify!(engine)).toBe(true);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
+});
+
 // v0.28.5 — A1: cheap probe used by `connectEngine` to gate `initSchema()`
 // so already-migrated brains don't pay the schema-replay cost on every
 // short-lived CLI invocation. Closes #651 in cooperation with X1's

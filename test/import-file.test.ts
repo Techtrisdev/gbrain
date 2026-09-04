@@ -21,6 +21,7 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
       if (prop === '_calls') return calls;
       if (prop === 'getTags') return overrides.getTags || (() => Promise.resolve([]));
       if (prop === 'getPage') return overrides.getPage || (() => Promise.resolve(null));
+      if (prop === 'executeRaw') return overrides.executeRaw || (() => Promise.resolve([]));
       // transaction: just call the fn with the same engine (no real DB transaction in tests)
       if (prop === 'transaction') return async (fn: (tx: BrainEngine) => Promise<any>) => fn(engine);
       return track(prop);
@@ -336,6 +337,24 @@ Content to chunk but not embed.
         expect(chunk.embedding).toBeUndefined();
       }
     }
+  });
+
+  test('skipDerivedIndex stores raw content without chunks or graph links', async () => {
+    const engine = mockEngine();
+    const result = await importFromContent(
+      engine,
+      'capture/session-1/tool-call-1',
+      '---\ntype: note\ntitle: Raw Capture\n---\n\nLarge raw output referencing src/core/engine.ts:1.',
+      { skipDerivedIndex: true, sourceId: 'capture-events' },
+    );
+
+    expect(result.status).toBe('imported');
+    expect(result.chunks).toBe(0);
+    const calls = (engine as any)._calls;
+    expect(calls.some((c: any) => c.method === 'putPageMetadata')).toBe(true);
+    expect(calls.some((c: any) => c.method === 'deleteChunks')).toBe(false);
+    expect(calls.some((c: any) => c.method === 'upsertChunks')).toBe(false);
+    expect(calls.some((c: any) => c.method === 'addLink')).toBe(false);
   });
 
   test('rejects in-memory content larger than MAX_FILE_SIZE', async () => {
