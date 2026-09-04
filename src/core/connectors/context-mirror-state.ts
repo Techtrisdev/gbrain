@@ -283,12 +283,11 @@ function sessionIdFor(
   // imported digit-only Hermes IDs as JSON numbers; hydrating that JSON into
   // JavaScript first can round IDs beyond Number.MAX_SAFE_INTEGER and merge
   // unrelated sessions. PostgreSQL/PGLite `->>` preserves the exact digits.
-  if (
-    (row.session_id_json_type === 'string' || row.session_id_json_type === 'number')
-    && typeof row.session_id_text === 'string'
-    && row.session_id_text.trim()
-  ) {
-    return { status: 'resolved', sessionId: row.session_id_text.trim(), prefix };
+  const sessionId = typeof row.session_id_text === 'string' ? row.session_id_text.trim() : '';
+  const supportedIdentity = row.session_id_json_type === 'string'
+    || (row.session_id_json_type === 'number' && /^[0-9]+$/.test(sessionId));
+  if (supportedIdentity && sessionId) {
+    return { status: 'resolved', sessionId, prefix };
   }
   return { status: 'ambiguous' };
 }
@@ -854,15 +853,20 @@ export async function runSessionHeadReconciliationV2(
       ? await tx.executeRaw<{ session_id: string }>(
           `UPDATE context_mirror_capture_membership m
               SET identity_status = 'resolved',
-                  session_id = NULLIF(p.frontmatter->>'session_id', ''),
+                  session_id = NULLIF(btrim(p.frontmatter->>'session_id'), ''),
                   capture_slug_prefix = 'capture/' || split_part(p.slug, '/', 2) || '/'
              FROM pages p
             WHERE m.source_id = $1
               AND m.identity_status = 'ambiguous'
               AND p.source_id = m.source_id AND p.id = m.page_id
               AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%/%'
-              AND jsonb_typeof(p.frontmatter->'session_id') IN ('string', 'number')
-              AND NULLIF(p.frontmatter->>'session_id', '') IS NOT NULL
+              AND (
+                (jsonb_typeof(p.frontmatter->'session_id') = 'string'
+                  AND NULLIF(btrim(p.frontmatter->>'session_id'), '') IS NOT NULL)
+                OR
+                (jsonb_typeof(p.frontmatter->'session_id') = 'number'
+                  AND (p.frontmatter->>'session_id') ~ '^[0-9]+$')
+              )
           RETURNING m.session_id`,
           [opts.sourceId],
         )

@@ -345,6 +345,95 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     expect(membership).toEqual([{ session_id: 'recovered-legacy', identity_status: 'resolved' }]);
   });
 
+  test('self-healing trims strings but rejects whitespace and non-integral numeric identities', async () => {
+    const cases = [
+      ['capture/recovery-whitespace/prompt-1', 'whitespace'],
+      ['capture/recovery-negative/prompt-1', 'negative'],
+      ['capture/recovery-fractional/prompt-1', 'fractional'],
+      ['capture/recovery-padded/prompt-1', 'padded'],
+    ] as const;
+    for (const [slug, title] of cases) {
+      await engine.putPage(
+        slug,
+        {
+          type: 'note', title, compiled_truth: `${title}-body`, timeline: '',
+          frontmatter: { session_id: null, kind: 'prompt', turn: 1 },
+        } as never,
+        { sourceId: CAPTURE_SOURCE },
+      );
+    }
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const blocked = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now,
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'missing identities',
+    });
+    expect(blocked).toMatchObject({ status: 'blocked', ambiguousIdentityPages: 4 });
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET frontmatter = jsonb_set(
+            frontmatter,
+            '{session_id}',
+            CASE slug
+              WHEN 'capture/recovery-whitespace/prompt-1' THEN to_jsonb('   '::text)
+              WHEN 'capture/recovery-negative/prompt-1' THEN to_jsonb((-1)::numeric)
+              WHEN 'capture/recovery-fractional/prompt-1' THEN to_jsonb(1.5::numeric)
+              ELSE to_jsonb('  recovered-padded  '::text)
+            END
+          )
+        WHERE source_id = $1 AND slug LIKE 'capture/recovery-%'`,
+      [CAPTURE_SOURCE],
+    );
+    const retried = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(now.getTime() + 60_000),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'validate corrected identities',
+    });
+    expect(retried).toMatchObject({ status: 'blocked', ambiguousIdentityPages: 3 });
+    const membership = await engine.executeRaw<{
+      page_slug: string;
+      session_id: string | null;
+      identity_status: string;
+    }>(
+      `SELECT page_slug, session_id, identity_status
+         FROM context_mirror_capture_membership
+        WHERE source_id = $1
+        ORDER BY page_slug`,
+      [CAPTURE_SOURCE],
+    );
+    expect(membership).toEqual([
+      {
+        page_slug: 'capture/recovery-fractional/prompt-1',
+        session_id: null,
+        identity_status: 'ambiguous',
+      },
+      {
+        page_slug: 'capture/recovery-negative/prompt-1',
+        session_id: null,
+        identity_status: 'ambiguous',
+      },
+      {
+        page_slug: 'capture/recovery-padded/prompt-1',
+        session_id: 'recovered-padded',
+        identity_status: 'resolved',
+      },
+      {
+        page_slug: 'capture/recovery-whitespace/prompt-1',
+        session_id: null,
+        identity_status: 'ambiguous',
+      },
+    ]);
+  });
+
   test('v2 reconciliation counts each immutable page once and tails later arrivals', async () => {
     await seedCapture('capture/chunkgap-sess-1/prompt-1', 'first prompt', 1);
     const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
