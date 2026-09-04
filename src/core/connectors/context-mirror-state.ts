@@ -141,6 +141,8 @@ interface CaptureMetadataRow {
   id: number | string;
   slug: string;
   frontmatter: Record<string, unknown> | string | null;
+  session_id_text: string | null;
+  session_id_json_type: string | null;
   captured_at: Date | string;
   updated_at: Date | string;
 }
@@ -277,9 +279,16 @@ function sessionIdFor(
 ): { status: 'resolved'; sessionId: string; prefix: string } | { status: 'ambiguous' } | null {
   const prefix = capturePrefixFor(row);
   if (!prefix) return null;
-  const fm = parseJsonObject(row.frontmatter);
-  if (typeof fm.session_id === 'string' && fm.session_id.trim()) {
-    return { status: 'resolved', sessionId: fm.session_id.trim(), prefix };
+  // Read the canonical text representation inside the database. Legacy YAML
+  // imported digit-only Hermes IDs as JSON numbers; hydrating that JSON into
+  // JavaScript first can round IDs beyond Number.MAX_SAFE_INTEGER and merge
+  // unrelated sessions. PostgreSQL/PGLite `->>` preserves the exact digits.
+  if (
+    (row.session_id_json_type === 'string' || row.session_id_json_type === 'number')
+    && typeof row.session_id_text === 'string'
+    && row.session_id_text.trim()
+  ) {
+    return { status: 'resolved', sessionId: row.session_id_text.trim(), prefix };
   }
   return { status: 'ambiguous' };
 }
@@ -369,6 +378,8 @@ export async function advanceSessionHeadBootstrap(
   const cursor = cursorFrom(checkpointRows[0]?.cursor);
   const rows = await engine.executeRaw<CaptureMetadataRow>(
     `SELECT id, slug, frontmatter,
+            NULLIF(frontmatter->>'session_id', '') AS session_id_text,
+            jsonb_typeof(frontmatter->'session_id') AS session_id_json_type,
             CASE
               WHEN COALESCE(frontmatter->>'captured_at', '') ~ '^\\d{4}-\\d{2}-\\d{2}T'
                 THEN (frontmatter->>'captured_at')::timestamptz
@@ -835,10 +846,34 @@ export async function runSessionHeadReconciliationV2(
       throw new Error('context mirror reconciliation lease lost');
     }
 
+    // A blocked run must be able to heal after an operator corrects legacy
+    // metadata. Re-evaluate only previously ambiguous ledger rows, using
+    // `->>` so digit-only JSON numbers retain their exact database text and
+    // never pass through JavaScript's lossy Number representation.
+    const recoveredMembership = state.phase === 'blocked' || Number(state.ambiguous_count) > 0
+      ? await tx.executeRaw<{ session_id: string }>(
+          `UPDATE context_mirror_capture_membership m
+              SET identity_status = 'resolved',
+                  session_id = NULLIF(p.frontmatter->>'session_id', ''),
+                  capture_slug_prefix = 'capture/' || split_part(p.slug, '/', 2) || '/'
+             FROM pages p
+            WHERE m.source_id = $1
+              AND m.identity_status = 'ambiguous'
+              AND p.source_id = m.source_id AND p.id = m.page_id
+              AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%/%'
+              AND jsonb_typeof(p.frontmatter->'session_id') IN ('string', 'number')
+              AND NULLIF(p.frontmatter->>'session_id', '') IS NOT NULL
+          RETURNING m.session_id`,
+          [opts.sourceId],
+        )
+      : [];
+
     const cursorPageId = Number(state.cursor_page_id);
     const upperPageId = Number(state.scan_upper_page_id);
     const rows = await tx.executeRaw<CaptureMetadataRow>(
       `SELECT id, slug, frontmatter,
+              NULLIF(frontmatter->>'session_id', '') AS session_id_text,
+              jsonb_typeof(frontmatter->'session_id') AS session_id_json_type,
               CASE
                 WHEN COALESCE(frontmatter->>'captured_at', '') ~ '^\\d{4}-\\d{2}-\\d{2}T'
                   THEN (frontmatter->>'captured_at')::timestamptz
@@ -891,9 +926,12 @@ export async function runSessionHeadReconciliationV2(
           [membershipInput],
         );
 
-    const sessionIds = [...new Set(membershipInput
-      .filter((item) => item.identity_status === 'resolved' && item.session_id)
-      .map((item) => item.session_id as string))];
+    const sessionIds = [...new Set([
+      ...recoveredMembership.map((item) => item.session_id),
+      ...membershipInput
+        .filter((item) => item.identity_status === 'resolved' && item.session_id)
+        .map((item) => item.session_id as string),
+    ])];
     const aggregates = sessionIds.length === 0
       ? []
       : await tx.executeRaw<{

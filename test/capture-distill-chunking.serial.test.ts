@@ -244,6 +244,107 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
     ]);
   }, 30_000);
 
+  test('digit-only legacy JSON numbers retain their exact session identity through hydration', async () => {
+    const exactSessionId = '20260708094235345000';
+    await engine.executeRaw(
+      `INSERT INTO pages (
+         source_id, slug, type, title, compiled_truth, timeline, frontmatter, updated_at
+       ) VALUES (
+         $1, 'capture/legacy-numeric/prompt-1', 'note', 'legacy numeric',
+         'EXACT-NUMERIC-SESSION-BODY', '',
+         jsonb_build_object('session_id', 20260708094235345000::numeric, 'kind', 'prompt', 'turn', 1),
+         now() - INTERVAL '2 days'
+       )`,
+      [CAPTURE_SOURCE],
+    );
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const reconciled = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now,
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'numeric legacy identity',
+    });
+    expect(reconciled).toMatchObject({ status: 'complete', membership: 1, ambiguousIdentityPages: 0 });
+    const membership = await engine.executeRaw<{ session_id: string; identity_status: string }>(
+      `SELECT session_id, identity_status
+         FROM context_mirror_capture_membership
+        WHERE source_id = $1`,
+      [CAPTURE_SOURCE],
+    );
+    expect(membership).toEqual([{ session_id: exactSessionId, identity_status: 'resolved' }]);
+
+    let providerInput = '';
+    __setChatTransportForTests(async (opts: ChatOpts): Promise<ChatResult> => {
+      providerInput = String(opts.messages[0]?.content ?? '');
+      return {
+        text: JSON.stringify(['numeric identity preserved']),
+        blocks: [],
+        stopReason: 'end',
+        usage: { input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0 },
+        model: 'test:stub',
+        providerId: 'test',
+      };
+    });
+    const report = await distillCaptureSessions(engine, {
+      now,
+      sourceId: CAPTURE_SOURCE,
+      sessionIds: [exactSessionId],
+      maxSessions: 1,
+      maxCalls: 1,
+    });
+    expect(report.distilled).toBe(1);
+    expect(providerInput).toContain('EXACT-NUMERIC-SESSION-BODY');
+  });
+
+  test('a blocked ambiguous membership self-heals only after exact metadata is corrected', async () => {
+    await engine.putPage(
+      'capture/recovered-legacy/prompt-1',
+      {
+        type: 'note', title: 'legacy missing id', compiled_truth: 'RECOVERED-BODY', timeline: '',
+        frontmatter: { session_id: null, kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: CAPTURE_SOURCE },
+    );
+    const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const blocked = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now,
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'missing identity',
+    });
+    expect(blocked).toMatchObject({ status: 'blocked', ambiguousIdentityPages: 1 });
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET frontmatter = jsonb_set(frontmatter, '{session_id}', to_jsonb($2::text))
+        WHERE source_id = $1 AND slug = 'capture/recovered-legacy/prompt-1'`,
+      [CAPTURE_SOURCE, 'recovered-legacy'],
+    );
+    const recovered = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(now.getTime() + 60_000),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      actor: 'test:reconciler',
+      reason: 'authoritative identity correction',
+    });
+    expect(recovered).toMatchObject({ status: 'complete', membership: 1, ambiguousIdentityPages: 0 });
+    const membership = await engine.executeRaw<{ session_id: string; identity_status: string }>(
+      `SELECT session_id, identity_status
+         FROM context_mirror_capture_membership
+        WHERE source_id = $1`,
+      [CAPTURE_SOURCE],
+    );
+    expect(membership).toEqual([{ session_id: 'recovered-legacy', identity_status: 'resolved' }]);
+  });
+
   test('v2 reconciliation counts each immutable page once and tails later arrivals', async () => {
     await seedCapture('capture/chunkgap-sess-1/prompt-1', 'first prompt', 1);
     const now = new Date(Date.now() + 24 * 60 * 60 * 1000);
