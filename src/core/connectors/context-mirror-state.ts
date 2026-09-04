@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
+import { executeRawJsonb } from '../sql-query.ts';
 
 const BOOTSTRAP_CHECKPOINT = 'capture_session_scan_v1';
 const DEFAULT_BOOTSTRAP_BATCH = 5_000;
@@ -728,7 +729,8 @@ export async function runSessionHeadReconciliationV2(
       [opts.sourceId],
     );
     if (initialized[0]) {
-      await tx.executeRaw(
+      await executeRawJsonb(
+        tx,
         `INSERT INTO context_mirror_admin_audit (
            source_id, operation, actor, reason, request_fingerprint,
            precondition_fingerprint, outcome, before_counts, after_counts, receipt_ref
@@ -740,7 +742,9 @@ export async function runSessionHeadReconciliationV2(
           reason,
           requestFingerprint,
           reconciliationFingerprint({ state: 'absent' }),
-          JSON.stringify({ scan_upper_page_id: Number(initialized[0].scan_upper_page_id) }),
+        ],
+        [
+          { scan_upper_page_id: Number(initialized[0].scan_upper_page_id) },
         ],
       );
     }
@@ -778,12 +782,13 @@ export async function runSessionHeadReconciliationV2(
     );
     const row = rows[0];
     if (!row) return null;
-    await tx.executeRaw(
+    await executeRawJsonb(
+      tx,
       `INSERT INTO context_mirror_admin_audit (
          source_id, operation, actor, reason, request_fingerprint,
          precondition_fingerprint, outcome, before_counts, after_counts, receipt_ref
        ) VALUES ($1, 'context_mirror_reconcile_v2_lease', $2, $3, $4, $5,
-                 'acquired', $6::jsonb, $7::jsonb, $8)`,
+                 'acquired', $7::jsonb, $8::jsonb, $6)`,
       [
         opts.sourceId,
         actor,
@@ -794,9 +799,11 @@ export async function runSessionHeadReconciliationV2(
           cursor_page_id: Number(before.cursor_page_id),
           lease_generation: Number(before.lease_generation),
         }),
-        JSON.stringify({ cursor_page_id: Number(before.cursor_page_id), lease_generation: Number(before.lease_generation) }),
-        JSON.stringify({ cursor_page_id: Number(row.cursor_page_id), lease_generation: Number(row.lease_generation) }),
         `reconcile-v2:${row.lease_generation}`,
+      ],
+      [
+        { cursor_page_id: Number(before.cursor_page_id), lease_generation: Number(before.lease_generation) },
+        { cursor_page_id: Number(row.cursor_page_id), lease_generation: Number(row.lease_generation) },
       ],
     );
     return row;
@@ -863,7 +870,8 @@ export async function runSessionHeadReconciliationV2(
     });
     const inserted = membershipInput.length === 0
       ? []
-      : await tx.executeRaw<{ page_id: number | string }>(
+      : await executeRawJsonb<{ page_id: number | string }>(
+          tx,
           `WITH incoming AS (
              SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
                page_id bigint, page_slug text, identity_status text,
@@ -879,7 +887,8 @@ export async function runSessionHeadReconciliationV2(
              FROM incoming
            ON CONFLICT (source_id, page_id) DO NOTHING
            RETURNING page_id`,
-          [opts.sourceId, JSON.stringify(membershipInput)],
+          [opts.sourceId],
+          [membershipInput],
         );
 
     const sessionIds = [...new Set(membershipInput
@@ -959,7 +968,8 @@ export async function runSessionHeadReconciliationV2(
       };
     });
     if (headInput.length > 0) {
-      await tx.executeRaw(
+      await executeRawJsonb(
+        tx,
         `WITH incoming AS (
            SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
              session_id text, session_slug text, capture_slug_prefix text,
@@ -983,7 +993,8 @@ export async function runSessionHeadReconciliationV2(
            state = EXCLUDED.state,
            disposition = EXCLUDED.disposition,
            updated_at = now()`,
-        [opts.sourceId, JSON.stringify(headInput)],
+        [opts.sourceId],
+        [headInput],
       );
     }
 
@@ -1125,12 +1136,13 @@ export async function runSessionHeadReconciliationV2(
     );
     const nextState = nextStateRows[0];
     if (!nextState) throw new Error('context mirror reconciliation lease lost');
-    await tx.executeRaw(
+    await executeRawJsonb(
+      tx,
       `INSERT INTO context_mirror_admin_audit (
          source_id, operation, actor, reason, request_fingerprint,
          precondition_fingerprint, outcome, before_counts, after_counts, receipt_ref
        ) VALUES ($1, 'context_mirror_reconcile_v2_batch', $2, $3, $4, $5,
-                 $6, $7::jsonb, $8::jsonb, $9)`,
+                 $6, $8::jsonb, $9::jsonb, $7)`,
       [
         opts.sourceId,
         actor,
@@ -1142,16 +1154,18 @@ export async function runSessionHeadReconciliationV2(
           lease_generation: leaseGeneration,
         }),
         status,
-        JSON.stringify({ cursor_page_id: cursorPageId, membership: Number(state.membership_count) }),
-        JSON.stringify({
+        `reconcile-v2:${leaseGeneration}`,
+      ],
+      [
+        { cursor_page_id: cursorPageId, membership: Number(state.membership_count) },
+        {
           cursor_page_id: nextCursor,
           membership: counts.membership,
           ambiguous: counts.ambiguous,
           heads: counts.heads,
           scanned: rows.length,
           inserted_membership: inserted.length,
-        }),
-        `reconcile-v2:${leaseGeneration}`,
+        },
       ],
     );
     return reconciliationResult(nextState, counts, status, rows.length, inserted.length);
