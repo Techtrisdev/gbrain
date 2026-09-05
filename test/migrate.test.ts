@@ -52,6 +52,19 @@ describe('migration v116 durable application migration snapshots', () => {
   });
 });
 
+describe('migration v118 exact Context Mirror membership identity', () => {
+  const migration = MIGRATIONS.find((m) => m.version === 118);
+
+  test('backfills exact active page ids before making both head columns required', () => {
+    expect(migration).toBeDefined();
+    expect(migration?.idempotent).toBe(true);
+    expect(migration?.sql).toContain('jsonb_agg(m.page_id::text ORDER BY m.page_id)');
+    expect(migration?.sql).toContain('ALTER TABLE context_mirror_session_heads');
+    expect(migration?.sql).toContain('ALTER TABLE context_mirror_reconciliation_heads');
+    expect(migration?.sql).toContain('ALTER COLUMN capture_membership_ids SET NOT NULL');
+  });
+});
+
 describe('migration v114 raw capture derived-index cleanup', () => {
   const migration = MIGRATIONS.find((m) => m.version === 114);
 

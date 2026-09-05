@@ -1462,6 +1462,7 @@ CREATE TABLE IF NOT EXISTS context_mirror_session_heads (
   capture_slug_prefix   TEXT        NOT NULL,
   newest_capture_at     TIMESTAMPTZ NOT NULL,
   turn_count            INTEGER     NOT NULL CHECK (turn_count >= 0),
+  capture_membership_ids JSONB       NOT NULL DEFAULT '[]'::jsonb,
   first_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   first_eligible_at     TIMESTAMPTZ,
   cohort_at             TIMESTAMPTZ,
@@ -1599,6 +1600,7 @@ CREATE TABLE IF NOT EXISTS context_mirror_review_reservations (
 CREATE TABLE IF NOT EXISTS context_mirror_recovery_holds (
   source_id             TEXT        PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
   active                BOOLEAN     NOT NULL DEFAULT false,
+  generation            BIGINT      NOT NULL DEFAULT 0,
   reason                TEXT        NOT NULL DEFAULT '',
   acted_by              TEXT        NOT NULL DEFAULT 'system',
   held_at               TIMESTAMPTZ,
@@ -1686,6 +1688,7 @@ CREATE TABLE IF NOT EXISTS context_mirror_reconciliation_heads (
   capture_slug_prefix TEXT        NOT NULL,
   newest_capture_at   TIMESTAMPTZ NOT NULL,
   turn_count          INTEGER     NOT NULL CHECK (turn_count >= 0),
+  capture_membership_ids JSONB     NOT NULL DEFAULT '[]'::jsonb,
   state               TEXT        NOT NULL DEFAULT 'ready' CHECK (state IN ('ready','quarantined')),
   disposition         TEXT,
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),

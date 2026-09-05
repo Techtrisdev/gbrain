@@ -665,13 +665,39 @@ describe('distillCaptureSessions — distilled pages must be CHUNKED (retrievabl
       reason: 'artifact ownership check',
     });
 
-    const [head] = await engine.executeRaw<{ state: string; disposition: string | null; session_slug: string }>(
-      `SELECT state, disposition, session_slug
+    const [head] = await engine.executeRaw<{
+      state: string; disposition: string | null; session_slug: string; current_generation: number | string;
+    }>(
+      `SELECT state, disposition, session_slug, current_generation
          FROM context_mirror_session_heads
         WHERE source_id = $1 AND session_id = 'legacy'`,
       [CAPTURE_SOURCE],
     );
-    expect(head).toEqual({ state: 'quarantined', disposition: 'locator_ownership_conflict', session_slug: 'legacy' });
+    expect(head).toEqual({
+      state: 'quarantined', disposition: 'locator_ownership_conflict',
+      session_slug: 'legacy', current_generation: 1,
+    });
+
+    await engine.deletePage('distill-state/legacy', { sourceId: CAPTURE_SOURCE });
+    const healed = await runSessionHeadReconciliationV2(engine, {
+      sourceId: CAPTURE_SOURCE,
+      now: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      idleHours: 6,
+      sessionSlug: (sessionId) => sessionId,
+      actor: 'test:reconciler',
+      reason: 'recheck corrected artifact ownership without new capture',
+    });
+    expect(healed.scanned).toBe(0);
+    expect(healed.cursorPageId).toBe(healed.scanUpperPageId);
+    const [recovered] = await engine.executeRaw<{
+      state: string; disposition: string | null; current_generation: number | string;
+    }>(
+      `SELECT state, disposition, current_generation
+         FROM context_mirror_session_heads
+        WHERE source_id = $1 AND session_id = 'legacy'`,
+      [CAPTURE_SOURCE],
+    );
+    expect(recovered).toEqual({ state: 'pending', disposition: null, current_generation: 1 });
   });
 
   test('a missing-ID page under a multi-session prefix blocks provider work as ambiguous', async () => {

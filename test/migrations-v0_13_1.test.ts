@@ -22,6 +22,7 @@ import { join } from 'path';
 import { migrations, getMigration } from '../src/commands/migrations/index.ts';
 import { __testing, v0_13_1, v0_40_9 } from '../src/commands/migrations/v0_13_1.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { LATEST_VERSION } from '../src/core/migrate.ts';
 import { contentHash } from '../src/core/utils.ts';
 import { withEnv } from './helpers/with-env.ts';
 
@@ -113,7 +114,7 @@ describe('v0_13_1 orchestrator — dry-run path', () => {
     expect(connectPhase?.detail).toBe('dry-run');
   });
 
-  test('prepares a v115 engine through schema v116 before page repair', async () => {
+  test('prepares a v115 engine through the current schema before page repair', async () => {
     await preparationEngine.executeRaw('DROP TABLE migration_page_snapshots');
     await preparationEngine.setConfig('version', '115');
     await __testing.prepareConnectedEngine(preparationEngine);
@@ -121,7 +122,7 @@ describe('v0_13_1 orchestrator — dry-run path', () => {
       `SELECT table_name FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'migration_page_snapshots'`,
     )).toEqual([{ table_name: 'migration_page_snapshots' }]);
-    expect(await preparationEngine.getConfig('version')).toBe('116');
+    expect(await preparationEngine.getConfig('version')).toBe(String(LATEST_VERSION));
   }, 60_000);
 
   test('v0.40.9 repair is registered after prior orchestrators', () => {
@@ -438,6 +439,11 @@ describe('v0_13_1 orchestrator multi-source identity', () => {
           timeline: '',
           frontmatter: { owner: 'original-format', validate: false },
         }, { sourceId: 'default' });
+        await engine.executeRaw(
+          `UPDATE pages SET created_at = '2026-09-04T23:00:00Z'::timestamptz
+            WHERE (source_id = 'source-b' AND slug = 'projects/over-grandfathered')
+               OR (source_id = 'default' AND slug = 'projects/original-ledger-format')`,
+        );
 
         mkdirSync(join(migrationHome, '.gbrain', 'migrations'), { recursive: true });
         const legacyLedgerEntries = [

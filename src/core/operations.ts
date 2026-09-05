@@ -4,6 +4,7 @@
  */
 
 import { lstatSync, realpathSync } from 'fs';
+import { createHash } from 'node:crypto';
 import { resolve, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
@@ -32,6 +33,11 @@ import { bumpLastRetrievedAt } from './last-retrieved.ts';
 import { CJK_SLUG_CHARS } from './cjk.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
+import {
+  ContextMirrorProofError,
+  verifyContextMirrorProofAttestation,
+} from './connectors/context-mirror-proof.ts';
+import type { VerifiedContextMirrorProof } from './connectors/context-mirror-proof.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -3862,6 +3868,185 @@ function boundedContextMirrorInteger(
   return resolved as number;
 }
 
+const CONTEXT_MIRROR_PROOF_FINGERPRINT = /^[a-f0-9]{64}$/;
+
+function optionalContextMirrorProofFingerprint(name: string, value: unknown): string | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string' || !CONTEXT_MIRROR_PROOF_FINGERPRINT.test(value)) {
+    throw new OperationError('invalid_params', `${name} must be a lowercase sha256 fingerprint`);
+  }
+  return value;
+}
+
+function contextMirrorExternalProof(
+  kind: 'runtime_inventory' | 'replay_ledger',
+  status: {
+    source_id: string;
+    build: { sha: string; host_sha: string };
+    recovery_hold: { generation: number; held_at: string | null };
+  },
+  attestation: unknown,
+  signature: unknown,
+): VerifiedContextMirrorProof | null {
+  try {
+    return verifyContextMirrorProofAttestation({
+      kind,
+      sourceId: status.source_id,
+      attestation,
+      signature,
+      secret: process.env.PROMOTION_HMAC_SECRET,
+      expectedGbrainBuildSha: status.build.sha,
+      expectedHostBuildSha: status.build.host_sha,
+      recoveryHoldGeneration: status.recovery_hold.generation,
+      recoveryHeldAt: status.recovery_hold.held_at,
+    }) ?? null;
+  } catch (error) {
+    if (error instanceof ContextMirrorProofError) {
+      throw new OperationError('precondition_failed', error.message);
+    }
+    throw error;
+  }
+}
+
+function contextMirrorRequestFingerprint(value: Record<string, unknown>): string {
+  return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex');
+}
+
+function contextMirrorOperationTimedOut(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code;
+  return code === '57014' || code === '55P03' || code === '40001' || code === '40P01'
+    || code === 'CONTEXT_MIRROR_OPERATION_TIMEOUT';
+}
+
+const list_context_mirror_actions: Operation = {
+  name: 'list_context_mirror_actions',
+  description:
+    'Admin-only, source-confined Context Mirror recovery action inventory. Returns bounded counts, ' +
+    'opaque references, blockers, and compare-and-set fingerprints without transcript bodies or provider calls.',
+  params: {
+    runtime_proof_attestation: { type: 'string', description: 'Signed, source-bound machine-runtime proof JSON' },
+    runtime_proof_signature: { type: 'string', description: 'HMAC-SHA256 of the exact runtime proof JSON' },
+    replay_ledger_attestation: { type: 'string', description: 'Signed, source-bound outbox/replay proof JSON' },
+    replay_ledger_signature: { type: 'string', description: 'HMAC-SHA256 of the exact replay proof JSON' },
+  },
+  scope: 'admin',
+  mutating: false,
+  handler: async (ctx, p) => {
+    const sourceId = contextMirrorAdminSource(ctx);
+    const {
+      buildContextMirrorRecoveryReadiness,
+      getContextMirrorStatus,
+    } = await import('./connectors/context-mirror-status.ts');
+    const status = await getContextMirrorStatus(ctx.engine, sourceId);
+    if (!status) throw new OperationError('source_not_found', 'Context Mirror source not found');
+    const runtimeProof = contextMirrorExternalProof(
+      'runtime_inventory', status, p.runtime_proof_attestation, p.runtime_proof_signature,
+    );
+    const replayProof = contextMirrorExternalProof(
+      'replay_ledger', status, p.replay_ledger_attestation, p.replay_ledger_signature,
+    );
+    const readiness = buildContextMirrorRecoveryReadiness(status, runtimeProof, replayProof);
+
+    const actions: Array<Record<string, unknown>> = [];
+    const pushAction = (
+      action: string,
+      targetCount: number,
+      blockers: string[],
+      successProof: string,
+      opaqueTargets: Array<Record<string, string>> = [],
+    ) => actions.push({
+      action,
+      authority: 'source_admin',
+      cost_class: 'free',
+      target_count: targetCount,
+      blockers,
+      idempotency: 'compare_and_set',
+      success_proof: successProof,
+      opaque_targets: opaqueTargets,
+    });
+
+    const bootstrapBlockers = readiness.blockers.filter((code) => code.startsWith('capture_'));
+    if (bootstrapBlockers.length > 0) {
+      pushAction(
+        'run_context_mirror_bootstrap',
+        Math.max(
+          status.progress.unreconciled_active_records,
+          Math.abs(status.capture.active_records - status.progress.membership_records),
+          status.progress.ambiguous_identity_pages,
+          status.progress.head_projection_mismatch_records,
+          status.progress.locator_ownership_conflicts,
+        ),
+        bootstrapBlockers,
+        'bootstrap_complete_and_membership_conserved',
+      );
+    }
+    if (readiness.blockers.includes('ambiguous_provider_outcome')) {
+      pushAction(
+        'reconcile_ambiguous_provider_outcomes',
+        status.distillation.provider.calls.ambiguous_provider_outcome,
+        ['ambiguous_provider_outcome'],
+        'every_provider_call_has_one_durable_outcome',
+      );
+    }
+    if (readiness.blockers.includes('generation_manifest_gap')) {
+      pushAction(
+        'repair_generation_manifest',
+        status.generations.manifest_gap,
+        ['generation_manifest_gap'],
+        'generation_manifest_gap_is_zero',
+      );
+    }
+    if (readiness.blockers.includes('promotion_not_terminal')
+        || readiness.blockers.includes('promotion_transition_missing')) {
+      const promotionTargetCount = status.promotion.transition_missing
+        + status.promotion.promotion_states.accepted_dispatching
+        + status.promotion.promotion_states.dispatch_failed
+        + status.promotion.promotion_states.pr_opened
+        + status.promotion.promotion_states.merged_reindexing
+        + status.promotion.promotion_states.indexing_failed
+        + status.promotion.promotion_states.unresolved_legacy;
+      const promotionRows = await ctx.engine.executeRaw<{ id: number | string }>(
+        `SELECT c.id
+           FROM connector_candidates c
+           LEFT JOIN connector_promotion_transitions t ON t.candidate_id = c.id
+          WHERE c.source_id = $1 AND c.provider = 'context_mirror' AND c.status = 'accepted'
+            AND (t.candidate_id IS NULL OR t.state <> 'indexed')
+          ORDER BY c.id LIMIT 25`,
+        [sourceId],
+      );
+      pushAction(
+        'reconcile_legacy_promotions',
+        promotionTargetCount,
+        readiness.blockers.filter((code) => code.startsWith('promotion_')),
+        'every_accepted_promotion_is_indexed_or_explicitly_unresolved',
+        promotionRows.map((row) => ({ kind: 'candidate', ref: String(row.id) })),
+      );
+    }
+    if (readiness.blockers.includes('runtime_proof_missing')) {
+      pushAction('prove_runtime_capture', 3, ['runtime_proof_missing'], 'three_native_runtime_receipts');
+    }
+    if (readiness.blockers.includes('replay_ledger_proof_missing')) {
+      pushAction('reconcile_capture_outbox', 1, ['replay_ledger_proof_missing'], 'outbox_ledger_reconciled');
+    }
+    if (status.recovery_hold.active) {
+      pushAction(
+        'release_recovery_hold',
+        1,
+        readiness.blockers,
+        'hold_inactive_with_matching_readiness_fingerprint',
+      );
+    }
+    return {
+      schema_version: 1,
+      source_id: sourceId,
+      ready_to_release: readiness.ready,
+      readiness_fingerprint: readiness.fingerprint,
+      action_count: actions.length,
+      actions,
+    };
+  },
+};
+
 const run_context_mirror_bootstrap: Operation = {
   name: 'run_context_mirror_bootstrap',
   description:
@@ -3882,27 +4067,42 @@ const run_context_mirror_bootstrap: Operation = {
     const maxRuntimeMs = boundedContextMirrorInteger('max_runtime_ms', p.max_runtime_ms, 30_000, 1_000, 45_000);
     const reason = contextMirrorAdminReason(p.reason);
     const actor = contextMirrorAdminActor(ctx);
+    if (ctx.engine.kind !== 'postgres') {
+      throw new OperationError(
+        'unsupported_engine',
+        'Bounded Context Mirror bootstrap requires Postgres; the embedded database cannot interrupt a blocking statement safely',
+      );
+    }
     const started = Date.now();
+    const deadlineAtMs = started + maxRuntimeMs;
     let scanned = 0;
     let insertedMembership = 0;
     let batches = 0;
     let latest: import('./connectors/context-mirror-state.ts').ReconciliationV2Result | null = null;
     const { runSessionHeadReconciliationV2 } = await import('./connectors/context-mirror-state.ts');
     const { toSessionSlug } = await import('./connectors/distill.ts');
-    while (batches < maxBatches && Date.now() - started < maxRuntimeMs) {
-      latest = await runSessionHeadReconciliationV2(ctx.engine, {
-        sourceId,
-        now: new Date(),
-        idleHours: 6,
-        sessionSlug: toSessionSlug,
-        batchSize,
-        actor,
-        reason,
-      });
-      batches += 1;
-      scanned += latest.scanned;
-      insertedMembership += latest.insertedMembership;
-      if (latest.status !== 'partial') break;
+    try {
+      while (batches < maxBatches && deadlineAtMs - Date.now() >= 1_000) {
+        latest = await runSessionHeadReconciliationV2(ctx.engine, {
+          sourceId,
+          now: new Date(),
+          idleHours: 6,
+          sessionSlug: toSessionSlug,
+          batchSize,
+          deadlineAtMs,
+          actor,
+          reason,
+        });
+        batches += 1;
+        scanned += latest.scanned;
+        insertedMembership += latest.insertedMembership;
+        if (latest.status !== 'partial') break;
+      }
+    } catch (error) {
+      if (contextMirrorOperationTimedOut(error)) {
+        throw new OperationError('operation_timeout', 'Context Mirror bootstrap exceeded its runtime limit');
+      }
+      throw error;
     }
     if (!latest) {
       throw new OperationError('operation_timeout', 'Context Mirror bootstrap runtime expired before the first batch');
@@ -4044,6 +4244,11 @@ const set_context_mirror_recovery_hold: Operation = {
   params: {
     active: { type: 'boolean', required: true, description: 'true to activate the hold; false to release it' },
     reason: { type: 'string', required: true, description: 'Operator reason recorded durably with the hold state' },
+    expected_readiness_fingerprint: { type: 'string', description: 'Required compare-and-set fingerprint when releasing' },
+    runtime_proof_attestation: { type: 'string', description: 'Required signed machine-runtime proof when releasing' },
+    runtime_proof_signature: { type: 'string', description: 'HMAC-SHA256 of the exact runtime proof JSON' },
+    replay_ledger_attestation: { type: 'string', description: 'Required signed outbox/replay proof when releasing' },
+    replay_ledger_signature: { type: 'string', description: 'HMAC-SHA256 of the exact replay proof JSON' },
   },
   scope: 'admin',
   mutating: true,
@@ -4051,14 +4256,131 @@ const set_context_mirror_recovery_hold: Operation = {
     const sourceId = contextMirrorAdminSource(ctx);
     const reason = contextMirrorAdminReason(p.reason);
     const actor = contextMirrorAdminActor(ctx);
-    const { setContextMirrorRecoveryHold } = await import('./connectors/context-mirror-state.ts');
-    const hold = await setContextMirrorRecoveryHold(
-      ctx.engine,
-      sourceId,
-      p.active as boolean,
-      reason,
-      actor,
+    if (typeof p.active !== 'boolean') {
+      throw new OperationError('invalid_params', 'active must be a boolean');
+    }
+    const active = p.active;
+    let runtimeProof: VerifiedContextMirrorProof | null = null;
+    let replayProof: VerifiedContextMirrorProof | null = null;
+    const expectedReadiness = optionalContextMirrorProofFingerprint(
+      'expected_readiness_fingerprint', p.expected_readiness_fingerprint,
     );
+    const {
+      releaseContextMirrorRecoveryHold,
+      setContextMirrorRecoveryHold,
+    } = await import('./connectors/context-mirror-state.ts');
+    const {
+      buildContextMirrorRecoveryReadiness,
+      readContextMirrorStatusSnapshot,
+    } = await import('./connectors/context-mirror-status.ts');
+    const { executeRawJsonb } = await import('./sql-query.ts');
+    let result: {
+      hold: import('./connectors/context-mirror-state.ts').ContextMirrorRecoveryHold;
+      readiness: ReturnType<typeof buildContextMirrorRecoveryReadiness> | null;
+    };
+    try {
+      result = await ctx.engine.transaction(async (tx) => {
+        if (ctx.engine.kind === 'postgres') {
+          await tx.executeRaw("SET LOCAL statement_timeout = '5000'");
+          await tx.executeRaw("SET LOCAL lock_timeout = '1000'");
+        }
+        const beforeRows = await tx.executeRaw<{
+          active: boolean;
+          generation: number | string;
+        }>(
+          `SELECT active,generation FROM context_mirror_recovery_holds WHERE source_id=$1 FOR UPDATE`,
+          [sourceId],
+        );
+        let readiness: ReturnType<typeof buildContextMirrorRecoveryReadiness> | null = null;
+        if (!active) {
+          if (!beforeRows[0] || beforeRows[0].active !== true) {
+            throw new OperationError('precondition_failed', 'No active recovery hold exists to release');
+          }
+          if (ctx.engine.kind === 'postgres') {
+            const sourceRows = await tx.executeRaw<{ id: string }>(
+              'SELECT id FROM sources WHERE id = $1 FOR SHARE',
+              [sourceId],
+            );
+            if (!sourceRows[0]) {
+              throw new OperationError('source_not_found', 'Context Mirror source not found');
+            }
+            await tx.executeRaw(
+              `LOCK TABLE config, pages, content_chunks, context_mirror_capture_membership,
+                 context_mirror_reconciliation_state, context_mirror_provider_calls,
+                 context_mirror_generations, context_mirror_partitions,
+                 connector_candidates, connector_promotion_transitions IN SHARE MODE`,
+            );
+          }
+          const status = await readContextMirrorStatusSnapshot(tx, sourceId);
+          if (!status) throw new OperationError('source_not_found', 'Context Mirror source not found');
+          runtimeProof = contextMirrorExternalProof(
+            'runtime_inventory', status, p.runtime_proof_attestation, p.runtime_proof_signature,
+          );
+          replayProof = contextMirrorExternalProof(
+            'replay_ledger', status, p.replay_ledger_attestation, p.replay_ledger_signature,
+          );
+          if (!expectedReadiness || !runtimeProof || !replayProof) {
+            throw new OperationError(
+              'precondition_failed',
+              'Hold release requires fresh engine, runtime, and replay proof fingerprints',
+            );
+          }
+          readiness = buildContextMirrorRecoveryReadiness(status, runtimeProof, replayProof);
+          if (readiness.fingerprint !== expectedReadiness) {
+            throw new OperationError('stale_precondition', 'Context Mirror readiness changed; refresh the action inventory');
+          }
+          if (!readiness.ready) {
+            throw new OperationError('precondition_failed', `Context Mirror recovery is not ready: ${readiness.blockers.join(',')}`);
+          }
+        }
+        const hold = active
+          ? await setContextMirrorRecoveryHold(tx, sourceId, true, reason, actor)
+          : await releaseContextMirrorRecoveryHold(
+              tx,
+              sourceId,
+              reason,
+              actor,
+              Number(beforeRows[0]!.generation),
+            );
+        if (!hold) {
+          throw new OperationError('stale_precondition', 'Recovery hold changed; refresh the action inventory');
+        }
+        const requestFingerprint = contextMirrorRequestFingerprint({
+          source_id: sourceId,
+          active,
+          reason,
+          runtime_proof_fingerprint: runtimeProof?.receiptFingerprint ?? null,
+          replay_ledger_fingerprint: replayProof?.receiptFingerprint ?? null,
+        });
+        await executeRawJsonb(
+          tx,
+          `INSERT INTO context_mirror_admin_audit (
+             source_id,operation,actor,reason,request_fingerprint,
+             precondition_fingerprint,outcome,before_counts,after_counts,receipt_ref
+           ) VALUES ($1,'set_context_mirror_recovery_hold',$2,$3,$4,$5,$6,$8::jsonb,$9::jsonb,$7)`,
+          [
+            sourceId,
+            actor,
+            reason,
+            requestFingerprint,
+            readiness?.fingerprint ?? contextMirrorRequestFingerprint({ source_id: sourceId, activation: true }),
+            active ? 'activated' : 'released',
+            `context-mirror-hold:${requestFingerprint.slice(0, 16)}`,
+          ],
+          [
+            { active: beforeRows[0]?.active === true },
+            { active: hold.active },
+          ],
+        );
+        return { hold, readiness };
+      });
+    } catch (error) {
+      if (contextMirrorOperationTimedOut(error)) {
+        throw new OperationError('operation_timeout', 'Context Mirror hold release could not obtain a stable snapshot in time');
+      }
+      throw error;
+    }
+    const hold = result.hold;
     ctx.logger.info(
       `[context-mirror-admin] operation=set_context_mirror_recovery_hold source=${sourceId} ` +
       `active=${hold.active} actor=${actor} reason=${JSON.stringify(reason)}`,
@@ -4071,6 +4393,7 @@ const set_context_mirror_recovery_hold: Operation = {
       held_at: hold.heldAt?.toISOString() ?? null,
       released_at: hold.releasedAt?.toISOString() ?? null,
       updated_at: hold.updatedAt?.toISOString() ?? null,
+      readiness_fingerprint: result.readiness?.fingerprint ?? null,
     };
   },
 };
@@ -5059,6 +5382,7 @@ export const operations: Operation[] = [
   takes_scorecard, takes_calibration,
   // v0.28: whoami + scoped sources management
   whoami, sources_add, sources_list, sources_remove, sources_status, context_mirror_status,
+  list_context_mirror_actions,
   run_context_mirror_bootstrap, retry_candidate_promotion, rollback_context_generation, set_context_mirror_recovery_hold,
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,

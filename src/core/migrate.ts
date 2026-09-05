@@ -5865,6 +5865,94 @@ export const MIGRATIONS: Migration[] = [
       return new Set(rows.map((row) => row.column_name)).size === 9;
     },
   },
+  {
+    version: 117,
+    name: 'context_mirror_recovery_hold_generation',
+    idempotent: true,
+    sql: `
+      ALTER TABLE context_mirror_recovery_holds
+        ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'context_mirror_recovery_holds'
+            AND column_name = 'generation'`,
+      );
+      return rows.length === 1;
+    },
+  },
+  {
+    version: 118,
+    name: 'context_mirror_exact_capture_membership_identity',
+    idempotent: true,
+    sql: `
+      ALTER TABLE context_mirror_session_heads
+        ADD COLUMN IF NOT EXISTS capture_membership_ids JSONB;
+      ALTER TABLE context_mirror_reconciliation_heads
+        ADD COLUMN IF NOT EXISTS capture_membership_ids JSONB;
+
+      WITH active_membership AS (
+        SELECT m.source_id, m.session_id,
+               jsonb_agg(m.page_id::text ORDER BY m.page_id) AS ids
+          FROM context_mirror_capture_membership m
+          JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+         WHERE m.identity_status = 'resolved'
+           AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%'
+         GROUP BY m.source_id, m.session_id
+      )
+      UPDATE context_mirror_session_heads h
+         SET capture_membership_ids = COALESCE(a.ids, '[]'::jsonb)
+        FROM active_membership a
+       WHERE h.source_id = a.source_id AND h.session_id = a.session_id;
+      UPDATE context_mirror_session_heads
+         SET capture_membership_ids = '[]'::jsonb
+       WHERE capture_membership_ids IS NULL;
+
+      WITH active_membership AS (
+        SELECT m.source_id, m.session_id,
+               jsonb_agg(m.page_id::text ORDER BY m.page_id) AS ids
+          FROM context_mirror_capture_membership m
+          JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+         WHERE m.identity_status = 'resolved'
+           AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%'
+         GROUP BY m.source_id, m.session_id
+      )
+      UPDATE context_mirror_reconciliation_heads h
+         SET capture_membership_ids = COALESCE(a.ids, '[]'::jsonb)
+        FROM active_membership a
+       WHERE h.source_id = a.source_id AND h.session_id = a.session_id;
+      UPDATE context_mirror_reconciliation_heads
+         SET capture_membership_ids = '[]'::jsonb
+       WHERE capture_membership_ids IS NULL;
+
+      ALTER TABLE context_mirror_session_heads
+        ALTER COLUMN capture_membership_ids SET DEFAULT '[]'::jsonb,
+        ALTER COLUMN capture_membership_ids SET NOT NULL;
+      ALTER TABLE context_mirror_reconciliation_heads
+        ALTER COLUMN capture_membership_ids SET DEFAULT '[]'::jsonb,
+        ALTER COLUMN capture_membership_ids SET NOT NULL;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{
+        table_name: string;
+        column_default: string | null;
+        is_nullable: string;
+      }>(
+        `SELECT table_name, column_default, is_nullable
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name IN (
+              'context_mirror_session_heads',
+              'context_mirror_reconciliation_heads'
+            )
+            AND column_name = 'capture_membership_ids'`,
+      );
+      return rows.length === 2
+        && rows.every((row) => row.is_nullable === 'NO' && row.column_default?.includes("'[]'::jsonb"));
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto';
+
 import type { BrainEngine } from '../engine.ts';
-import { VERSION, BUILD_SHA, HOST_BUILD_SHA } from '../../version.ts';
+import type { VerifiedContextMirrorProof } from './context-mirror-proof.ts';
+import { VERSION, gbrainBuildShaFromEnv, hostBuildShaFromEnv } from '../../version.ts';
 import {
   parseJsonObject,
   readContextMirrorRecoveryHold,
@@ -37,8 +40,10 @@ export interface ContextMirrorStatusV1 {
   };
   recovery_hold: {
     active: boolean;
+    generation: number;
     held_at: string | null;
     released_at: string | null;
+    updated_at: string | null;
     reason_code: string | null;
   };
   capture: {
@@ -152,11 +157,20 @@ export interface ContextMirrorStatusV1 {
     reconciliation_version: number | null;
     reconciliation_phase: 'rebuilding' | 'tailing' | 'blocked' | null;
     membership_records: number;
+    unreconciled_active_records: number;
     ambiguous_identity_pages: number;
+    head_projection_mismatch_records: number;
+    locator_ownership_conflicts: number;
     cursor_page_id: number | null;
     scan_upper_page_id: number | null;
     last_tail_at: string | null;
   };
+}
+
+export interface ContextMirrorRecoveryReadiness {
+  ready: boolean;
+  blockers: string[];
+  fingerprint: string;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -320,7 +334,7 @@ function classifyOverall(input: {
  * selected. Brain-side health combines this with the authoritative D-drive outbox and
  * real-consumer proofs, which are intentionally `unknown` here rather than inferred.
  */
-async function readContextMirrorStatus(
+export async function readContextMirrorStatusSnapshot(
   engine: BrainEngine,
   sourceId: string,
   now: Date = new Date(),
@@ -512,19 +526,67 @@ async function readContextMirrorStatus(
     cursor_page_id: number | string;
     scan_upper_page_id: number | string;
     membership_count: number | string;
+    unreconciled_active_count: number | string;
     ambiguous_count: number | string;
+    head_projection_mismatch_records: number | string;
+    locator_ownership_conflict_count: number | string;
     last_tail_at: Date | string | null;
     updated_at: Date | string;
   }>(
-    `SELECT version, phase, cursor_page_id, scan_upper_page_id,
-            membership_count, ambiguous_count, last_tail_at, updated_at
-       FROM context_mirror_reconciliation_state WHERE source_id = $1`,
+    `SELECT r.version, r.phase, r.cursor_page_id, r.scan_upper_page_id,
+            r.membership_count, r.ambiguous_count, r.last_tail_at, r.updated_at,
+            (
+              SELECT count(*)
+                FROM pages p
+                LEFT JOIN context_mirror_capture_membership m
+                  ON m.source_id = p.source_id AND m.page_id = p.id
+               WHERE p.source_id = $1 AND p.deleted_at IS NULL
+                 AND p.slug LIKE 'capture/%' AND m.page_id IS NULL
+            ) AS unreconciled_active_count,
+            (
+              WITH active_ids AS (
+                SELECT p.id::text AS page_id, count(*)::bigint AS copies
+                  FROM pages p
+                 WHERE p.source_id = $1 AND p.deleted_at IS NULL
+                   AND p.slug LIKE 'capture/%'
+                 GROUP BY p.id
+              ), projected_ids AS (
+                SELECT item.page_id, count(*)::bigint AS copies
+                  FROM context_mirror_session_heads h
+                  CROSS JOIN LATERAL jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof(h.capture_membership_ids) = 'array'
+                      THEN h.capture_membership_ids ELSE '[]'::jsonb END
+                  ) item(page_id)
+                 WHERE h.source_id = $1
+                 GROUP BY item.page_id
+              ), mismatched AS (
+                SELECT COALESCE(active_ids.page_id, projected_ids.page_id) AS page_id,
+                       abs(COALESCE(active_ids.copies, 0) - COALESCE(projected_ids.copies, 0)) AS copies
+                  FROM active_ids
+                  FULL OUTER JOIN projected_ids USING (page_id)
+                 WHERE active_ids.copies IS DISTINCT FROM projected_ids.copies
+              )
+              SELECT COALESCE(sum(copies), 0)
+                     + (SELECT count(*) FROM context_mirror_session_heads h
+                         WHERE h.source_id = $1
+                           AND jsonb_typeof(h.capture_membership_ids) IS DISTINCT FROM 'array')
+                FROM mismatched
+            ) AS head_projection_mismatch_records,
+            (
+              SELECT count(*)
+                FROM context_mirror_reconciliation_heads h
+               WHERE h.source_id = $1 AND h.state = 'quarantined'
+                 AND h.disposition = 'locator_ownership_conflict'
+            ) AS locator_ownership_conflict_count
+       FROM context_mirror_reconciliation_state r WHERE r.source_id = $1`,
     [sourceId],
   );
   const reconciliation = reconciliationRows[0];
   const reconciliationComplete = reconciliation
     ? reconciliation.phase === 'tailing'
       && numberValue(reconciliation.ambiguous_count) === 0
+      && numberValue(reconciliation.head_projection_mismatch_records) === 0
+      && numberValue(reconciliation.locator_ownership_conflict_count) === 0
       && numberValue(reconciliation.cursor_page_id) >= numberValue(reconciliation.scan_upper_page_id)
     : null;
   const bootstrapComplete = reconciliationComplete ?? bootstrapCheckpoint?.completed ?? null;
@@ -683,7 +745,11 @@ async function readContextMirrorStatus(
     schema_version: 1,
     generated_at: now.toISOString(),
     source_id: sourceId,
-    build: { version: VERSION, sha: BUILD_SHA, host_sha: HOST_BUILD_SHA },
+    build: {
+      version: VERSION,
+      sha: gbrainBuildShaFromEnv(process.env),
+      host_sha: hostBuildShaFromEnv(process.env),
+    },
     overall,
     configuration: {
       connector_enabled: connectorEnabled,
@@ -698,8 +764,10 @@ async function readContextMirrorStatus(
     },
     recovery_hold: {
       active: recovery.active,
+      generation: recovery.generation,
       held_at: recovery.heldAt?.toISOString() ?? null,
       released_at: recovery.releasedAt?.toISOString() ?? null,
+      updated_at: recovery.updatedAt?.toISOString() ?? null,
       reason_code: recovery.active ? 'operator_recovery_hold' : null,
     },
     capture: {
@@ -864,12 +932,93 @@ async function readContextMirrorStatus(
       reconciliation_version: reconciliation ? numberValue(reconciliation.version) : null,
       reconciliation_phase: reconciliation?.phase ?? null,
       membership_records: numberValue(reconciliation?.membership_count),
+      unreconciled_active_records: numberValue(reconciliation?.unreconciled_active_count),
       ambiguous_identity_pages: numberValue(reconciliation?.ambiguous_count),
+      head_projection_mismatch_records: numberValue(reconciliation?.head_projection_mismatch_records),
+      locator_ownership_conflicts: numberValue(reconciliation?.locator_ownership_conflict_count),
       cursor_page_id: reconciliation ? numberValue(reconciliation.cursor_page_id) : null,
       scan_upper_page_id: reconciliation ? numberValue(reconciliation.scan_upper_page_id) : null,
       last_tail_at: iso(reconciliation?.last_tail_at),
     },
   };
+}
+
+function readinessFingerprint(value: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(JSON.stringify(value), 'utf8')
+    .digest('hex');
+}
+
+/** Stable, body-free compare-and-set input for recovery-hold release. */
+export function buildContextMirrorRecoveryReadiness(
+  status: ContextMirrorStatusV1,
+  runtimeProof: VerifiedContextMirrorProof | null,
+  replayLedgerProof: VerifiedContextMirrorProof | null,
+): ContextMirrorRecoveryReadiness {
+  const runtimeProofFingerprint = runtimeProof?.receiptFingerprint ?? null;
+  const replayLedgerFingerprint = replayLedgerProof?.receiptFingerprint ?? null;
+  const blockers: string[] = [];
+  if (status.configuration.connector_enabled) blockers.push('connector_enabled_during_recovery');
+  if (status.configuration.distill_before_poll) blockers.push('paid_distillation_enabled_during_recovery');
+  if (!status.promotion.dispatch_frozen) blockers.push('promotion_dispatch_not_frozen');
+  if (status.progress.bootstrap_complete !== true) blockers.push('capture_inventory_incomplete');
+  if (status.progress.reconciliation_phase !== 'tailing') blockers.push('capture_inventory_not_tailing');
+  if (
+    status.progress.cursor_page_id !== status.progress.scan_upper_page_id
+    || status.progress.membership_records !== status.capture.active_records
+    || status.progress.unreconciled_active_records > 0
+    || status.progress.head_projection_mismatch_records > 0
+  ) blockers.push('capture_membership_mismatch');
+  if (status.progress.ambiguous_identity_pages > 0) blockers.push('capture_identity_ambiguous');
+  if (status.progress.locator_ownership_conflicts > 0) blockers.push('capture_locator_ownership_conflict');
+  if (status.distillation.provider.calls.ambiguous_provider_outcome > 0) blockers.push('ambiguous_provider_outcome');
+  if (status.generations.manifest_gap > 0) blockers.push('generation_manifest_gap');
+  if (status.promotion.transition_missing > 0) blockers.push('promotion_transition_missing');
+  const promotionNonterminal =
+    status.promotion.promotion_states.accepted_dispatching
+    + status.promotion.promotion_states.dispatch_failed
+    + status.promotion.promotion_states.pr_opened
+    + status.promotion.promotion_states.merged_reindexing
+    + status.promotion.promotion_states.indexing_failed
+    + status.promotion.promotion_states.unresolved_legacy;
+  if (promotionNonterminal > 0) blockers.push('promotion_not_terminal');
+  if (!runtimeProofFingerprint) blockers.push('runtime_proof_missing');
+  if (!replayLedgerFingerprint) blockers.push('replay_ledger_proof_missing');
+  blockers.sort();
+  const fingerprint = readinessFingerprint({
+    schema_version: 1,
+    source_id: status.source_id,
+    build: status.build,
+    recovery_hold: {
+      active: status.recovery_hold.active,
+      generation: status.recovery_hold.generation,
+    },
+    configuration: {
+      connector_enabled: status.configuration.connector_enabled,
+      distill_before_poll: status.configuration.distill_before_poll,
+      promotion_dispatch_frozen: status.promotion.dispatch_frozen,
+    },
+    capture: {
+      active_records: status.capture.active_records,
+      membership_records: status.progress.membership_records,
+      unreconciled_active_records: status.progress.unreconciled_active_records,
+      cursor_page_id: status.progress.cursor_page_id,
+      scan_upper_page_id: status.progress.scan_upper_page_id,
+      ambiguous_identity_pages: status.progress.ambiguous_identity_pages,
+      head_projection_mismatch_records: status.progress.head_projection_mismatch_records,
+      locator_ownership_conflicts: status.progress.locator_ownership_conflicts,
+      bootstrap_complete: status.progress.bootstrap_complete,
+      reconciliation_phase: status.progress.reconciliation_phase,
+    },
+    provider_ambiguous: status.distillation.provider.calls.ambiguous_provider_outcome,
+    generation_manifest_gap: status.generations.manifest_gap,
+    promotion_nonterminal: promotionNonterminal,
+    promotion_transition_missing: status.promotion.transition_missing,
+    runtime_proof_fingerprint: runtimeProofFingerprint,
+    replay_ledger_fingerprint: replayLedgerFingerprint,
+    blockers,
+  });
+  return { ready: blockers.length === 0, blockers, fingerprint };
 }
 
 /**
@@ -887,6 +1036,6 @@ export async function getContextMirrorStatus(
       await tx.executeRaw("SET LOCAL statement_timeout = '5000'");
       await tx.executeRaw("SET LOCAL lock_timeout = '1000'");
     }
-    return readContextMirrorStatus(tx, sourceId, now);
+    return readContextMirrorStatusSnapshot(tx, sourceId, now);
   });
 }

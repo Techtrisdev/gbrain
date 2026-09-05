@@ -12,12 +12,14 @@ import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
+import { createHmac } from 'node:crypto';
 import {
   hasDatabase, setupDB, teardownDB, getEngine, getConn,
   importFixtures, importFixture, time, dumpDBState, FIXTURES_PATH,
 } from './helpers.ts';
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
+import type { BrainEngine } from '../../src/core/engine.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
 import { runSessionHeadReconciliationV2 } from '../../src/core/connectors/context-mirror-state.ts';
 import { toSessionSlug } from '../../src/core/connectors/distill.ts';
@@ -26,15 +28,15 @@ import { toSessionSlug } from '../../src/core/connectors/distill.ts';
 const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
 
-function makeCtx(opts: { remote?: boolean } = {}): OperationContext {
+function makeCtx(opts: { remote?: boolean; sourceId?: string; engine?: BrainEngine } = {}): OperationContext {
   return {
-    engine: getEngine(),
+    engine: opts.engine ?? getEngine(),
     config: { engine: 'postgres', database_url: process.env.DATABASE_URL! },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     dryRun: false,
     // Default: trusted local invocation (matches `gbrain call` semantics).
     remote: opts.remote ?? false,
-    sourceId: 'default',
+    sourceId: opts.sourceId ?? 'default',
   };
 }
 
@@ -1447,6 +1449,40 @@ describeE2E('E2E: Performance Baselines', () => {
 
 describeE2E('E2E: Context Mirror reconciliation JSONB', () => {
   const sourceId = 'default';
+  const proofSecret = 'context-mirror-e2e-proof-secret-at-least-32-bytes';
+  const gbrainBuildSha = 'b'.repeat(40);
+  const hostBuildSha = 'c'.repeat(40);
+
+  function externalProofParams(proofSourceId: string, observedAt = new Date()) {
+    const signedProof = (kind: 'runtime_inventory' | 'replay_ledger', fingerprint: string) => {
+      const attestation = JSON.stringify({
+        evidence_fingerprint: fingerprint,
+        gbrain_build_sha: gbrainBuildSha,
+        host_build_sha: hostBuildSha,
+        observed_at: observedAt.toISOString(),
+        proof_kind: kind,
+        recovery_hold_generation: 0,
+        result: 'ok',
+        schema_version: 1,
+        source_id: proofSourceId,
+      });
+      return {
+        attestation,
+        signature: createHmac('sha256', proofSecret)
+          .update('context-mirror-proof/v1\n', 'utf8')
+          .update(attestation, 'utf8')
+          .digest('hex'),
+      };
+    };
+    const runtime = signedProof('runtime_inventory', 'a'.repeat(64));
+    const replay = signedProof('replay_ledger', 'd'.repeat(64));
+    return {
+      runtime_proof_attestation: runtime.attestation,
+      runtime_proof_signature: runtime.signature,
+      replay_ledger_attestation: replay.attestation,
+      replay_ledger_signature: replay.signature,
+    };
+  }
 
   async function clearSourceState(): Promise<void> {
     const engine = getEngine();
@@ -1529,4 +1565,270 @@ describeE2E('E2E: Context Mirror reconciliation JSONB', () => {
     expect(auditKinds.every((row) => row.before_kind === 'object')).toBe(true);
     expect(auditKinds.every((row) => row.after_kind === 'object')).toBe(true);
   });
+
+  test('recovery release locks source and global config through its readiness snapshot', async () => {
+    const engine = getEngine();
+    const raceSourceId = `cmrel-${process.pid.toString(36)}-${Date.now().toString(36)}`;
+    const originalPromotionDispatchFrozen = await engine.getConfig('connectors.promotion_dispatch_frozen');
+    const originalProofSecret = process.env.PROMOTION_HMAC_SECRET;
+    const originalGbrainBuildSha = process.env.GBRAIN_BUILD_SHA;
+    const originalHostBuildSha = process.env.GBRAIN_HOST_BUILD_SHA;
+    let resumeSnapshot = () => {};
+    let releasePromise: Promise<unknown> | undefined;
+    let sourceUpdatePromise: Promise<unknown> | undefined;
+    let configUpdatePromise: Promise<unknown> | undefined;
+
+    try {
+      process.env.PROMOTION_HMAC_SECRET = proofSecret;
+      process.env.GBRAIN_BUILD_SHA = gbrainBuildSha;
+      process.env.GBRAIN_HOST_BUILD_SHA = hostBuildSha;
+      await engine.setConfig('connectors.promotion_dispatch_frozen', 'true');
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, config) VALUES ($1, $1, '{}'::jsonb)`,
+        [raceSourceId],
+      );
+      await engine.executeRaw(
+        `INSERT INTO context_mirror_recovery_holds (
+           source_id, active, reason, acted_by, held_at
+         ) VALUES ($1, true, 'repair', 'test', now() - interval '1 second')`,
+        [raceSourceId],
+      );
+      await engine.executeRaw(
+        `INSERT INTO context_mirror_reconciliation_state (
+           source_id, version, phase, cursor_page_id, scan_upper_page_id,
+           membership_count, ambiguous_count, head_count, last_complete_at, last_tail_at
+         ) VALUES ($1, 2, 'tailing', 0, 0, 0, 0, 0, now(), now())`,
+        [raceSourceId],
+      );
+
+      const proofParams = externalProofParams(raceSourceId);
+      const inventory = await operationsByName.list_context_mirror_actions!.handler(
+        makeCtx({ sourceId: raceSourceId }),
+        proofParams,
+      ) as { ready_to_release: boolean; readiness_fingerprint: string };
+      expect(inventory.ready_to_release).toBe(true);
+
+      let reachedSnapshot!: () => void;
+      const snapshotReached = new Promise<void>((resolve) => { reachedSnapshot = resolve; });
+      const snapshotGate = new Promise<void>((resolve) => { resumeSnapshot = resolve; });
+      let paused = false;
+      const pausingEngine = new Proxy(engine as BrainEngine, {
+        get(target, property, receiver) {
+          if (property === 'transaction') {
+            return async <T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> => {
+              return target.transaction(async (tx) => {
+                const pausingTx = new Proxy(tx, {
+                  get(txTarget, txProperty, txReceiver) {
+                    if (txProperty === 'executeRaw') {
+                      return async <Row = Record<string, unknown>>(
+                        sql: string,
+                        params?: unknown[],
+                      ): Promise<Row[]> => {
+                        const rows = await txTarget.executeRaw<Row>(sql, params);
+                        if (!paused && sql.includes('SELECT config FROM sources WHERE id = $1')) {
+                          paused = true;
+                          reachedSnapshot();
+                          await snapshotGate;
+                        }
+                        return rows;
+                      };
+                    }
+                    const value = Reflect.get(txTarget, txProperty, txReceiver);
+                    return typeof value === 'function' ? value.bind(txTarget) : value;
+                  },
+                }) as BrainEngine;
+                return fn(pausingTx);
+              });
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as BrainEngine;
+
+      releasePromise = operationsByName.set_context_mirror_recovery_hold!.handler(
+        makeCtx({ sourceId: raceSourceId, engine: pausingEngine }),
+        {
+          active: false,
+          reason: 'free foundation verified',
+          expected_readiness_fingerprint: inventory.readiness_fingerprint,
+          ...proofParams,
+        },
+      );
+      let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          snapshotReached,
+          new Promise<never>((_, reject) => {
+            snapshotTimer = setTimeout(
+              () => reject(new Error('release did not reach the source readiness snapshot')),
+              2_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (snapshotTimer) clearTimeout(snapshotTimer);
+      }
+
+      let sourceUpdateSettled = false;
+      sourceUpdatePromise = engine.executeRaw(
+        `UPDATE /* cm_source_lock_regression */ sources
+            SET config = $2::jsonb
+          WHERE id = $1`,
+        [raceSourceId, JSON.stringify({ connectors: { context_mirror: { enabled: true } } })],
+      ).finally(() => { sourceUpdateSettled = true; });
+      let configUpdateSettled = false;
+      configUpdatePromise = engine.executeRaw(
+        `UPDATE /* cm_global_config_lock_regression */ config
+            SET value = 'false'
+          WHERE key = 'connectors.promotion_dispatch_frozen'`,
+      ).finally(() => { configUpdateSettled = true; });
+      let sourceUpdateWasBlocked = false;
+      let configUpdateWasBlocked = false;
+      const lockObservationDeadline = Date.now() + 1_000;
+      while (
+        (!sourceUpdateWasBlocked || !configUpdateWasBlocked)
+        && (!sourceUpdateSettled || !configUpdateSettled)
+        && Date.now() < lockObservationDeadline
+      ) {
+        const [lockState] = await engine.executeRaw<{
+          source_waiting: boolean;
+          config_waiting: boolean;
+        }>(
+          `SELECT
+             EXISTS (
+               SELECT 1
+                 FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND query LIKE '%cm_source_lock_regression%'
+                  AND wait_event_type = 'Lock'
+             ) AS source_waiting,
+             EXISTS (
+               SELECT 1
+                 FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND query LIKE '%cm_global_config_lock_regression%'
+                  AND wait_event_type = 'Lock'
+             ) AS config_waiting`,
+        );
+        sourceUpdateWasBlocked ||= lockState?.source_waiting === true;
+        configUpdateWasBlocked ||= lockState?.config_waiting === true;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      resumeSnapshot();
+
+      const [released] = await Promise.all([
+        releasePromise,
+        sourceUpdatePromise,
+        configUpdatePromise,
+      ]);
+      expect(sourceUpdateWasBlocked).toBe(true);
+      expect(configUpdateWasBlocked).toBe(true);
+      expect(released).toMatchObject({ source_id: raceSourceId, active: false });
+    } finally {
+      resumeSnapshot();
+      await Promise.allSettled([
+        ...(releasePromise ? [releasePromise] : []),
+        ...(sourceUpdatePromise ? [sourceUpdatePromise] : []),
+        ...(configUpdatePromise ? [configUpdatePromise] : []),
+      ]);
+      await engine.executeRaw('DELETE FROM sources WHERE id = $1', [raceSourceId]);
+      if (originalPromotionDispatchFrozen === null) {
+        await engine.executeRaw(
+          `DELETE FROM config WHERE key = 'connectors.promotion_dispatch_frozen'`,
+        );
+      } else {
+        await engine.setConfig('connectors.promotion_dispatch_frozen', originalPromotionDispatchFrozen);
+      }
+      if (originalProofSecret === undefined) delete process.env.PROMOTION_HMAC_SECRET;
+      else process.env.PROMOTION_HMAC_SECRET = originalProofSecret;
+      if (originalGbrainBuildSha === undefined) delete process.env.GBRAIN_BUILD_SHA;
+      else process.env.GBRAIN_BUILD_SHA = originalGbrainBuildSha;
+      if (originalHostBuildSha === undefined) delete process.env.GBRAIN_HOST_BUILD_SHA;
+      else process.env.GBRAIN_HOST_BUILD_SHA = originalHostBuildSha;
+    }
+  }, 10_000);
+
+  test('busy lease status reads are canceled and settled by the request deadline', async () => {
+    const engine = getEngine();
+    const busySourceId = `cm-busy-deadline-${process.pid}-${Date.now()}`;
+    let busyTransactionSettled = false;
+
+    const delayedBusyRead = (target: BrainEngine, onBusy: () => void): BrainEngine => new Proxy(target, {
+      get(inner, property, receiver) {
+        if (property === 'executeRaw') {
+          return async <Row = Record<string, unknown>>(
+            sql: string,
+            params?: unknown[],
+          ): Promise<Row[]> => {
+            if (
+              sql.includes('FROM context_mirror_reconciliation_state WHERE source_id = $1')
+              && !sql.includes('FOR UPDATE')
+            ) {
+              onBusy();
+              await inner.executeRaw('SELECT pg_sleep(3)');
+            }
+            return inner.executeRaw<Row>(sql, params);
+          };
+        }
+        const value = Reflect.get(inner, property, receiver);
+        return typeof value === 'function' ? value.bind(inner) : value;
+      },
+    }) as BrainEngine;
+
+    try {
+      await engine.executeRaw('INSERT INTO sources (id, name) VALUES ($1, $1)', [busySourceId]);
+      await engine.executeRaw(
+        `INSERT INTO context_mirror_reconciliation_state (
+           source_id, version, phase, cursor_page_id, scan_upper_page_id,
+           lease_owner, lease_expires_at, membership_count, ambiguous_count, head_count
+         ) VALUES ($1, 2, 'tailing', 0, 0, 'other-worker', now() + interval '1 minute', 0, 0, 0)`,
+        [busySourceId],
+      );
+
+      const delayedEngine = new Proxy(engine as BrainEngine, {
+        get(target, property, receiver) {
+          if (property === 'transaction') {
+            return async <T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> => {
+              let sawBusyRead = false;
+              try {
+                return await target.transaction((tx) => fn(delayedBusyRead(tx, () => {
+                  sawBusyRead = true;
+                })));
+              } finally {
+                if (sawBusyRead) busyTransactionSettled = true;
+              }
+            };
+          }
+          if (property === 'executeRaw') {
+            const delayed = delayedBusyRead(target, () => {});
+            return delayed.executeRaw.bind(delayed);
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }) as BrainEngine;
+
+      const startedAt = Date.now();
+      await expect(runSessionHeadReconciliationV2(delayedEngine, {
+        sourceId: busySourceId,
+        now: new Date(),
+        idleHours: 6,
+        sessionSlug: toSessionSlug,
+        batchSize: 10,
+        deadlineAtMs: Date.now() + 1_300,
+        actor: 'test:busy-deadline',
+        reason: 'bound busy lease status',
+      })).rejects.toMatchObject({ code: 'CONTEXT_MIRROR_OPERATION_TIMEOUT' });
+      expect(Date.now() - startedAt).toBeLessThan(2_500);
+      expect(busyTransactionSettled).toBe(true);
+      const [state] = await engine.executeRaw<{ lease_owner: string }>(
+        `SELECT lease_owner FROM context_mirror_reconciliation_state WHERE source_id = $1`,
+        [busySourceId],
+      );
+      expect(state?.lease_owner).toBe('other-worker');
+    } finally {
+      await engine.executeRaw('DELETE FROM sources WHERE id = $1', [busySourceId]);
+    }
+  }, 10_000);
 });
