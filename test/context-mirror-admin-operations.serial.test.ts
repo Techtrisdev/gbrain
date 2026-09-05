@@ -718,6 +718,46 @@ describe('Context Mirror admin MCP controls', () => {
     )).rejects.toMatchObject({ code: 'precondition_failed' });
   });
 
+  test('refuses hold release while capture ownership conflicts remain quarantined', async () => {
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,1,now(),now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_heads (
+         source_id,session_id,session_slug,capture_slug_prefix,newest_capture_at,
+         turn_count,state,disposition
+       ) VALUES (
+         'default','opaque-session','opaque-session','capture/opaque-session/',now(),
+         1,'quarantined','locator_ownership_conflict'
+       )`,
+    );
+
+    const inventory = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), externalProofParams('3'.repeat(64), '4'.repeat(64)),
+    ) as {
+      ready_to_release: boolean;
+      actions: Array<{ action: string; blockers: string[] }>;
+    };
+    const statusResult = await operationsByName.context_mirror_status.handler(
+      adminContext(), { source_id: 'default' },
+    ) as { progress: { locator_ownership_conflicts: number } };
+
+    expect(inventory.ready_to_release).toBe(false);
+    expect(statusResult.progress.locator_ownership_conflicts).toBe(1);
+    expect(inventory.actions).toContainEqual(expect.objectContaining({
+      action: 'release_recovery_hold',
+      blockers: expect.arrayContaining(['capture_locator_ownership_conflict']),
+    }));
+  });
+
   test('HTTP scope resolution rejects read/write tokens and accepts admin', () => {
     const operation = operationsByName.set_context_mirror_recovery_hold!;
     const required = resolveRequiredScope(operation);

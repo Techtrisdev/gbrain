@@ -159,6 +159,7 @@ export interface ContextMirrorStatusV1 {
     membership_records: number;
     unreconciled_active_records: number;
     ambiguous_identity_pages: number;
+    locator_ownership_conflicts: number;
     cursor_page_id: number | null;
     scan_upper_page_id: number | null;
     last_tail_at: string | null;
@@ -526,6 +527,7 @@ export async function readContextMirrorStatusSnapshot(
     membership_count: number | string;
     unreconciled_active_count: number | string;
     ambiguous_count: number | string;
+    locator_ownership_conflict_count: number | string;
     last_tail_at: Date | string | null;
     updated_at: Date | string;
   }>(
@@ -538,7 +540,13 @@ export async function readContextMirrorStatusSnapshot(
                   ON m.source_id = p.source_id AND m.page_id = p.id
                WHERE p.source_id = $1 AND p.deleted_at IS NULL
                  AND p.slug LIKE 'capture/%' AND m.page_id IS NULL
-            ) AS unreconciled_active_count
+            ) AS unreconciled_active_count,
+            (
+              SELECT count(*)
+                FROM context_mirror_reconciliation_heads h
+               WHERE h.source_id = $1 AND h.state = 'quarantined'
+                 AND h.disposition = 'locator_ownership_conflict'
+            ) AS locator_ownership_conflict_count
        FROM context_mirror_reconciliation_state r WHERE r.source_id = $1`,
     [sourceId],
   );
@@ -546,6 +554,7 @@ export async function readContextMirrorStatusSnapshot(
   const reconciliationComplete = reconciliation
     ? reconciliation.phase === 'tailing'
       && numberValue(reconciliation.ambiguous_count) === 0
+      && numberValue(reconciliation.locator_ownership_conflict_count) === 0
       && numberValue(reconciliation.cursor_page_id) >= numberValue(reconciliation.scan_upper_page_id)
     : null;
   const bootstrapComplete = reconciliationComplete ?? bootstrapCheckpoint?.completed ?? null;
@@ -893,6 +902,7 @@ export async function readContextMirrorStatusSnapshot(
       membership_records: numberValue(reconciliation?.membership_count),
       unreconciled_active_records: numberValue(reconciliation?.unreconciled_active_count),
       ambiguous_identity_pages: numberValue(reconciliation?.ambiguous_count),
+      locator_ownership_conflicts: numberValue(reconciliation?.locator_ownership_conflict_count),
       cursor_page_id: reconciliation ? numberValue(reconciliation.cursor_page_id) : null,
       scan_upper_page_id: reconciliation ? numberValue(reconciliation.scan_upper_page_id) : null,
       last_tail_at: iso(reconciliation?.last_tail_at),
@@ -923,6 +933,7 @@ export function buildContextMirrorRecoveryReadiness(
     || status.progress.unreconciled_active_records > 0
   ) blockers.push('capture_membership_mismatch');
   if (status.progress.ambiguous_identity_pages > 0) blockers.push('capture_identity_ambiguous');
+  if (status.progress.locator_ownership_conflicts > 0) blockers.push('capture_locator_ownership_conflict');
   if (status.distillation.provider.calls.ambiguous_provider_outcome > 0) blockers.push('ambiguous_provider_outcome');
   if (status.generations.manifest_gap > 0) blockers.push('generation_manifest_gap');
   if (status.promotion.transition_missing > 0) blockers.push('promotion_transition_missing');
@@ -952,6 +963,7 @@ export function buildContextMirrorRecoveryReadiness(
       cursor_page_id: status.progress.cursor_page_id,
       scan_upper_page_id: status.progress.scan_upper_page_id,
       ambiguous_identity_pages: status.progress.ambiguous_identity_pages,
+      locator_ownership_conflicts: status.progress.locator_ownership_conflicts,
       bootstrap_complete: status.progress.bootstrap_complete,
       reconciliation_phase: status.progress.reconciliation_phase,
     },
