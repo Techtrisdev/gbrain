@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { BrainEngine } from '../engine.ts';
 import { VERSION, BUILD_SHA, HOST_BUILD_SHA } from '../../version.ts';
 import {
@@ -157,6 +159,12 @@ export interface ContextMirrorStatusV1 {
     scan_upper_page_id: number | null;
     last_tail_at: string | null;
   };
+}
+
+export interface ContextMirrorRecoveryReadiness {
+  ready: boolean;
+  blockers: string[];
+  fingerprint: string;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -320,7 +328,7 @@ function classifyOverall(input: {
  * selected. Brain-side health combines this with the authoritative D-drive outbox and
  * real-consumer proofs, which are intentionally `unknown` here rather than inferred.
  */
-async function readContextMirrorStatus(
+export async function readContextMirrorStatusSnapshot(
   engine: BrainEngine,
   sourceId: string,
   now: Date = new Date(),
@@ -872,6 +880,64 @@ async function readContextMirrorStatus(
   };
 }
 
+function readinessFingerprint(value: Record<string, unknown>): string {
+  return createHash('sha256')
+    .update(JSON.stringify(value), 'utf8')
+    .digest('hex');
+}
+
+/** Stable, body-free compare-and-set input for recovery-hold release. */
+export function buildContextMirrorRecoveryReadiness(
+  status: ContextMirrorStatusV1,
+  runtimeProofFingerprint: string | null,
+  replayLedgerFingerprint: string | null,
+): ContextMirrorRecoveryReadiness {
+  const blockers: string[] = [];
+  if (status.progress.bootstrap_complete !== true) blockers.push('capture_inventory_incomplete');
+  if (status.progress.reconciliation_phase !== 'tailing') blockers.push('capture_inventory_not_tailing');
+  if (
+    status.progress.cursor_page_id !== status.progress.scan_upper_page_id
+    || status.progress.membership_records !== status.capture.active_records
+  ) blockers.push('capture_membership_mismatch');
+  if (status.progress.ambiguous_identity_pages > 0) blockers.push('capture_identity_ambiguous');
+  if (status.distillation.provider.calls.ambiguous_provider_outcome > 0) blockers.push('ambiguous_provider_outcome');
+  if (status.generations.manifest_gap > 0) blockers.push('generation_manifest_gap');
+  if (status.promotion.transition_missing > 0) blockers.push('promotion_transition_missing');
+  const promotionNonterminal =
+    status.promotion.promotion_states.accepted_dispatching
+    + status.promotion.promotion_states.dispatch_failed
+    + status.promotion.promotion_states.pr_opened
+    + status.promotion.promotion_states.merged_reindexing
+    + status.promotion.promotion_states.indexing_failed
+    + status.promotion.promotion_states.unresolved_legacy;
+  if (promotionNonterminal > 0) blockers.push('promotion_not_terminal');
+  if (!runtimeProofFingerprint) blockers.push('runtime_proof_missing');
+  if (!replayLedgerFingerprint) blockers.push('replay_ledger_proof_missing');
+  blockers.sort();
+  const fingerprint = readinessFingerprint({
+    schema_version: 1,
+    source_id: status.source_id,
+    build: status.build,
+    capture: {
+      active_records: status.capture.active_records,
+      membership_records: status.progress.membership_records,
+      cursor_page_id: status.progress.cursor_page_id,
+      scan_upper_page_id: status.progress.scan_upper_page_id,
+      ambiguous_identity_pages: status.progress.ambiguous_identity_pages,
+      bootstrap_complete: status.progress.bootstrap_complete,
+      reconciliation_phase: status.progress.reconciliation_phase,
+    },
+    provider_ambiguous: status.distillation.provider.calls.ambiguous_provider_outcome,
+    generation_manifest_gap: status.generations.manifest_gap,
+    promotion_nonterminal: promotionNonterminal,
+    promotion_transition_missing: status.promotion.transition_missing,
+    runtime_proof_fingerprint: runtimeProofFingerprint,
+    replay_ledger_fingerprint: replayLedgerFingerprint,
+    blockers,
+  });
+  return { ready: blockers.length === 0, blockers, fingerprint };
+}
+
 /**
  * Bound every aggregate statement and keep the many stage reads on one
  * consistent snapshot. A timeout is an MCP failure, which the Brain-side
@@ -887,6 +953,6 @@ export async function getContextMirrorStatus(
       await tx.executeRaw("SET LOCAL statement_timeout = '5000'");
       await tx.executeRaw("SET LOCAL lock_timeout = '1000'");
     }
-    return readContextMirrorStatus(tx, sourceId, now);
+    return readContextMirrorStatusSnapshot(tx, sourceId, now);
   });
 }

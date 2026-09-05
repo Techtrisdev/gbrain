@@ -48,6 +48,7 @@ function adminContext(sourceId = 'default'): OperationContext {
 describe('Context Mirror admin MCP controls', () => {
   test('are remote-visible admin mutations and never ordinary read/write tools', () => {
     for (const name of [
+      'list_context_mirror_actions',
       'retry_candidate_promotion',
       'rollback_context_generation',
       'run_context_mirror_bootstrap',
@@ -56,9 +57,132 @@ describe('Context Mirror admin MCP controls', () => {
       const operation = operationsByName[name];
       expect(operation).toBeDefined();
       expect(operation.scope).toBe('admin');
-      expect(operation.mutating).toBe(true);
+      expect(operation.mutating).toBe(name !== 'list_context_mirror_actions');
       expect(operation.localOnly).not.toBe(true);
     }
+  });
+
+  test('lists bounded free recovery actions with a release fingerprint and no raw identity', async () => {
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,0,now(),now())`,
+    );
+    const result = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      {
+        runtime_proof_fingerprint: 'a'.repeat(64),
+        replay_ledger_fingerprint: 'b'.repeat(64),
+      },
+    ) as Record<string, unknown>;
+    expect(result).toMatchObject({
+      schema_version: 1,
+      source_id: 'default',
+      action_count: 1,
+      ready_to_release: true,
+    });
+    expect(result.readiness_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.actions).toEqual([
+      expect.objectContaining({
+        action: 'release_recovery_hold',
+        authority: 'source_admin',
+        cost_class: 'free',
+        target_count: 1,
+        blockers: [],
+      }),
+    ]);
+    expect(JSON.stringify(result)).not.toContain('session_id');
+  });
+
+  test('rejects action inventory requests for a different authenticated source', async () => {
+    await expect(operationsByName.list_context_mirror_actions!.handler(
+      adminContext('other-source'),
+      {},
+    )).rejects.toThrow('Context Mirror source not found');
+  });
+
+  test('releases the recovery hold only with fresh engine and external proof fingerprints', async () => {
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,0,now(),now())`,
+    );
+    const proofParams = {
+      runtime_proof_fingerprint: 'c'.repeat(64),
+      replay_ledger_fingerprint: 'd'.repeat(64),
+    };
+    const inventory = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), proofParams,
+    ) as Record<string, unknown>;
+    await expect(operationsByName.set_context_mirror_recovery_hold!.handler(
+      adminContext(),
+      {
+        active: false,
+        reason: 'free foundation verified',
+        expected_readiness_fingerprint: 'e'.repeat(64),
+        ...proofParams,
+      },
+    )).rejects.toMatchObject({ code: 'stale_precondition' });
+
+    const released = await operationsByName.set_context_mirror_recovery_hold!.handler(
+      adminContext(),
+      {
+        active: false,
+        reason: 'free foundation verified',
+        expected_readiness_fingerprint: inventory.readiness_fingerprint,
+        ...proofParams,
+      },
+    ) as Record<string, unknown>;
+    expect(released).toMatchObject({
+      source_id: 'default',
+      active: false,
+      readiness_fingerprint: inventory.readiness_fingerprint,
+    });
+    const [audit] = await engine.executeRaw<{ operation: string; outcome: string }>(
+      `SELECT operation,outcome FROM context_mirror_admin_audit
+        WHERE source_id='default' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(audit).toEqual({
+      operation: 'set_context_mirror_recovery_hold',
+      outcome: 'released',
+    });
+  });
+
+  test('refuses hold release while engine blockers remain', async () => {
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    const proofParams = {
+      runtime_proof_fingerprint: '1'.repeat(64),
+      replay_ledger_fingerprint: '2'.repeat(64),
+    };
+    const inventory = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), proofParams,
+    ) as Record<string, unknown>;
+    expect(inventory.ready_to_release).toBe(false);
+    await expect(operationsByName.set_context_mirror_recovery_hold!.handler(
+      adminContext(),
+      {
+        active: false,
+        reason: 'must remain held',
+        expected_readiness_fingerprint: inventory.readiness_fingerprint,
+        ...proofParams,
+      },
+    )).rejects.toMatchObject({ code: 'precondition_failed' });
   });
 
   test('HTTP scope resolution rejects read/write tokens and accepts admin', () => {
