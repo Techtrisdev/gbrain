@@ -9,7 +9,17 @@ import { buildToolDefs } from './tool-defs.ts';
 import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 
-export async function startMcpServer(engine: BrainEngine) {
+export interface StartMcpServerOpts {
+  /**
+   * SEC-001 escape hatch, default DENY. Permits `localOnly` (CLI-only)
+   * operations over stdio. Set only by an explicit
+   * `gbrain serve --allow-local-ops`, so the decision is visible in the
+   * process invocation rather than implied by the transport.
+   */
+  allowLocalOps?: boolean;
+}
+
+export async function startMcpServer(engine: BrainEngine, opts: StartMcpServerOpts = {}) {
   const server = new Server(
     { name: 'gbrain', version: VERSION },
     { capabilities: { tools: {} }, instructions: RETRIEVAL_ROUTING_INSTRUCTIONS },
@@ -36,6 +46,12 @@ export async function startMcpServer(engine: BrainEngine) {
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
     return dispatchToolCall(engine, name, params, {
       remote: true,
+      // SEC-001: off unless the operator passed --allow-local-ops. Without it,
+      // dispatch refuses every localOnly op for this transport — stdio is
+      // agent-facing (Claude Desktop, Cursor, any MCP client), and a
+      // prompt-injected client is exactly the confused deputy that gate exists
+      // to stop.
+      allowLocalOps: opts.allowLocalOps === true,
       takesHoldersAllowList: ['world'],
       // v0.31: source defaults to 'default' for stdio (no per-token scope).
       // Operators who want a different source on stdio MCP should set
