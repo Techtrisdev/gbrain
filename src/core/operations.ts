@@ -3972,8 +3972,10 @@ const list_context_mirror_actions: Operation = {
         Math.max(
           status.progress.unreconciled_active_records,
           Math.abs(status.capture.active_records - status.progress.membership_records),
-        )
-          + status.progress.ambiguous_identity_pages,
+          status.progress.ambiguous_identity_pages,
+          status.progress.head_projection_mismatch_records,
+          status.progress.locator_ownership_conflicts,
+        ),
         bootstrapBlockers,
         'bootstrap_complete_and_membership_conserved',
       );

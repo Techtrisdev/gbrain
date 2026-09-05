@@ -159,6 +159,7 @@ export interface ContextMirrorStatusV1 {
     membership_records: number;
     unreconciled_active_records: number;
     ambiguous_identity_pages: number;
+    head_projection_mismatch_records: number;
     locator_ownership_conflicts: number;
     cursor_page_id: number | null;
     scan_upper_page_id: number | null;
@@ -527,6 +528,7 @@ export async function readContextMirrorStatusSnapshot(
     membership_count: number | string;
     unreconciled_active_count: number | string;
     ambiguous_count: number | string;
+    head_projection_mismatch_records: number | string;
     locator_ownership_conflict_count: number | string;
     last_tail_at: Date | string | null;
     updated_at: Date | string;
@@ -542,6 +544,35 @@ export async function readContextMirrorStatusSnapshot(
                  AND p.slug LIKE 'capture/%' AND m.page_id IS NULL
             ) AS unreconciled_active_count,
             (
+              WITH active_ids AS (
+                SELECT p.id::text AS page_id, count(*)::bigint AS copies
+                  FROM pages p
+                 WHERE p.source_id = $1 AND p.deleted_at IS NULL
+                   AND p.slug LIKE 'capture/%'
+                 GROUP BY p.id
+              ), projected_ids AS (
+                SELECT item.page_id, count(*)::bigint AS copies
+                  FROM context_mirror_session_heads h
+                  CROSS JOIN LATERAL jsonb_array_elements_text(
+                    CASE WHEN jsonb_typeof(h.capture_membership_ids) = 'array'
+                      THEN h.capture_membership_ids ELSE '[]'::jsonb END
+                  ) item(page_id)
+                 WHERE h.source_id = $1
+                 GROUP BY item.page_id
+              ), mismatched AS (
+                SELECT COALESCE(active_ids.page_id, projected_ids.page_id) AS page_id,
+                       abs(COALESCE(active_ids.copies, 0) - COALESCE(projected_ids.copies, 0)) AS copies
+                  FROM active_ids
+                  FULL OUTER JOIN projected_ids USING (page_id)
+                 WHERE active_ids.copies IS DISTINCT FROM projected_ids.copies
+              )
+              SELECT COALESCE(sum(copies), 0)
+                     + (SELECT count(*) FROM context_mirror_session_heads h
+                         WHERE h.source_id = $1
+                           AND jsonb_typeof(h.capture_membership_ids) IS DISTINCT FROM 'array')
+                FROM mismatched
+            ) AS head_projection_mismatch_records,
+            (
               SELECT count(*)
                 FROM context_mirror_reconciliation_heads h
                WHERE h.source_id = $1 AND h.state = 'quarantined'
@@ -554,6 +585,7 @@ export async function readContextMirrorStatusSnapshot(
   const reconciliationComplete = reconciliation
     ? reconciliation.phase === 'tailing'
       && numberValue(reconciliation.ambiguous_count) === 0
+      && numberValue(reconciliation.head_projection_mismatch_records) === 0
       && numberValue(reconciliation.locator_ownership_conflict_count) === 0
       && numberValue(reconciliation.cursor_page_id) >= numberValue(reconciliation.scan_upper_page_id)
     : null;
@@ -902,6 +934,7 @@ export async function readContextMirrorStatusSnapshot(
       membership_records: numberValue(reconciliation?.membership_count),
       unreconciled_active_records: numberValue(reconciliation?.unreconciled_active_count),
       ambiguous_identity_pages: numberValue(reconciliation?.ambiguous_count),
+      head_projection_mismatch_records: numberValue(reconciliation?.head_projection_mismatch_records),
       locator_ownership_conflicts: numberValue(reconciliation?.locator_ownership_conflict_count),
       cursor_page_id: reconciliation ? numberValue(reconciliation.cursor_page_id) : null,
       scan_upper_page_id: reconciliation ? numberValue(reconciliation.scan_upper_page_id) : null,
@@ -925,12 +958,16 @@ export function buildContextMirrorRecoveryReadiness(
   const runtimeProofFingerprint = runtimeProof?.receiptFingerprint ?? null;
   const replayLedgerFingerprint = replayLedgerProof?.receiptFingerprint ?? null;
   const blockers: string[] = [];
+  if (status.configuration.connector_enabled) blockers.push('connector_enabled_during_recovery');
+  if (status.configuration.distill_before_poll) blockers.push('paid_distillation_enabled_during_recovery');
+  if (!status.promotion.dispatch_frozen) blockers.push('promotion_dispatch_not_frozen');
   if (status.progress.bootstrap_complete !== true) blockers.push('capture_inventory_incomplete');
   if (status.progress.reconciliation_phase !== 'tailing') blockers.push('capture_inventory_not_tailing');
   if (
     status.progress.cursor_page_id !== status.progress.scan_upper_page_id
     || status.progress.membership_records !== status.capture.active_records
     || status.progress.unreconciled_active_records > 0
+    || status.progress.head_projection_mismatch_records > 0
   ) blockers.push('capture_membership_mismatch');
   if (status.progress.ambiguous_identity_pages > 0) blockers.push('capture_identity_ambiguous');
   if (status.progress.locator_ownership_conflicts > 0) blockers.push('capture_locator_ownership_conflict');
@@ -956,6 +993,11 @@ export function buildContextMirrorRecoveryReadiness(
       active: status.recovery_hold.active,
       generation: status.recovery_hold.generation,
     },
+    configuration: {
+      connector_enabled: status.configuration.connector_enabled,
+      distill_before_poll: status.configuration.distill_before_poll,
+      promotion_dispatch_frozen: status.promotion.dispatch_frozen,
+    },
     capture: {
       active_records: status.capture.active_records,
       membership_records: status.progress.membership_records,
@@ -963,6 +1005,7 @@ export function buildContextMirrorRecoveryReadiness(
       cursor_page_id: status.progress.cursor_page_id,
       scan_upper_page_id: status.progress.scan_upper_page_id,
       ambiguous_identity_pages: status.progress.ambiguous_identity_pages,
+      head_projection_mismatch_records: status.progress.head_projection_mismatch_records,
       locator_ownership_conflicts: status.progress.locator_ownership_conflicts,
       bootstrap_complete: status.progress.bootstrap_complete,
       reconciliation_phase: status.progress.reconciliation_phase,

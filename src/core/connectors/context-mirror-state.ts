@@ -84,30 +84,38 @@ async function boundedReconciliationTransaction<T>(
     return result;
   });
 
-  return await new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<'deadline'>((resolve) => {
+    timer = setTimeout(() => {
       deadlineExpired = true;
-      reject(new ContextMirrorReconciliationTimeoutError('context mirror reconciliation deadline expired'));
+      resolve('deadline');
     }, initialRemaining);
-
-    work.then(
-      (result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(result);
-      },
-      (error: unknown) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
   });
+  const settledWork = work.then(
+    (value) => ({ kind: 'success' as const, value }),
+    (error: unknown) => ({ kind: 'failure' as const, error }),
+  );
+  const first = await Promise.race([settledWork, deadline]);
+  if (first !== 'deadline') {
+    if (timer) clearTimeout(timer);
+    if (first.kind === 'failure') throw first.error;
+    return first.value;
+  }
+
+  // The server-side statement timeout cancels the active statement and the
+  // cooperative checks stop work between statements. Do not report timeout
+  // until the transaction has actually committed or rolled back: returning
+  // early would let a caller retry while the first request was still writing.
+  const final = await settledWork;
+  if (timer) clearTimeout(timer);
+  if (final.kind === 'failure') {
+    if ((final.error as { code?: unknown })?.code === '57014'
+        || final.error instanceof ContextMirrorReconciliationTimeoutError) {
+      throw new ContextMirrorReconciliationTimeoutError('context mirror reconciliation deadline expired');
+    }
+    throw final.error;
+  }
+  return final.value;
 }
 
 export interface DurableSessionHead {
@@ -1062,11 +1070,23 @@ export async function runSessionHeadReconciliationV2(
           [membershipInput],
         );
 
+    const locatorConflictRows = state.phase === 'tailing'
+      ? await tx.executeRaw<{ session_id: string }>(
+          `SELECT session_id
+             FROM context_mirror_reconciliation_heads
+            WHERE source_id = $1 AND state = 'quarantined'
+              AND disposition = 'locator_ownership_conflict'
+            ORDER BY updated_at ASC, session_id ASC
+            LIMIT $2`,
+          [opts.sourceId, batchSize],
+        )
+      : [];
     const sessionIds = [...new Set([
       ...recoveredMembership.map((item) => item.session_id),
       ...membershipInput
         .filter((item) => item.identity_status === 'resolved' && item.session_id)
         .map((item) => item.session_id as string),
+      ...locatorConflictRows.map((item) => item.session_id),
     ])];
     const aggregates = sessionIds.length === 0
       ? []
@@ -1229,8 +1249,12 @@ export async function runSessionHeadReconciliationV2(
       );
       await tx.executeRaw(
         `UPDATE context_mirror_reconciliation_heads h
-            SET state = 'quarantined', disposition = 'v2_membership_missing', updated_at = now()
-          WHERE h.source_id = $1 AND h.disposition IS DISTINCT FROM 'v2_membership_missing'
+            SET turn_count = 0,
+                capture_membership_ids = '[]'::jsonb,
+                state = 'quarantined', disposition = 'v2_membership_missing', updated_at = now()
+          WHERE h.source_id = $1
+            AND (h.disposition IS DISTINCT FROM 'v2_membership_missing'
+              OR h.turn_count <> 0 OR h.capture_membership_ids <> '[]'::jsonb)
             AND NOT EXISTS (
               SELECT 1
                 FROM context_mirror_capture_membership m

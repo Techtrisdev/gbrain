@@ -180,6 +180,52 @@ describe('Context Mirror admin MCP controls', () => {
     expect(JSON.stringify(result)).not.toContain('session_id');
   });
 
+  test('refuses release while capture, paid distillation, or promotion dispatch is enabled', async () => {
+    await engine.executeRaw(
+      `UPDATE sources
+          SET config = $2::jsonb
+        WHERE id = $1`,
+      ['default', JSON.stringify({
+        connectors: {
+          context_mirror: {
+            enabled: true,
+            distill_before_poll: true,
+            consolidation_enabled: true,
+          },
+        },
+      })],
+    );
+    await engine.setConfig('connectors.promotion_dispatch_frozen', 'false');
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,0,now(),now())`,
+    );
+
+    const result = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      externalProofParams(),
+    ) as {
+      ready_to_release: boolean;
+      actions: Array<{ action: string; blockers: string[] }>;
+    };
+    expect(result.ready_to_release).toBe(false);
+    expect(result.actions).toContainEqual(expect.objectContaining({
+      action: 'release_recovery_hold',
+      blockers: expect.arrayContaining([
+        'connector_enabled_during_recovery',
+        'paid_distillation_enabled_during_recovery',
+        'promotion_dispatch_not_frozen',
+      ]),
+    }));
+  });
+
   test('rejects action inventory requests for a different authenticated source', async () => {
     await expect(operationsByName.list_context_mirror_actions!.handler(
       adminContext('other-source'),
@@ -641,7 +687,7 @@ describe('Context Mirror admin MCP controls', () => {
       adminContext(), {},
     ) as { actions: Array<{ action: string; target_count: number }> };
     expect(result.actions).toContainEqual(expect.objectContaining({
-      action: 'run_context_mirror_bootstrap', target_count: 1,
+      action: 'run_context_mirror_bootstrap', target_count: 2,
     }));
   });
 
@@ -666,7 +712,7 @@ describe('Context Mirror admin MCP controls', () => {
     }));
   });
 
-  test('bootstrap action adds independent membership and ambiguity targets', async () => {
+  test('bootstrap action reports a bounded target for combined membership and ambiguity repair', async () => {
     await engine.putPage(
       'capture/deleted-target/prompt-1',
       {
@@ -686,13 +732,13 @@ describe('Context Mirror admin MCP controls', () => {
     await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
       batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial mixed inventory',
     });
-    await engine.deletePage('capture/deleted-target/prompt-1', { sourceId: 'default' });
+    await engine.softDeletePage('capture/deleted-target/prompt-1', { sourceId: 'default' });
     const actions = await operationsByName.list_context_mirror_actions!.handler(
       adminContext(),
       {},
     ) as { actions: Array<{ action: string; target_count: number }> };
     expect(actions.actions).toContainEqual(expect.objectContaining({
-      action: 'run_context_mirror_bootstrap', target_count: 2,
+      action: 'run_context_mirror_bootstrap', target_count: 1,
     }));
   });
 
@@ -756,6 +802,75 @@ describe('Context Mirror admin MCP controls', () => {
       action: 'release_recovery_hold',
       blockers: expect.arrayContaining(['capture_locator_ownership_conflict']),
     }));
+    expect(inventory.actions).toContainEqual(expect.objectContaining({
+      action: 'run_context_mirror_bootstrap',
+      target_count: 1,
+    }));
+  });
+
+  test('detects an equal-count restore and delete until live head IDs are rebuilt', async () => {
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    for (const turn of [1, 2]) {
+      await engine.putPage(
+        `capture/projection-session/prompt-${turn}`,
+        {
+          type: 'note', title: 'capture', compiled_truth: `private body ${turn}`, timeline: '',
+          frontmatter: { session_id: 'projection-session', kind: 'prompt', turn },
+        } as never,
+        { sourceId: 'default' },
+      );
+    }
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial projection',
+    });
+    await engine.softDeletePage('capture/projection-session/prompt-2', { sourceId: 'default' });
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'record deletion',
+    });
+    await engine.restorePage('capture/projection-session/prompt-2', { sourceId: 'default' });
+    await engine.softDeletePage('capture/projection-session/prompt-1', { sourceId: 'default' });
+
+    const proofParams = externalProofParams('5'.repeat(64), '6'.repeat(64));
+    const before = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), proofParams,
+    ) as {
+      ready_to_release: boolean;
+      actions: Array<{ action: string; target_count: number }>;
+    };
+    const beforeStatus = await operationsByName.context_mirror_status.handler(
+      adminContext(), { source_id: 'default' },
+    ) as {
+      capture: { active_records: number };
+      progress: {
+        membership_records: number;
+        unreconciled_active_records: number;
+        cursor_page_id: number;
+        scan_upper_page_id: number;
+        head_projection_mismatch_records: number;
+      };
+    };
+    expect(before.ready_to_release).toBe(false);
+    expect(beforeStatus.capture.active_records).toBe(beforeStatus.progress.membership_records);
+    expect(beforeStatus.progress.unreconciled_active_records).toBe(0);
+    expect(beforeStatus.progress.cursor_page_id).toBe(beforeStatus.progress.scan_upper_page_id);
+    expect(beforeStatus.progress.head_projection_mismatch_records).toBe(2);
+    expect(before.actions).toContainEqual(expect.objectContaining({
+      action: 'run_context_mirror_bootstrap', target_count: 2,
+    }));
+    expect(JSON.stringify(before)).not.toContain('projection-session');
+    expect(JSON.stringify(beforeStatus)).not.toContain('private body');
+
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'rebuild exact projection',
+    });
+    const afterStatus = await operationsByName.context_mirror_status.handler(
+      adminContext(), { source_id: 'default' },
+    ) as { progress: { head_projection_mismatch_records: number } };
+    expect(afterStatus.progress.head_projection_mismatch_records).toBe(0);
   });
 
   test('HTTP scope resolution rejects read/write tokens and accepts admin', () => {
@@ -837,6 +952,42 @@ describe('Context Mirror admin MCP controls', () => {
     );
     expect(Number(counts?.state_count)).toBe(0);
     expect(Number(counts?.audit_count)).toBe(0);
+  });
+
+  test('a deadline waits for transaction settlement and never reports a committed write as failed', async () => {
+    let transactionCalls = 0;
+    let finalTransactionSettled = false;
+    const delayedCommitEngine = new Proxy(operationEngine, {
+      get(target, property, receiver) {
+        if (property === 'transaction') {
+          return async <T>(fn: (tx: BrainEngine) => Promise<T>): Promise<T> => {
+            transactionCalls += 1;
+            const result = await target.transaction(fn);
+            if (transactionCalls === 3) {
+              await new Promise((resolve) => setTimeout(resolve, 1_300));
+              finalTransactionSettled = true;
+            }
+            return result;
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const startedAt = Date.now();
+    const result = await runSessionHeadReconciliationV2(delayedCommitEngine, {
+      sourceId: 'default',
+      now: new Date(),
+      idleHours: 6,
+      sessionSlug: toSessionSlug,
+      batchSize: 10,
+      deadlineAtMs: Date.now() + 1_100,
+      actor: 'test',
+      reason: 'await transaction settlement',
+    });
+    expect(result.status).toBe('complete');
+    expect(finalTransactionSettled).toBe(true);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_250);
   });
 
   test('rejects bounded bootstrap on the non-interruptible embedded engine before mutation', async () => {
