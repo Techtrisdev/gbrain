@@ -1599,6 +1599,7 @@ CREATE TABLE IF NOT EXISTS context_mirror_review_reservations (
 CREATE TABLE IF NOT EXISTS context_mirror_recovery_holds (
   source_id             TEXT        PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
   active                BOOLEAN     NOT NULL DEFAULT false,
+  generation            BIGINT      NOT NULL DEFAULT 0,
   reason                TEXT        NOT NULL DEFAULT '',
   acted_by              TEXT        NOT NULL DEFAULT 'system',
   held_at               TIMESTAMPTZ,

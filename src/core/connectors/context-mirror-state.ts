@@ -113,6 +113,7 @@ export interface ReviewCapacitySnapshot {
 
 export interface ContextMirrorRecoveryHold {
   active: boolean;
+  generation: number;
   reason: string;
   actedBy: string;
   heldAt: Date | null;
@@ -147,6 +148,27 @@ interface CaptureMetadataRow {
   updated_at: Date | string;
 }
 
+/** Release only the exact active hold generation observed by the caller. */
+export async function releaseContextMirrorRecoveryHold(
+  engine: BrainEngine,
+  sourceId: string,
+  reason: string,
+  actor: string,
+  expectedGeneration: number,
+): Promise<ContextMirrorRecoveryHold | null> {
+  const cleanReason = reason.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 240);
+  const cleanActor = actor.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 120) || 'system';
+  const rows = await engine.executeRaw<{ source_id: string }>(
+    `UPDATE context_mirror_recovery_holds
+        SET active = false, reason = $3, acted_by = $4,
+            released_at = now(), updated_at = now(), generation = generation + 1
+      WHERE source_id = $1 AND active = true AND generation = $2
+      RETURNING source_id`,
+    [sourceId, expectedGeneration, cleanReason, cleanActor],
+  );
+  return rows[0] ? await readContextMirrorRecoveryHold(engine, sourceId) : null;
+}
+
 interface ScanCursor {
   updatedAt: string;
   id: number;
@@ -177,19 +199,21 @@ export async function readContextMirrorRecoveryHold(
 ): Promise<ContextMirrorRecoveryHold> {
   const rows = await engine.executeRaw<{
     active: boolean;
+    generation: number | string;
     reason: string;
     acted_by: string;
     held_at: Date | string | null;
     released_at: Date | string | null;
     updated_at: Date | string | null;
   }>(
-    `SELECT active, reason, acted_by, held_at, released_at, updated_at
+    `SELECT active, generation, reason, acted_by, held_at, released_at, updated_at
        FROM context_mirror_recovery_holds WHERE source_id = $1`,
     [sourceId],
   );
   const row = rows[0];
   return {
     active: row?.active === true,
+    generation: Number(row?.generation ?? 0),
     reason: row?.reason ?? '',
     actedBy: row?.acted_by ?? '',
     heldAt: row?.held_at ? new Date(row.held_at) : null,
@@ -212,15 +236,16 @@ export async function setContextMirrorRecoveryHold(
   if (active && !cleanReason) throw new Error('context mirror recovery hold requires a reason');
   await engine.executeRaw(
     `INSERT INTO context_mirror_recovery_holds (
-       source_id, active, reason, acted_by, held_at, released_at, updated_at
+       source_id, active, generation, reason, acted_by, held_at, released_at, updated_at
      ) VALUES (
-       $1, $2, $3, $4,
+       $1, $2, 1, $3, $4,
        CASE WHEN $2 THEN now() ELSE NULL END,
        CASE WHEN $2 THEN NULL ELSE now() END,
        now()
      )
      ON CONFLICT (source_id) DO UPDATE SET
        active = EXCLUDED.active,
+       generation = context_mirror_recovery_holds.generation + 1,
        reason = EXCLUDED.reason,
        acted_by = EXCLUDED.acted_by,
        held_at = CASE
@@ -657,9 +682,10 @@ async function reconciliationCounts(
   }>(
     `WITH membership_counts AS (
        SELECT count(*) AS membership,
-              count(*) FILTER (WHERE identity_status = 'ambiguous') AS ambiguous
-         FROM context_mirror_capture_membership
-        WHERE source_id = $1
+              count(*) FILTER (WHERE m.identity_status = 'ambiguous') AS ambiguous
+         FROM context_mirror_capture_membership m
+         JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+        WHERE m.source_id = $1 AND p.deleted_at IS NULL
      ), head_counts AS (
        SELECT count(*) AS heads
          FROM context_mirror_reconciliation_heads
@@ -1044,14 +1070,59 @@ export async function runSessionHeadReconciliationV2(
     const nextCursor = last ? Number(last.id) : cursorPageId;
     const reachedUpper = nextCursor >= upperPageId;
     const ambiguousRows = await tx.executeRaw<{ count: number | string }>(
-      `SELECT count(*) AS count FROM context_mirror_capture_membership
-        WHERE source_id = $1 AND identity_status = 'ambiguous'`,
+      `SELECT count(*) AS count
+         FROM context_mirror_capture_membership m
+         JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+        WHERE m.source_id = $1 AND m.identity_status = 'ambiguous'
+          AND p.deleted_at IS NULL`,
       [opts.sourceId],
     );
     const ambiguousCount = Number(ambiguousRows[0]?.count ?? 0);
     const initialActivation = reachedUpper && state.phase !== 'tailing' && ambiguousCount === 0;
     const updateLiveHeads = initialActivation || state.phase === 'tailing';
     if (updateLiveHeads) {
+      await tx.executeRaw(
+        `WITH active AS (
+           SELECT m.session_id,
+                  min(m.capture_slug_prefix) AS capture_slug_prefix,
+                  max(m.captured_at) AS newest_capture_at,
+                  count(*)::integer AS turn_count
+             FROM context_mirror_capture_membership m
+             JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+            WHERE m.source_id = $1 AND m.identity_status = 'resolved'
+              AND p.deleted_at IS NULL
+            GROUP BY m.session_id
+         )
+         UPDATE context_mirror_reconciliation_heads h
+            SET capture_slug_prefix = active.capture_slug_prefix,
+                newest_capture_at = active.newest_capture_at,
+                turn_count = active.turn_count,
+                state = CASE WHEN h.disposition = 'v2_membership_missing' THEN 'ready' ELSE h.state END,
+                disposition = CASE WHEN h.disposition = 'v2_membership_missing' THEN NULL ELSE h.disposition END,
+                updated_at = now()
+           FROM active
+          WHERE h.source_id = $1 AND h.session_id = active.session_id
+            AND (h.capture_slug_prefix, h.newest_capture_at, h.turn_count, h.state, h.disposition)
+              IS DISTINCT FROM (
+                active.capture_slug_prefix, active.newest_capture_at, active.turn_count,
+                CASE WHEN h.disposition = 'v2_membership_missing' THEN 'ready' ELSE h.state END,
+                CASE WHEN h.disposition = 'v2_membership_missing' THEN NULL ELSE h.disposition END
+              )`,
+        [opts.sourceId],
+      );
+      await tx.executeRaw(
+        `UPDATE context_mirror_reconciliation_heads h
+            SET state = 'quarantined', disposition = 'v2_membership_missing', updated_at = now()
+          WHERE h.source_id = $1 AND h.disposition IS DISTINCT FROM 'v2_membership_missing'
+            AND NOT EXISTS (
+              SELECT 1
+                FROM context_mirror_capture_membership m
+                JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+               WHERE m.source_id = h.source_id AND m.session_id = h.session_id
+                 AND m.identity_status = 'resolved' AND p.deleted_at IS NULL
+            )`,
+        [opts.sourceId],
+      );
       await tx.executeRaw(
         `INSERT INTO context_mirror_session_heads (
            source_id, session_id, session_slug, capture_slug_prefix,
@@ -1103,8 +1174,47 @@ export async function runSessionHeadReconciliationV2(
            updated_at = now()`,
         [opts.sourceId, initialActivation, sessionIds],
       );
-    }
-    if (initialActivation) {
+      await tx.executeRaw(
+        `UPDATE context_mirror_session_heads h
+            SET capture_slug_prefix = shadow.capture_slug_prefix,
+                newest_capture_at = shadow.newest_capture_at,
+                turn_count = shadow.turn_count,
+                state = CASE
+                  WHEN shadow.state = 'quarantined' THEN 'quarantined'
+                  WHEN h.state IN ('claimed','result_persisted','complete','quarantined') THEN 'pending'
+                  ELSE h.state
+                END,
+                disposition = CASE
+                  WHEN shadow.state = 'quarantined' THEN shadow.disposition
+                  WHEN h.state IN ('claimed','result_persisted','complete','quarantined') THEN NULL
+                  ELSE h.disposition
+                END,
+                current_generation = CASE
+                  WHEN shadow.state <> 'quarantined'
+                    AND h.state IN ('claimed','result_persisted','complete','quarantined')
+                    THEN h.current_generation + 1
+                  ELSE h.current_generation
+                END,
+                claim_id = NULL, lease_expires_at = NULL,
+                current_eligible_at = NULL, current_cohort_at = NULL,
+                updated_at = now()
+           FROM context_mirror_reconciliation_heads shadow
+          WHERE h.source_id = $1 AND shadow.source_id = h.source_id
+            AND shadow.session_id = h.session_id
+            AND (
+              (h.capture_slug_prefix, h.newest_capture_at, h.turn_count)
+                IS DISTINCT FROM (
+                  shadow.capture_slug_prefix, shadow.newest_capture_at, shadow.turn_count
+                )
+              OR (
+                shadow.state = 'quarantined'
+                AND (h.state, h.disposition)
+                  IS DISTINCT FROM ('quarantined', shadow.disposition)
+              )
+              OR (shadow.state <> 'quarantined' AND h.state = 'quarantined')
+            )`,
+        [opts.sourceId],
+      );
       await tx.executeRaw(
         `UPDATE context_mirror_session_heads h
             SET state = 'quarantined', disposition = 'v2_membership_missing',
@@ -1112,9 +1222,8 @@ export async function runSessionHeadReconciliationV2(
                 current_eligible_at = NULL, current_cohort_at = NULL, updated_at = now()
           WHERE h.source_id = $1
             AND NOT EXISTS (
-              SELECT 1 FROM context_mirror_capture_membership m
-               WHERE m.source_id = h.source_id AND m.session_id = h.session_id
-                 AND m.identity_status = 'resolved'
+              SELECT 1 FROM context_mirror_reconciliation_heads shadow
+               WHERE shadow.source_id = h.source_id AND shadow.session_id = h.session_id
             )`,
         [opts.sourceId],
       );

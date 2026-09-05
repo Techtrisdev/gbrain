@@ -5865,6 +5865,24 @@ export const MIGRATIONS: Migration[] = [
       return new Set(rows.map((row) => row.column_name)).size === 9;
     },
   },
+  {
+    version: 117,
+    name: 'context_mirror_recovery_hold_generation',
+    idempotent: true,
+    sql: `
+      ALTER TABLE context_mirror_recovery_holds
+        ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+    `,
+    verify: async (engine) => {
+      const rows = await engine.executeRaw<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = 'context_mirror_recovery_holds'
+            AND column_name = 'generation'`,
+      );
+      return rows.length === 1;
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

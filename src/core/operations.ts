@@ -3926,7 +3926,8 @@ const list_context_mirror_actions: Operation = {
     if (bootstrapBlockers.length > 0) {
       pushAction(
         'run_context_mirror_bootstrap',
-        Math.max(0, status.capture.active_records - status.progress.membership_records),
+        Math.abs(status.capture.active_records - status.progress.membership_records)
+          + status.progress.ambiguous_identity_pages,
         bootstrapBlockers,
         'bootstrap_complete_and_membership_conserved',
       );
@@ -4203,19 +4204,29 @@ const set_context_mirror_recovery_hold: Operation = {
     const expectedReadiness = optionalContextMirrorProofFingerprint(
       'expected_readiness_fingerprint', p.expected_readiness_fingerprint,
     );
-    const { setContextMirrorRecoveryHold } = await import('./connectors/context-mirror-state.ts');
+    const {
+      releaseContextMirrorRecoveryHold,
+      setContextMirrorRecoveryHold,
+    } = await import('./connectors/context-mirror-state.ts');
     const {
       buildContextMirrorRecoveryReadiness,
       readContextMirrorStatusSnapshot,
     } = await import('./connectors/context-mirror-status.ts');
     const { executeRawJsonb } = await import('./sql-query.ts');
     const result = await ctx.engine.transaction(async (tx) => {
-      const beforeRows = await tx.executeRaw<{ active: boolean }>(
-        `SELECT active FROM context_mirror_recovery_holds WHERE source_id=$1 FOR UPDATE`,
+      if (ctx.engine.kind === 'postgres') {
+        await tx.executeRaw("SET LOCAL statement_timeout = '5000'");
+        await tx.executeRaw("SET LOCAL lock_timeout = '1000'");
+      }
+      const beforeRows = await tx.executeRaw<{ active: boolean; generation: number | string }>(
+        `SELECT active,generation FROM context_mirror_recovery_holds WHERE source_id=$1 FOR UPDATE`,
         [sourceId],
       );
       let readiness: ReturnType<typeof buildContextMirrorRecoveryReadiness> | null = null;
       if (!active) {
+        if (!beforeRows[0] || beforeRows[0].active !== true) {
+          throw new OperationError('precondition_failed', 'No active recovery hold exists to release');
+        }
         if (!expectedReadiness || !runtimeProof || !replayProof) {
           throw new OperationError(
             'precondition_failed',
@@ -4232,7 +4243,18 @@ const set_context_mirror_recovery_hold: Operation = {
           throw new OperationError('precondition_failed', `Context Mirror recovery is not ready: ${readiness.blockers.join(',')}`);
         }
       }
-      const hold = await setContextMirrorRecoveryHold(tx, sourceId, active, reason, actor);
+      const hold = active
+        ? await setContextMirrorRecoveryHold(tx, sourceId, true, reason, actor)
+        : await releaseContextMirrorRecoveryHold(
+            tx,
+            sourceId,
+            reason,
+            actor,
+            Number(beforeRows[0]!.generation),
+          );
+      if (!hold) {
+        throw new OperationError('stale_precondition', 'Recovery hold changed; refresh the action inventory');
+      }
       const requestFingerprint = contextMirrorRequestFingerprint({
         source_id: sourceId,
         active,

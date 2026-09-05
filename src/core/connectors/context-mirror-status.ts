@@ -39,8 +39,10 @@ export interface ContextMirrorStatusV1 {
   };
   recovery_hold: {
     active: boolean;
+    generation: number;
     held_at: string | null;
     released_at: string | null;
+    updated_at: string | null;
     reason_code: string | null;
   };
   capture: {
@@ -706,8 +708,10 @@ export async function readContextMirrorStatusSnapshot(
     },
     recovery_hold: {
       active: recovery.active,
+      generation: recovery.generation,
       held_at: recovery.heldAt?.toISOString() ?? null,
       released_at: recovery.releasedAt?.toISOString() ?? null,
+      updated_at: recovery.updatedAt?.toISOString() ?? null,
       reason_code: recovery.active ? 'operator_recovery_hold' : null,
     },
     capture: {
@@ -918,6 +922,10 @@ export function buildContextMirrorRecoveryReadiness(
     schema_version: 1,
     source_id: status.source_id,
     build: status.build,
+    recovery_hold: {
+      active: status.recovery_hold.active,
+      generation: status.recovery_hold.generation,
+    },
     capture: {
       active_records: status.capture.active_records,
       membership_records: status.progress.membership_records,

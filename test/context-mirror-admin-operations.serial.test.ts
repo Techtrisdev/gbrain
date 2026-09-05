@@ -69,6 +69,11 @@ describe('Context Mirror admin MCP controls', () => {
        ) VALUES ('default',true,'repair','test',now())`,
     );
     await engine.executeRaw(
+      `UPDATE context_mirror_recovery_holds
+          SET updated_at = '2026-09-04T12:00:00.123456Z'
+        WHERE source_id = 'default'`,
+    );
+    await engine.executeRaw(
       `INSERT INTO context_mirror_reconciliation_state (
          source_id,version,phase,cursor_page_id,scan_upper_page_id,
          membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
@@ -158,6 +163,275 @@ describe('Context Mirror admin MCP controls', () => {
       operation: 'set_context_mirror_recovery_hold',
       outcome: 'released',
     });
+  });
+
+  test('stale release cannot clear a newer recovery hold generation', async () => {
+    const operation = operationsByName.set_context_mirror_recovery_hold!;
+    await operation.handler(adminContext(), { active: true, reason: 'first repair' });
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,0,now(),now())`,
+    );
+    const proofParams = {
+      runtime_proof_fingerprint: '7'.repeat(64),
+      replay_ledger_fingerprint: '8'.repeat(64),
+    };
+    const stale = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), proofParams,
+    ) as Record<string, unknown>;
+    await operation.handler(adminContext(), {
+      active: false,
+      reason: 'first release',
+      expected_readiness_fingerprint: stale.readiness_fingerprint,
+      ...proofParams,
+    });
+    await operation.handler(adminContext(), { active: true, reason: 'new repair' });
+    await expect(operation.handler(adminContext(), {
+      active: false,
+      reason: 'stale release',
+      expected_readiness_fingerprint: stale.readiness_fingerprint,
+      ...proofParams,
+    })).rejects.toMatchObject({ code: 'stale_precondition' });
+    const [hold] = await engine.executeRaw<{ active: boolean }>(
+      `SELECT active FROM context_mirror_recovery_holds WHERE source_id='default'`,
+    );
+    expect(hold?.active).toBe(true);
+  });
+
+  test('release refuses when no active recovery hold exists', async () => {
+    await expect(operationsByName.set_context_mirror_recovery_hold!.handler(
+      adminContext(),
+      {
+        active: false,
+        reason: 'nothing to release',
+        expected_readiness_fingerprint: 'a'.repeat(64),
+        runtime_proof_fingerprint: 'b'.repeat(64),
+        replay_ledger_fingerprint: 'c'.repeat(64),
+      },
+    )).rejects.toMatchObject({ code: 'precondition_failed' });
+  });
+
+  test('bootstrap reconciles active membership after a capture page is deleted', async () => {
+    await engine.putPage(
+      'capture/deleted-session/prompt-1',
+      {
+        type: 'note', title: 'capture', compiled_truth: 'private body', timeline: '',
+        frontmatter: { session_id: 'deleted-session', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: 'default' },
+    );
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial inventory',
+    });
+    await engine.deletePage('capture/deleted-session/prompt-1', { sourceId: 'default' });
+    const proofParams = {
+      runtime_proof_fingerprint: 'd'.repeat(64),
+      replay_ledger_fingerprint: 'e'.repeat(64),
+    };
+    const before = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), proofParams,
+    ) as { actions: Array<{ action: string; target_count: number }> };
+    expect(before.actions).toContainEqual(expect.objectContaining({
+      action: 'run_context_mirror_bootstrap', target_count: 1,
+    }));
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'deleted capture reconcile',
+    });
+    const after = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(), proofParams,
+    ) as { actions: Array<{ action: string }> };
+    expect(after.actions.some((action) => action.action === 'run_context_mirror_bootstrap')).toBe(false);
+    const [heads] = await engine.executeRaw<{
+      shadow_heads: number | string;
+      state: string;
+      disposition: string;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM context_mirror_reconciliation_heads
+           WHERE source_id = 'default') AS shadow_heads,
+         state, disposition
+       FROM context_mirror_session_heads
+       WHERE source_id = 'default' AND session_id = 'deleted-session'`,
+    );
+    expect(Number(heads?.shadow_heads)).toBe(1);
+    expect(heads).toMatchObject({ state: 'quarantined', disposition: 'v2_membership_missing' });
+  });
+
+  test('bootstrap recomputes a surviving head after one capture turn is deleted', async () => {
+    for (const turn of [1, 2]) {
+      await engine.putPage(
+        `capture/partial-deletion/prompt-${turn}`,
+        {
+          type: 'note', title: 'capture', compiled_truth: `private body ${turn}`, timeline: '',
+          frontmatter: { session_id: 'partial-deletion', kind: 'prompt', turn },
+        } as never,
+        { sourceId: 'default' },
+      );
+    }
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial inventory',
+    });
+    await engine.deletePage('capture/partial-deletion/prompt-2', { sourceId: 'default' });
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'partial deletion reconcile',
+    });
+    const [heads] = await engine.executeRaw<{
+      shadow_turns: number | string;
+      live_turns: number | string;
+      live_state: string;
+    }>(
+      `SELECT
+         (SELECT turn_count FROM context_mirror_reconciliation_heads
+           WHERE source_id='default' AND session_id='partial-deletion') AS shadow_turns,
+         turn_count AS live_turns, state AS live_state
+       FROM context_mirror_session_heads
+       WHERE source_id='default' AND session_id='partial-deletion'`,
+    );
+    expect(Number(heads?.shadow_turns)).toBe(1);
+    expect(Number(heads?.live_turns)).toBe(1);
+    expect(heads?.live_state).toBe('pending');
+  });
+
+  test('bootstrap invalidates an in-flight claim when capture membership changes', async () => {
+    for (const turn of [1, 2]) {
+      await engine.putPage(
+        `capture/claimed-partial-deletion/prompt-${turn}`,
+        {
+          type: 'note', title: 'capture', compiled_truth: `private body ${turn}`, timeline: '',
+          frontmatter: { session_id: 'claimed-partial-deletion', kind: 'prompt', turn },
+        } as never,
+        { sourceId: 'default' },
+      );
+    }
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial claimed inventory',
+    });
+    await engine.executeRaw(
+      `UPDATE context_mirror_session_heads
+          SET state='claimed', claim_id='claim-before-membership-change',
+              lease_expires_at=now() + interval '5 minutes'
+        WHERE source_id='default' AND session_id='claimed-partial-deletion'`,
+    );
+    await engine.deletePage('capture/claimed-partial-deletion/prompt-2', { sourceId: 'default' });
+
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000,
+      reason: 'invalidate changed claimed inventory',
+    });
+
+    const [head] = await engine.executeRaw<{
+      turn_count: number | string;
+      state: string;
+      claim_id: string | null;
+      lease_expires_at: string | null;
+      current_generation: number | string;
+    }>(
+      `SELECT turn_count, state, claim_id, lease_expires_at, current_generation
+         FROM context_mirror_session_heads
+        WHERE source_id='default' AND session_id='claimed-partial-deletion'`,
+    );
+    expect(Number(head?.turn_count)).toBe(1);
+    expect(head?.state).toBe('pending');
+    expect(head?.claim_id).toBeNull();
+    expect(head?.lease_expires_at).toBeNull();
+    expect(Number(head?.current_generation)).toBe(2);
+  });
+
+  test('bootstrap preserves an in-flight claim when capture membership is unchanged', async () => {
+    await engine.putPage(
+      'capture/unchanged-claim/prompt-1',
+      {
+        type: 'note', title: 'capture', compiled_truth: 'private body', timeline: '',
+        frontmatter: { session_id: 'unchanged-claim', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: 'default' },
+    );
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial claim inventory',
+    });
+    await engine.executeRaw(
+      `UPDATE context_mirror_session_heads
+          SET state='claimed', claim_id='claim-that-must-survive',
+              lease_expires_at=now() + interval '5 minutes'
+        WHERE source_id='default' AND session_id='unchanged-claim'`,
+    );
+
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000,
+      reason: 'no-op claimed inventory reconcile',
+    });
+
+    const [head] = await engine.executeRaw<{
+      state: string;
+      claim_id: string | null;
+      current_generation: number | string;
+    }>(
+      `SELECT state, claim_id, current_generation
+         FROM context_mirror_session_heads
+        WHERE source_id='default' AND session_id='unchanged-claim'`,
+    );
+    expect(head?.state).toBe('claimed');
+    expect(head?.claim_id).toBe('claim-that-must-survive');
+    expect(Number(head?.current_generation)).toBe(1);
+  });
+
+  test('bootstrap action reports ambiguous captures even when membership counts match', async () => {
+    await engine.putPage(
+      'capture/ambiguous-session/prompt-1',
+      {
+        type: 'note', title: 'capture', compiled_truth: 'private body', timeline: '',
+        frontmatter: { session_id: -1, kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: 'default' },
+    );
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'inventory ambiguous capture',
+    });
+    const actions = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      {
+        runtime_proof_fingerprint: 'd'.repeat(64),
+        replay_ledger_fingerprint: 'e'.repeat(64),
+      },
+    ) as { actions: Array<{ action: string; target_count: number }> };
+    expect(actions.actions).toContainEqual(expect.objectContaining({
+      action: 'run_context_mirror_bootstrap', target_count: 1,
+    }));
+  });
+
+  test('bootstrap action adds independent membership and ambiguity targets', async () => {
+    await engine.putPage(
+      'capture/deleted-target/prompt-1',
+      {
+        type: 'note', title: 'capture', compiled_truth: 'private body', timeline: '',
+        frontmatter: { session_id: 'deleted-target', kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: 'default' },
+    );
+    await engine.putPage(
+      'capture/ambiguous-target/prompt-1',
+      {
+        type: 'note', title: 'capture', compiled_truth: 'private body', timeline: '',
+        frontmatter: { session_id: -1, kind: 'prompt', turn: 1 },
+      } as never,
+      { sourceId: 'default' },
+    );
+    await operationsByName.run_context_mirror_bootstrap!.handler(adminContext(), {
+      batch_size: 10, max_batches: 2, max_runtime_ms: 5_000, reason: 'initial mixed inventory',
+    });
+    await engine.deletePage('capture/deleted-target/prompt-1', { sourceId: 'default' });
+    const actions = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      {
+        runtime_proof_fingerprint: 'd'.repeat(64),
+        replay_ledger_fingerprint: 'e'.repeat(64),
+      },
+    ) as { actions: Array<{ action: string; target_count: number }> };
+    expect(actions.actions).toContainEqual(expect.objectContaining({
+      action: 'run_context_mirror_bootstrap', target_count: 2,
+    }));
   });
 
   test('refuses hold release while engine blockers remain', async () => {
