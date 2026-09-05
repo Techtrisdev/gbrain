@@ -1568,7 +1568,7 @@ describeE2E('E2E: Context Mirror reconciliation JSONB', () => {
 
   test('recovery release locks source and global config through its readiness snapshot', async () => {
     const engine = getEngine();
-    const raceSourceId = `cm-release-race-${process.pid}-${Date.now()}`;
+    const raceSourceId = `cmrel-${process.pid.toString(36)}-${Date.now().toString(36)}`;
     const originalPromotionDispatchFrozen = await engine.getConfig('connectors.promotion_dispatch_frozen');
     const originalProofSecret = process.env.PROMOTION_HMAC_SECRET;
     const originalGbrainBuildSha = process.env.GBRAIN_BUILD_SHA;
