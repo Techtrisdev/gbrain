@@ -17,6 +17,99 @@ const DEFAULT_REVIEW_MAX_AGE_HOURS = 7 * 24;
 const COLLISION_DIGEST_LENGTH = 12;
 const COLLISION_SESSION_SLUG_LENGTH = 96;
 
+export class ContextMirrorReconciliationTimeoutError extends Error {
+  readonly code = 'CONTEXT_MIRROR_OPERATION_TIMEOUT';
+}
+
+export class ContextMirrorReconciliationUnsupportedEngineError extends Error {
+  readonly code = 'CONTEXT_MIRROR_UNSUPPORTED_ENGINE';
+}
+
+function remainingReconciliationMs(deadlineAtMs: number): number {
+  const remaining = Math.floor(deadlineAtMs - Date.now());
+  if (remaining < 1) {
+    throw new ContextMirrorReconciliationTimeoutError('context mirror reconciliation deadline expired');
+  }
+  return remaining;
+}
+
+async function boundedReconciliationTransaction<T>(
+  engine: BrainEngine,
+  deadlineAtMs: number,
+  fn: (tx: BrainEngine) => Promise<T>,
+): Promise<T> {
+  if (!Number.isFinite(deadlineAtMs)) return engine.transaction(fn);
+  if (engine.kind !== 'postgres') {
+    throw new ContextMirrorReconciliationUnsupportedEngineError(
+      'bounded context mirror reconciliation requires a cancellable Postgres transaction',
+    );
+  }
+  const initialRemaining = remainingReconciliationMs(deadlineAtMs);
+  let deadlineExpired = false;
+  const assertActive = (): number => {
+    if (deadlineExpired) {
+      throw new ContextMirrorReconciliationTimeoutError('context mirror reconciliation deadline expired');
+    }
+    return remainingReconciliationMs(deadlineAtMs);
+  };
+  const work = engine.transaction(async (tx) => {
+    assertActive();
+    const bounded = new Proxy(tx, {
+      get(target, property, receiver) {
+        if (property === 'executeRaw') {
+          return async <Row extends Record<string, unknown>>(
+            sql: string,
+            params?: unknown[],
+          ): Promise<Row[]> => {
+            const remaining = assertActive();
+            if (engine.kind === 'postgres') {
+              await target.executeRaw(
+                `SELECT set_config('statement_timeout', $1, true),
+                        set_config('lock_timeout', $2, true)`,
+                [String(remaining), String(Math.min(remaining, 1_000))],
+              );
+              assertActive();
+            }
+            const rows = await target.executeRaw<Row>(sql, params);
+            assertActive();
+            return rows;
+          };
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as BrainEngine;
+    const result = await fn(bounded);
+    assertActive();
+    return result;
+  });
+
+  return await new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      deadlineExpired = true;
+      reject(new ContextMirrorReconciliationTimeoutError('context mirror reconciliation deadline expired'));
+    }, initialRemaining);
+
+    work.then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 export interface DurableSessionHead {
   sessionId: string;
   sessionSlug: string;
@@ -685,7 +778,7 @@ async function reconciliationCounts(
               count(*) FILTER (WHERE m.identity_status = 'ambiguous') AS ambiguous
          FROM context_mirror_capture_membership m
          JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
-        WHERE m.source_id = $1 AND p.deleted_at IS NULL
+        WHERE m.source_id = $1 AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%'
      ), head_counts AS (
        SELECT count(*) AS heads
          FROM context_mirror_reconciliation_heads
@@ -727,12 +820,25 @@ export async function runSessionHeadReconciliationV2(
     sessionSlug: (sessionId: string) => string;
     batchSize?: number;
     leaseMs?: number;
+    deadlineAtMs?: number;
     actor: string;
     reason: string;
   },
 ): Promise<ReconciliationV2Result> {
   const batchSize = opts.batchSize ?? DEFAULT_BOOTSTRAP_BATCH;
-  const leaseMs = opts.leaseMs ?? DEFAULT_RECONCILIATION_LEASE_MS;
+  const deadlineAtMs = opts.deadlineAtMs ?? Number.POSITIVE_INFINITY;
+  if (Number.isNaN(deadlineAtMs)) {
+    throw new Error('context mirror reconciliation deadline is invalid');
+  }
+  const requestRemainingMs = Number.isFinite(deadlineAtMs)
+    ? remainingReconciliationMs(deadlineAtMs)
+    : DEFAULT_RECONCILIATION_LEASE_MS;
+  if (Number.isFinite(deadlineAtMs) && requestRemainingMs < 1_000) {
+    throw new ContextMirrorReconciliationTimeoutError(
+      'context mirror reconciliation has insufficient time to acquire a lease',
+    );
+  }
+  const leaseMs = Math.min(opts.leaseMs ?? DEFAULT_RECONCILIATION_LEASE_MS, requestRemainingMs);
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 5_000) {
     throw new Error('context mirror reconciliation batchSize must be an integer from 1 to 5000');
   }
@@ -752,7 +858,7 @@ export async function runSessionHeadReconciliationV2(
     idle_hours: opts.idleHours,
   });
 
-  await engine.transaction(async (tx) => {
+  await boundedReconciliationTransaction(engine, deadlineAtMs, async (tx) => {
     const initialized = await tx.executeRaw<{ source_id: string; scan_upper_page_id: number | string }>(
       `INSERT INTO context_mirror_reconciliation_state (
          source_id, version, phase, cursor_page_id, scan_upper_page_id
@@ -786,7 +892,7 @@ export async function runSessionHeadReconciliationV2(
     }
   });
 
-  const acquired = await engine.transaction(async (tx) => {
+  const acquired = await boundedReconciliationTransaction(engine, deadlineAtMs, async (tx) => {
     const beforeRows = await tx.executeRaw<ReconciliationStateRow>(
       `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
               lease_owner, membership_count, ambiguous_count, head_count
@@ -858,7 +964,7 @@ export async function runSessionHeadReconciliationV2(
   }
 
   const leaseGeneration = Number(acquired.lease_generation);
-  return await engine.transaction(async (tx) => {
+  return await boundedReconciliationTransaction(engine, deadlineAtMs, async (tx) => {
     const stateRows = await tx.executeRaw<ReconciliationStateRow>(
       `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
               lease_owner, membership_count, ambiguous_count, head_count
@@ -969,15 +1075,19 @@ export async function runSessionHeadReconciliationV2(
           capture_slug_prefix: string;
           turn_count: number | string;
           newest_capture_at: Date | string;
+          capture_membership_ids: unknown;
         }>(
-          `SELECT session_id,
-                  min(capture_slug_prefix) AS capture_slug_prefix,
+          `SELECT m.session_id,
+                  min(m.capture_slug_prefix) AS capture_slug_prefix,
                   count(*) AS turn_count,
-                  max(captured_at) AS newest_capture_at
-             FROM context_mirror_capture_membership
-            WHERE source_id = $1 AND identity_status = 'resolved'
-              AND session_id = ANY($2::text[])
-            GROUP BY session_id`,
+                  max(m.captured_at) AS newest_capture_at,
+                  jsonb_agg(m.page_id::text ORDER BY m.page_id) AS capture_membership_ids
+             FROM context_mirror_capture_membership m
+             JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
+            WHERE m.source_id = $1 AND m.identity_status = 'resolved'
+              AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%'
+              AND m.session_id = ANY($2::text[])
+            GROUP BY m.session_id`,
           [opts.sourceId, sessionIds],
         );
     const candidateSlugs = [...new Set(aggregates.flatMap((head) => {
@@ -1032,6 +1142,7 @@ export async function runSessionHeadReconciliationV2(
         capture_slug_prefix: head.capture_slug_prefix,
         newest_capture_at: new Date(head.newest_capture_at).toISOString(),
         turn_count: Number(head.turn_count),
+        capture_membership_ids: head.capture_membership_ids,
         ownership_conflict: locator.ownershipConflict,
       };
     });
@@ -1041,15 +1152,16 @@ export async function runSessionHeadReconciliationV2(
         `WITH incoming AS (
            SELECT * FROM jsonb_to_recordset($2::jsonb) AS x(
              session_id text, session_slug text, capture_slug_prefix text,
-             newest_capture_at timestamptz, turn_count integer, ownership_conflict boolean
+             newest_capture_at timestamptz, turn_count integer,
+             capture_membership_ids jsonb, ownership_conflict boolean
            )
          )
          INSERT INTO context_mirror_reconciliation_heads (
            source_id, session_id, session_slug, capture_slug_prefix,
-           newest_capture_at, turn_count, state, disposition
+           newest_capture_at, turn_count, capture_membership_ids, state, disposition
          )
          SELECT $1, session_id, session_slug, capture_slug_prefix,
-                newest_capture_at, turn_count,
+                newest_capture_at, turn_count, capture_membership_ids,
                 CASE WHEN ownership_conflict THEN 'quarantined' ELSE 'ready' END,
                 CASE WHEN ownership_conflict THEN 'locator_ownership_conflict' ELSE NULL END
            FROM incoming
@@ -1058,6 +1170,7 @@ export async function runSessionHeadReconciliationV2(
            capture_slug_prefix = EXCLUDED.capture_slug_prefix,
            newest_capture_at = EXCLUDED.newest_capture_at,
            turn_count = EXCLUDED.turn_count,
+           capture_membership_ids = EXCLUDED.capture_membership_ids,
            state = EXCLUDED.state,
            disposition = EXCLUDED.disposition,
            updated_at = now()`,
@@ -1086,25 +1199,29 @@ export async function runSessionHeadReconciliationV2(
            SELECT m.session_id,
                   min(m.capture_slug_prefix) AS capture_slug_prefix,
                   max(m.captured_at) AS newest_capture_at,
-                  count(*)::integer AS turn_count
+                  count(*)::integer AS turn_count,
+                  jsonb_agg(m.page_id::text ORDER BY m.page_id) AS capture_membership_ids
              FROM context_mirror_capture_membership m
              JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
             WHERE m.source_id = $1 AND m.identity_status = 'resolved'
-              AND p.deleted_at IS NULL
+              AND p.deleted_at IS NULL AND p.slug LIKE 'capture/%'
             GROUP BY m.session_id
          )
          UPDATE context_mirror_reconciliation_heads h
             SET capture_slug_prefix = active.capture_slug_prefix,
                 newest_capture_at = active.newest_capture_at,
                 turn_count = active.turn_count,
+                capture_membership_ids = active.capture_membership_ids,
                 state = CASE WHEN h.disposition = 'v2_membership_missing' THEN 'ready' ELSE h.state END,
                 disposition = CASE WHEN h.disposition = 'v2_membership_missing' THEN NULL ELSE h.disposition END,
                 updated_at = now()
            FROM active
           WHERE h.source_id = $1 AND h.session_id = active.session_id
-            AND (h.capture_slug_prefix, h.newest_capture_at, h.turn_count, h.state, h.disposition)
+            AND (h.capture_slug_prefix, h.newest_capture_at, h.turn_count,
+                 h.capture_membership_ids, h.state, h.disposition)
               IS DISTINCT FROM (
                 active.capture_slug_prefix, active.newest_capture_at, active.turn_count,
+                active.capture_membership_ids,
                 CASE WHEN h.disposition = 'v2_membership_missing' THEN 'ready' ELSE h.state END,
                 CASE WHEN h.disposition = 'v2_membership_missing' THEN NULL ELSE h.disposition END
               )`,
@@ -1120,98 +1237,101 @@ export async function runSessionHeadReconciliationV2(
                 JOIN pages p ON p.source_id = m.source_id AND p.id = m.page_id
                WHERE m.source_id = h.source_id AND m.session_id = h.session_id
                  AND m.identity_status = 'resolved' AND p.deleted_at IS NULL
+                 AND p.slug LIKE 'capture/%'
             )`,
         [opts.sourceId],
       );
       await tx.executeRaw(
         `INSERT INTO context_mirror_session_heads (
            source_id, session_id, session_slug, capture_slug_prefix,
-           newest_capture_at, turn_count, state, disposition
+           newest_capture_at, turn_count, capture_membership_ids, state, disposition
          )
          SELECT source_id, session_id, session_slug, capture_slug_prefix,
-                newest_capture_at, turn_count,
+                 newest_capture_at, turn_count, capture_membership_ids,
                 CASE WHEN state = 'quarantined' THEN 'quarantined' ELSE 'pending' END,
                 disposition
            FROM context_mirror_reconciliation_heads
           WHERE source_id = $1
             AND ($2::boolean OR session_id = ANY($3::text[]))
-         ON CONFLICT (source_id, session_id) DO UPDATE SET
-           capture_slug_prefix = EXCLUDED.capture_slug_prefix,
-           newest_capture_at = EXCLUDED.newest_capture_at,
-           turn_count = EXCLUDED.turn_count,
-           state = CASE
-             WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN 'quarantined'
-             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
-              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN 'pending'
-             ELSE context_mirror_session_heads.state
-           END,
-           disposition = CASE
-             WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN EXCLUDED.disposition
-             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
-              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN NULL
-             ELSE context_mirror_session_heads.disposition
-           END,
-           current_eligible_at = CASE
-             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
-              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN NULL
-             ELSE context_mirror_session_heads.current_eligible_at
-           END,
-           current_cohort_at = CASE
-             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
-              AND context_mirror_session_heads.state IN ('complete','quarantined') THEN NULL
-             ELSE context_mirror_session_heads.current_cohort_at
-           END,
-           current_generation = CASE
-             WHEN EXCLUDED.newest_capture_at > context_mirror_session_heads.newest_capture_at
-              AND context_mirror_session_heads.state IN ('complete','quarantined')
-                THEN context_mirror_session_heads.current_generation + 1
-             ELSE context_mirror_session_heads.current_generation
-           END,
-           claim_id = CASE WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN NULL
-                           ELSE context_mirror_session_heads.claim_id END,
-           lease_expires_at = CASE WHEN EXCLUDED.disposition = 'locator_ownership_conflict' THEN NULL
-                                   ELSE context_mirror_session_heads.lease_expires_at END,
-           updated_at = now()`,
+          ON CONFLICT (source_id, session_id) DO NOTHING`,
         [opts.sourceId, initialActivation, sessionIds],
       );
       await tx.executeRaw(
-        `UPDATE context_mirror_session_heads h
+        `WITH compared AS (
+           SELECT shadow.*,
+                  (h.capture_slug_prefix, h.newest_capture_at, h.turn_count, h.capture_membership_ids)
+                    IS DISTINCT FROM (
+                      shadow.capture_slug_prefix, shadow.newest_capture_at,
+                      shadow.turn_count, shadow.capture_membership_ids
+                    ) AS material_changed
+             FROM context_mirror_reconciliation_heads shadow
+             JOIN context_mirror_session_heads h
+               ON h.source_id = shadow.source_id AND h.session_id = shadow.session_id
+            WHERE shadow.source_id = $1
+         )
+         UPDATE context_mirror_session_heads h
             SET capture_slug_prefix = shadow.capture_slug_prefix,
                 newest_capture_at = shadow.newest_capture_at,
                 turn_count = shadow.turn_count,
+                capture_membership_ids = shadow.capture_membership_ids,
                 state = CASE
                   WHEN shadow.state = 'quarantined' THEN 'quarantined'
-                  WHEN h.state IN ('claimed','result_persisted','complete','quarantined') THEN 'pending'
+                  WHEN shadow.material_changed
+                    OR (h.state = 'quarantined'
+                        AND h.disposition IN ('v2_membership_missing','locator_ownership_conflict'))
+                    THEN CASE
+                      WHEN h.state IN ('claimed','result_persisted','complete','quarantined') THEN 'pending'
+                      ELSE h.state
+                    END
                   ELSE h.state
                 END,
                 disposition = CASE
                   WHEN shadow.state = 'quarantined' THEN shadow.disposition
-                  WHEN h.state IN ('claimed','result_persisted','complete','quarantined') THEN NULL
+                  WHEN shadow.material_changed
+                    OR (h.state = 'quarantined'
+                        AND h.disposition IN ('v2_membership_missing','locator_ownership_conflict'))
+                    THEN CASE
+                      WHEN h.state IN ('claimed','result_persisted','complete','quarantined') THEN NULL
+                      ELSE h.disposition
+                    END
                   ELSE h.disposition
                 END,
                 current_generation = CASE
-                  WHEN shadow.state <> 'quarantined'
-                    AND h.state IN ('claimed','result_persisted','complete','quarantined')
+                  WHEN shadow.material_changed
+                    AND shadow.state <> 'quarantined'
+                    AND (
+                      h.state IN ('claimed','result_persisted','complete','quarantined')
+                      OR (
+                        h.state = 'pending'
+                        AND EXISTS (
+                          SELECT 1 FROM context_mirror_generations g
+                           WHERE g.source_id = h.source_id
+                             AND g.session_id = h.session_id
+                             AND g.generation = h.current_generation
+                             AND g.is_current
+                        )
+                      )
+                    )
                     THEN h.current_generation + 1
                   ELSE h.current_generation
                 END,
                 claim_id = NULL, lease_expires_at = NULL,
                 current_eligible_at = NULL, current_cohort_at = NULL,
                 updated_at = now()
-           FROM context_mirror_reconciliation_heads shadow
-          WHERE h.source_id = $1 AND shadow.source_id = h.source_id
-            AND shadow.session_id = h.session_id
+           FROM compared shadow
+          WHERE h.source_id = shadow.source_id AND h.session_id = shadow.session_id
             AND (
-              (h.capture_slug_prefix, h.newest_capture_at, h.turn_count)
-                IS DISTINCT FROM (
-                  shadow.capture_slug_prefix, shadow.newest_capture_at, shadow.turn_count
-                )
+              shadow.material_changed
               OR (
                 shadow.state = 'quarantined'
                 AND (h.state, h.disposition)
                   IS DISTINCT FROM ('quarantined', shadow.disposition)
               )
-              OR (shadow.state <> 'quarantined' AND h.state = 'quarantined')
+              OR (
+                shadow.state <> 'quarantined'
+                AND h.state = 'quarantined'
+                AND h.disposition IN ('v2_membership_missing','locator_ownership_conflict')
+              )
             )`,
         [opts.sourceId],
       );

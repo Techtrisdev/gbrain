@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 
 import type { BrainEngine } from '../engine.ts';
-import { VERSION, BUILD_SHA, HOST_BUILD_SHA } from '../../version.ts';
+import type { VerifiedContextMirrorProof } from './context-mirror-proof.ts';
+import { VERSION, gbrainBuildShaFromEnv, hostBuildShaFromEnv } from '../../version.ts';
 import {
   parseJsonObject,
   readContextMirrorRecoveryHold,
@@ -156,6 +157,7 @@ export interface ContextMirrorStatusV1 {
     reconciliation_version: number | null;
     reconciliation_phase: 'rebuilding' | 'tailing' | 'blocked' | null;
     membership_records: number;
+    unreconciled_active_records: number;
     ambiguous_identity_pages: number;
     cursor_page_id: number | null;
     scan_upper_page_id: number | null;
@@ -522,13 +524,22 @@ export async function readContextMirrorStatusSnapshot(
     cursor_page_id: number | string;
     scan_upper_page_id: number | string;
     membership_count: number | string;
+    unreconciled_active_count: number | string;
     ambiguous_count: number | string;
     last_tail_at: Date | string | null;
     updated_at: Date | string;
   }>(
-    `SELECT version, phase, cursor_page_id, scan_upper_page_id,
-            membership_count, ambiguous_count, last_tail_at, updated_at
-       FROM context_mirror_reconciliation_state WHERE source_id = $1`,
+    `SELECT r.version, r.phase, r.cursor_page_id, r.scan_upper_page_id,
+            r.membership_count, r.ambiguous_count, r.last_tail_at, r.updated_at,
+            (
+              SELECT count(*)
+                FROM pages p
+                LEFT JOIN context_mirror_capture_membership m
+                  ON m.source_id = p.source_id AND m.page_id = p.id
+               WHERE p.source_id = $1 AND p.deleted_at IS NULL
+                 AND p.slug LIKE 'capture/%' AND m.page_id IS NULL
+            ) AS unreconciled_active_count
+       FROM context_mirror_reconciliation_state r WHERE r.source_id = $1`,
     [sourceId],
   );
   const reconciliation = reconciliationRows[0];
@@ -693,7 +704,11 @@ export async function readContextMirrorStatusSnapshot(
     schema_version: 1,
     generated_at: now.toISOString(),
     source_id: sourceId,
-    build: { version: VERSION, sha: BUILD_SHA, host_sha: HOST_BUILD_SHA },
+    build: {
+      version: VERSION,
+      sha: gbrainBuildShaFromEnv(process.env),
+      host_sha: hostBuildShaFromEnv(process.env),
+    },
     overall,
     configuration: {
       connector_enabled: connectorEnabled,
@@ -876,6 +891,7 @@ export async function readContextMirrorStatusSnapshot(
       reconciliation_version: reconciliation ? numberValue(reconciliation.version) : null,
       reconciliation_phase: reconciliation?.phase ?? null,
       membership_records: numberValue(reconciliation?.membership_count),
+      unreconciled_active_records: numberValue(reconciliation?.unreconciled_active_count),
       ambiguous_identity_pages: numberValue(reconciliation?.ambiguous_count),
       cursor_page_id: reconciliation ? numberValue(reconciliation.cursor_page_id) : null,
       scan_upper_page_id: reconciliation ? numberValue(reconciliation.scan_upper_page_id) : null,
@@ -893,15 +909,18 @@ function readinessFingerprint(value: Record<string, unknown>): string {
 /** Stable, body-free compare-and-set input for recovery-hold release. */
 export function buildContextMirrorRecoveryReadiness(
   status: ContextMirrorStatusV1,
-  runtimeProofFingerprint: string | null,
-  replayLedgerFingerprint: string | null,
+  runtimeProof: VerifiedContextMirrorProof | null,
+  replayLedgerProof: VerifiedContextMirrorProof | null,
 ): ContextMirrorRecoveryReadiness {
+  const runtimeProofFingerprint = runtimeProof?.receiptFingerprint ?? null;
+  const replayLedgerFingerprint = replayLedgerProof?.receiptFingerprint ?? null;
   const blockers: string[] = [];
   if (status.progress.bootstrap_complete !== true) blockers.push('capture_inventory_incomplete');
   if (status.progress.reconciliation_phase !== 'tailing') blockers.push('capture_inventory_not_tailing');
   if (
     status.progress.cursor_page_id !== status.progress.scan_upper_page_id
     || status.progress.membership_records !== status.capture.active_records
+    || status.progress.unreconciled_active_records > 0
   ) blockers.push('capture_membership_mismatch');
   if (status.progress.ambiguous_identity_pages > 0) blockers.push('capture_identity_ambiguous');
   if (status.distillation.provider.calls.ambiguous_provider_outcome > 0) blockers.push('ambiguous_provider_outcome');
@@ -929,6 +948,7 @@ export function buildContextMirrorRecoveryReadiness(
     capture: {
       active_records: status.capture.active_records,
       membership_records: status.progress.membership_records,
+      unreconciled_active_records: status.progress.unreconciled_active_records,
       cursor_page_id: status.progress.cursor_page_id,
       scan_upper_page_id: status.progress.scan_upper_page_id,
       ambiguous_identity_pages: status.progress.ambiguous_identity_pages,
