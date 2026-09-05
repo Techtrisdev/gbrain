@@ -960,15 +960,17 @@ export async function runSessionHeadReconciliationV2(
   });
 
   if (!acquired) {
-    const [state] = await engine.executeRaw<ReconciliationStateRow>(
-      `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
-              lease_owner, membership_count, ambiguous_count, head_count
-         FROM context_mirror_reconciliation_state WHERE source_id = $1`,
-      [opts.sourceId],
-    );
-    if (!state) throw new Error('context mirror reconciliation state unavailable');
-    const counts = await reconciliationCounts(engine, opts.sourceId);
-    return reconciliationResult(state, counts, 'busy', 0, 0);
+    return await boundedReconciliationTransaction(engine, deadlineAtMs, async (tx) => {
+      const [state] = await tx.executeRaw<ReconciliationStateRow>(
+        `SELECT phase, cursor_page_id, scan_upper_page_id, lease_generation,
+                lease_owner, membership_count, ambiguous_count, head_count
+           FROM context_mirror_reconciliation_state WHERE source_id = $1`,
+        [opts.sourceId],
+      );
+      if (!state) throw new Error('context mirror reconciliation state unavailable');
+      const counts = await reconciliationCounts(tx, opts.sourceId);
+      return reconciliationResult(state, counts, 'busy', 0, 0);
+    });
   }
 
   const leaseGeneration = Number(acquired.lease_generation);

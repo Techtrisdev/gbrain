@@ -4297,8 +4297,15 @@ const set_context_mirror_recovery_hold: Operation = {
             throw new OperationError('precondition_failed', 'No active recovery hold exists to release');
           }
           if (ctx.engine.kind === 'postgres') {
+            const sourceRows = await tx.executeRaw<{ id: string }>(
+              'SELECT id FROM sources WHERE id = $1 FOR SHARE',
+              [sourceId],
+            );
+            if (!sourceRows[0]) {
+              throw new OperationError('source_not_found', 'Context Mirror source not found');
+            }
             await tx.executeRaw(
-              `LOCK TABLE pages, content_chunks, context_mirror_capture_membership,
+              `LOCK TABLE config, pages, content_chunks, context_mirror_capture_membership,
                  context_mirror_reconciliation_state, context_mirror_provider_calls,
                  context_mirror_generations, context_mirror_partitions,
                  connector_candidates, connector_promotion_transitions IN SHARE MODE`,
