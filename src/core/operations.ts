@@ -3967,9 +3967,11 @@ const list_context_mirror_actions: Operation = {
 
     const bootstrapBlockers = readiness.blockers.filter((code) => code.startsWith('capture_'));
     if (bootstrapBlockers.length > 0) {
+      const staleTailPass = bootstrapBlockers.includes('capture_tail_stale') ? 1 : 0;
       pushAction(
         'run_context_mirror_bootstrap',
         Math.max(
+          staleTailPass,
           status.progress.unreconciled_active_records,
           Math.abs(status.capture.active_records - status.progress.membership_records),
           status.progress.ambiguous_identity_pages,
@@ -3977,7 +3979,7 @@ const list_context_mirror_actions: Operation = {
           status.progress.locator_ownership_conflicts,
         ),
         bootstrapBlockers,
-        'bootstrap_complete_and_membership_conserved',
+        'bootstrap_complete_membership_conserved_and_tail_fresh',
       );
     }
     if (readiness.blockers.includes('ambiguous_provider_outcome')) {
@@ -4073,61 +4075,33 @@ const run_context_mirror_bootstrap: Operation = {
         'Bounded Context Mirror bootstrap requires Postgres; the embedded database cannot interrupt a blocking statement safely',
       );
     }
-    const started = Date.now();
-    const deadlineAtMs = started + maxRuntimeMs;
-    let scanned = 0;
-    let insertedMembership = 0;
-    let batches = 0;
-    let latest: import('./connectors/context-mirror-state.ts').ReconciliationV2Result | null = null;
-    const { runSessionHeadReconciliationV2 } = await import('./connectors/context-mirror-state.ts');
-    const { toSessionSlug } = await import('./connectors/distill.ts');
+    const {
+      runBoundedContextMirrorReconciliation,
+      toBoundedContextMirrorReconciliationWireReport,
+    } = await import(
+      './connectors/context-mirror-reconcile.ts'
+    );
+    let report: Awaited<ReturnType<typeof runBoundedContextMirrorReconciliation>>;
     try {
-      while (batches < maxBatches && deadlineAtMs - Date.now() >= 1_000) {
-        latest = await runSessionHeadReconciliationV2(ctx.engine, {
-          sourceId,
-          now: new Date(),
-          idleHours: 6,
-          sessionSlug: toSessionSlug,
-          batchSize,
-          deadlineAtMs,
-          actor,
-          reason,
-        });
-        batches += 1;
-        scanned += latest.scanned;
-        insertedMembership += latest.insertedMembership;
-        if (latest.status !== 'partial') break;
-      }
+      report = await runBoundedContextMirrorReconciliation(ctx.engine, {
+        sourceId,
+        batchSize,
+        maxBatches,
+        maxRuntimeMs,
+        actor,
+        reason,
+      });
     } catch (error) {
       if (contextMirrorOperationTimedOut(error)) {
         throw new OperationError('operation_timeout', 'Context Mirror bootstrap exceeded its runtime limit');
       }
       throw error;
     }
-    if (!latest) {
-      throw new OperationError('operation_timeout', 'Context Mirror bootstrap runtime expired before the first batch');
-    }
     ctx.logger.info(
       `[context-mirror-admin] operation=run_context_mirror_bootstrap source=${sourceId} ` +
-      `status=${latest.status} batches=${batches} scanned=${scanned} actor=${actor}`,
+      `status=${report.status} batches=${report.batches} scanned=${report.scanned} actor=${actor}`,
     );
-    return {
-      schema_version: 2,
-      source_id: sourceId,
-      status: latest.status,
-      batches,
-      scanned,
-      inserted_membership: insertedMembership,
-      membership: latest.membership,
-      ambiguous_identity_pages: latest.ambiguousIdentityPages,
-      total_heads: latest.totalHeads,
-      pending_eligible: latest.pendingEligible,
-      cursor_page_id: latest.cursorPageId,
-      scan_upper_page_id: latest.scanUpperPageId,
-      lease_generation: latest.leaseGeneration,
-      resume_fingerprint: latest.resumeFingerprint,
-      provider_calls: 0,
-    };
+    return toBoundedContextMirrorReconciliationWireReport(report);
   },
 };
 

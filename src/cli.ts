@@ -1025,10 +1025,12 @@ async function handleCliOnly(command: string, args: string[]) {
   }
 
   if (command === 'connector') {
-    // One-shot connector poll: DB-required, daemon-free. --help / no-args print
-    // help without a DB (mirrors dream's no-DB tolerance for help).
+    // One-shot connector operations are DB-required except help. Route the
+    // scheduled tail's nested help before engine initialization so operators
+    // can discover its recovery flags even when the database is unavailable.
     const { runConnector } = await import('./commands/connector.ts');
-    if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
+    const tailHelp = args[0] === 'tail-context-mirror' && hasHelpFlag(args.slice(1));
+    if (args.length === 0 || args[0] === '--help' || args[0] === '-h' || tailHelp) {
       await runConnector(null, args);
       return;
     }
