@@ -110,6 +110,14 @@ describe('parseSkillFrontmatter', () => {
     expect(fm!.brain_first_typo).toBeUndefined();
   });
 
+  test('parses canonical frontmatter from a CRLF checkout', () => {
+    const content = '---\r\nname: x\r\nbrain_first: exempt\r\n---\r\n';
+    const fm = parseSkillFrontmatter(content);
+    expect(fm).not.toBeNull();
+    expect(fm!.brain_first).toBe('exempt');
+    expect(fm!.brain_first_typo).toBeUndefined();
+  });
+
   test('kebab-case brain-first triggers noncanonical_key typo', () => {
     const content = '---\nname: x\nbrain-first: exempt\n---\n';
     const fm = parseSkillFrontmatter(content);
@@ -172,6 +180,11 @@ describe('stripFrontmatter', () => {
   test('removes leading YAML fence', () => {
     const content = '---\nname: x\n---\n# Body\nrest';
     expect(stripFrontmatter(content)).toBe('# Body\nrest');
+  });
+
+  test('removes leading YAML fence with CRLF line endings', () => {
+    const content = '---\r\nname: x\r\n---\r\n# Body\r\nrest';
+    expect(stripFrontmatter(content)).toBe('# Body\r\nrest');
   });
 
   test('leaves content unchanged when no fence is present', () => {

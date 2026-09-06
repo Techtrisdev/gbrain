@@ -47,7 +47,7 @@ ALLOWLIST_FILE="$ROOT/scripts/check-test-isolation.allowlist"
 # is fine — every violation will fail.
 ALLOWLIST=""
 if [ -f "$ALLOWLIST_FILE" ]; then
-  ALLOWLIST="$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | grep -v '^[[:space:]]*$' || true)"
+  ALLOWLIST="$(grep -v '^[[:space:]]*#' "$ALLOWLIST_FILE" | grep -v '^[[:space:]]*$' | sed 's/\r$//' || true)"
 fi
 
 is_allowlisted() {
