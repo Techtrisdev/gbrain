@@ -27,7 +27,7 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { loadAllSources } from '../core/sources-load.ts';
+import { fetchSource, loadAllSources } from '../core/sources-load.ts';
 import {
   selectEnabledConnectorSources,
   runConnectorPoll,
@@ -37,6 +37,10 @@ import {
 import { listCandidates, type ReviewCandidate } from '../core/connectors/candidate.ts';
 import { consolidateContextMirrorGeneration } from '../core/connectors/context-mirror.ts';
 import { rollbackContextGeneration } from '../core/connectors/context-mirror-state.ts';
+import {
+  runBoundedContextMirrorReconciliation,
+  toBoundedContextMirrorReconciliationWireReport,
+} from '../core/connectors/context-mirror-reconcile.ts';
 // Side-effect import: register all SaaS connectors so the standalone `gbrain connector`
 // CLI resolves providers. Without it getConnector() returns undefined and every source
 // skips as `connector_not_registered` (the HTTP server gets this via serve-http.ts:60;
@@ -95,6 +99,23 @@ export interface GenerationRollbackArgs {
   generation: number;
   rollbackGeneration: number;
   json: boolean;
+}
+
+export interface ContextMirrorTailArgs {
+  sourceId: string;
+  batchSize: number;
+  maxBatches: number;
+  maxRuntimeMs: number;
+  reason: string;
+  json: boolean;
+}
+
+export interface ContextMirrorTailCommandRuntime {
+  fetchSource: typeof fetchSource;
+  reconcile: typeof runBoundedContextMirrorReconciliation;
+  writeStdout: (text: string) => void;
+  writeStderr: (text: string) => void;
+  setExitCode: (code: 0 | 1 | 2) => void;
 }
 
 function finiteTargetedNumber(flag: string, value: string, integer: boolean): number {
@@ -175,6 +196,51 @@ export function parseGenerationRollbackArgs(args: string[]): GenerationRollbackA
   };
 }
 
+function boundedTailInteger(flag: string, value: string, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${flag} must be an integer from ${min} to ${max}`);
+  }
+  return parsed;
+}
+
+/** Strict parser for the scheduled no-provider reconciliation tail. */
+export function parseContextMirrorTailArgs(args: string[]): ContextMirrorTailArgs {
+  const values = new Map<string, string>();
+  let json = false;
+  const allowed = new Set([
+    '--source', '--batch-size', '--max-batches', '--max-runtime-ms', '--reason',
+  ]);
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index];
+    if (flag === '--json') {
+      if (json) throw new Error('--json may be specified only once');
+      json = true;
+      continue;
+    }
+    if (!allowed.has(flag)) throw new Error(`unknown Context Mirror tail option: ${flag}`);
+    if (values.has(flag)) throw new Error(`${flag} may be specified only once`);
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    values.set(flag, value);
+    index += 1;
+  }
+  const missing = [...allowed].filter((flag) => !values.has(flag));
+  if (missing.length > 0) throw new Error(`required Context Mirror tail options missing: ${missing.join(', ')}`);
+  const sourceId = values.get('--source')!.trim();
+  const reason = values.get('--reason')!.trim();
+  if (!sourceId || sourceId.length > 120) throw new Error('--source must contain 1 to 120 characters');
+  if (!reason || reason.length > 240) throw new Error('--reason must contain 1 to 240 characters');
+  return {
+    sourceId,
+    batchSize: boundedTailInteger('--batch-size', values.get('--batch-size')!, 1, 5_000),
+    maxBatches: boundedTailInteger('--max-batches', values.get('--max-batches')!, 1, 20),
+    maxRuntimeMs: boundedTailInteger('--max-runtime-ms', values.get('--max-runtime-ms')!, 2_000, 45_000),
+    reason,
+    json,
+  };
+}
+
 type ConnectorPollRunner = (
   engine: BrainEngine,
   target: ConnectorPollTarget,
@@ -238,7 +304,11 @@ export function connectorPollSummary(results: ConnectorPollResult[]): ConnectorP
   };
 }
 
-export async function runConnector(engine: BrainEngine | null, args: string[]): Promise<void> {
+export async function runConnector(
+  engine: BrainEngine | null,
+  args: string[],
+  tailRuntime: Partial<ContextMirrorTailCommandRuntime> = {},
+): Promise<void> {
   const sub = args[0];
   if (!sub || sub === '--help' || sub === '-h') {
     printHelp();
@@ -256,12 +326,75 @@ export async function runConnector(engine: BrainEngine | null, args: string[]): 
     await runGenerationRollback(engine, args.slice(1));
     return;
   }
+  if (sub === 'tail-context-mirror') {
+    await runContextMirrorTail(engine, args.slice(1), tailRuntime);
+    return;
+  }
   if (sub === 'review') {
     await runReview(engine, args.slice(1));
     return;
   }
-  console.error(`Unknown connector subcommand "${sub}". Try: gbrain connector poll | gbrain connector consolidate | gbrain connector rollback-generation | gbrain connector review`);
+  console.error(`Unknown connector subcommand "${sub}". Try: gbrain connector poll | gbrain connector consolidate | gbrain connector rollback-generation | gbrain connector tail-context-mirror | gbrain connector review`);
   process.exit(2);
+}
+
+export async function runContextMirrorTail(
+  engine: BrainEngine | null,
+  args: string[],
+  runtimeOverrides: Partial<ContextMirrorTailCommandRuntime> = {},
+): Promise<void> {
+  const runtime: ContextMirrorTailCommandRuntime = {
+    fetchSource,
+    reconcile: runBoundedContextMirrorReconciliation,
+    writeStdout: (text) => { process.stdout.write(text); },
+    writeStderr: (text) => { process.stderr.write(text); },
+    setExitCode: (code) => { process.exitCode = code; },
+    ...runtimeOverrides,
+  };
+  if (args.includes('--help') || args.includes('-h')) {
+    printHelp(runtime.writeStdout);
+    runtime.setExitCode(0);
+    return;
+  }
+  if (!engine) {
+    runtime.writeStderr('connector tail-context-mirror requires a database. Run `gbrain init` first.\n');
+    runtime.setExitCode(1);
+    return;
+  }
+  let parsed: ContextMirrorTailArgs;
+  try {
+    parsed = parseContextMirrorTailArgs(args);
+  } catch (err) {
+    runtime.writeStderr(`connector tail-context-mirror: ${err instanceof Error ? err.message : String(err)}\n`);
+    runtime.setExitCode(2);
+    return;
+  }
+  try {
+    const source = await runtime.fetchSource(engine, parsed.sourceId);
+    if (!source) {
+      runtime.writeStderr(`connector tail-context-mirror: source ${parsed.sourceId} not found\n`);
+      runtime.setExitCode(1);
+      return;
+    }
+    const report = await runtime.reconcile(engine, {
+      sourceId: parsed.sourceId,
+      batchSize: parsed.batchSize,
+      maxBatches: parsed.maxBatches,
+      maxRuntimeMs: parsed.maxRuntimeMs,
+      actor: 'context-mirror-tail-cli',
+      reason: parsed.reason,
+    });
+    const output = toBoundedContextMirrorReconciliationWireReport(report);
+    if (parsed.json) runtime.writeStdout(`${JSON.stringify(output)}\n`);
+    else runtime.writeStdout(
+      `connector tail-context-mirror: ${report.status}; batches=${report.batches}; `
+      + `scanned=${report.scanned}; membership=${report.membership}; provider_calls=0\n`,
+    );
+    runtime.setExitCode(report.status === 'complete' ? 0 : 1);
+  } catch (err) {
+    runtime.writeStderr(`connector tail-context-mirror: ${sanitizedPollError(err)}\n`);
+    runtime.setExitCode(1);
+  }
 }
 
 async function runPoll(engine: BrainEngine | null, args: string[]): Promise<void> {
@@ -705,13 +838,16 @@ async function runReview(engine: BrainEngine | null, args: string[]): Promise<vo
   }
 }
 
-function printHelp(): void {
-  console.log(`Usage: gbrain connector <subcommand>
+function printHelp(write: (text: string) => void = (text) => { console.log(text); }): void {
+  write(`Usage: gbrain connector <subcommand>
 
 One-shot SaaS connector operations — the synchronous, daemon-free equivalent of
 the autopilot connector-dispatch branch (no Minion worker required).
 
 Subcommands:
+  tail-context-mirror
+          Keep immutable raw membership and exact session heads current without
+          reading transcript bodies or calling an AI provider.
   poll    Poll enabled connector sources NOW. Lands connector_candidates (a
           REVIEW queue) — NEVER durable Brain pages, NEVER a promotion.
   rollback-generation
@@ -728,6 +864,15 @@ poll options:
                                     enabled connector source.
   --json                            Machine-readable report.
   --dry-run                         List targets without polling.
+  --help, -h                        Show this help.
+
+tail-context-mirror options:
+  --source <id>                     Exact source to reconcile.
+  --batch-size <1-5000>             Raw metadata rows per batch.
+  --max-batches <1-20>              Maximum batches in this invocation.
+  --max-runtime-ms <2000-45000>     Wall-clock ceiling.
+  --reason <text>                   Bounded audit reason.
+  --json                            Machine-readable report.
   --help, -h                        Show this help.
 
 review options:

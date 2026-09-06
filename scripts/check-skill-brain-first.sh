@@ -46,23 +46,22 @@ GBRAIN_SKILLS_DIR="$ROOT/skills" bun run src/cli.ts doctor --fast --json >"$TMPO
 # add jq to the verify chain.
 STATUS=$(python3 -c "
 import json, sys
-with open('$TMPOUT') as fp:
-    for line in fp:
-        line = line.strip()
-        if not (line.startswith('{') and line.endswith('}')):
-            continue
-        try:
-            report = json.loads(line)
-        except Exception:
-            continue
-        for c in report.get('checks', []):
-            if c.get('name') == 'skill_brain_first':
-                print(c.get('status', 'missing'))
-                sys.exit(0)
-        print('missing')
-        sys.exit(0)
+for line in sys.stdin:
+    line = line.strip()
+    if not (line.startswith('{') and line.endswith('}')):
+        continue
+    try:
+        report = json.loads(line)
+    except Exception:
+        continue
+    for c in report.get('checks', []):
+        if c.get('name') == 'skill_brain_first':
+            print(c.get('status', 'missing'))
+            sys.exit(0)
+    print('missing')
+    sys.exit(0)
 print('parse_error')
-" 2>/dev/null || echo "parse_error")
+" <"$TMPOUT" 2>/dev/null || echo "parse_error")
 
 case "$STATUS" in
   ok)

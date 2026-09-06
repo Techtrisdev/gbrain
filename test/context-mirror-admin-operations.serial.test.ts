@@ -180,6 +180,85 @@ describe('Context Mirror admin MCP controls', () => {
     expect(JSON.stringify(result)).not.toContain('session_id');
   });
 
+  test('keeps readiness stable across fresh tail ticks while blocking stale or missing tails', async () => {
+    const proofs = externalProofParams();
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_recovery_holds (
+         source_id,active,reason,acted_by,held_at
+       ) VALUES ('default',true,'repair','test',now())`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,0,now(),now() - interval '16 minutes')`,
+    );
+
+    const stale = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      proofs,
+    ) as {
+      ready_to_release: boolean;
+      readiness_fingerprint: string;
+      actions: Array<{
+        action: string;
+        blockers: string[];
+        target_count: number;
+        success_proof: string;
+      }>;
+    };
+    expect(stale.ready_to_release).toBe(false);
+    expect(stale.actions).toContainEqual(expect.objectContaining({
+      action: 'run_context_mirror_bootstrap',
+      blockers: expect.arrayContaining(['capture_tail_stale']),
+      target_count: 1,
+      success_proof: 'bootstrap_complete_membership_conserved_and_tail_fresh',
+    }));
+    expect(stale.actions).toContainEqual(expect.objectContaining({
+      action: 'release_recovery_hold',
+      blockers: expect.arrayContaining(['capture_tail_stale']),
+    }));
+
+    await engine.executeRaw(
+      `UPDATE context_mirror_reconciliation_state
+          SET last_tail_at = now()
+        WHERE source_id = 'default'`,
+    );
+    const fresh = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      proofs,
+    ) as { ready_to_release: boolean; readiness_fingerprint: string };
+    expect(fresh.ready_to_release).toBe(true);
+    expect(fresh.readiness_fingerprint).not.toBe(stale.readiness_fingerprint);
+
+    await engine.executeRaw(
+      `UPDATE context_mirror_reconciliation_state
+          SET last_tail_at = now() - interval '1 minute'
+        WHERE source_id = 'default'`,
+    );
+    const stillFresh = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      proofs,
+    ) as { ready_to_release: boolean; readiness_fingerprint: string };
+    expect(stillFresh.ready_to_release).toBe(true);
+    expect(stillFresh.readiness_fingerprint).toBe(fresh.readiness_fingerprint);
+
+    await engine.executeRaw(
+      `UPDATE context_mirror_reconciliation_state
+          SET last_tail_at = NULL
+        WHERE source_id = 'default'`,
+    );
+    const missing = await operationsByName.list_context_mirror_actions!.handler(
+      adminContext(),
+      proofs,
+    ) as { ready_to_release: boolean; actions: Array<{ action: string; blockers: string[] }> };
+    expect(missing.ready_to_release).toBe(false);
+    expect(missing.actions).toContainEqual(expect.objectContaining({
+      action: 'release_recovery_hold',
+      blockers: expect.arrayContaining(['capture_tail_stale']),
+    }));
+  });
+
   test('refuses release while capture, paid distillation, or promotion dispatch is enabled', async () => {
     await engine.executeRaw(
       `UPDATE sources

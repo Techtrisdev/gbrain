@@ -16,6 +16,15 @@ import { join, resolve } from 'path';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const LINT_SH = resolve(REPO_ROOT, 'scripts/check-test-isolation.sh');
+const BASH_UNAME = spawnSync('bash', ['-lc', 'uname -s'], { encoding: 'utf-8' }).stdout.trim();
+
+function toBashPath(path: string): string {
+  if (process.platform !== 'win32') return path;
+  const drivePrefix = BASH_UNAME === 'Linux' ? '/mnt/' : '/';
+  return path
+    .replace(/^([A-Za-z]):\\/, (_, drive: string) => `${drivePrefix}${drive.toLowerCase()}/`)
+    .replaceAll('\\', '/');
+}
 
 interface FakeFile {
   /** Path relative to the tmpdir's `test/` directory. */
@@ -29,7 +38,11 @@ interface RunResult {
   stderr: string;
 }
 
-function runLintIn(files: FakeFile[], allowlist: string[] = []): RunResult {
+function runLintIn(
+  files: FakeFile[],
+  allowlist: string[] = [],
+  allowlistNewline = '\n',
+): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'lint-isolation-'));
   mkdirSync(join(dir, 'test'), { recursive: true });
   mkdirSync(join(dir, 'scripts'), { recursive: true });
@@ -43,10 +56,10 @@ function runLintIn(files: FakeFile[], allowlist: string[] = []): RunResult {
   // real repo's, regardless of git toplevel resolution.
   writeFileSync(
     join(dir, 'scripts/check-test-isolation.allowlist'),
-    allowlist.length > 0 ? allowlist.join('\n') + '\n' : '',
+    allowlist.length > 0 ? allowlist.join(allowlistNewline) + allowlistNewline : '',
   );
 
-  const r = spawnSync('bash', [LINT_SH, 'test'], {
+  const r = spawnSync('bash', [toBashPath(LINT_SH), 'test'], {
     cwd: dir,
     encoding: 'utf-8',
     env: { ...process.env },
@@ -263,6 +276,20 @@ describe('check-test-isolation.sh', () => {
           },
         ],
         ['# legacy file', '', 'test/legacy.test.ts'],
+      );
+      expect(r.status).toBe(0);
+    });
+
+    it('accepts CRLF allowlists from Windows checkouts', () => {
+      const r = runLintIn(
+        [
+          {
+            path: 'legacy.test.ts',
+            contents: `process.env.OOPS = 'bad';\n`,
+          },
+        ],
+        ['test/legacy.test.ts'],
+        '\r\n',
       );
       expect(r.status).toBe(0);
     });

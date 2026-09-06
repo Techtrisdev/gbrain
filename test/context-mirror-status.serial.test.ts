@@ -212,6 +212,29 @@ describe('context_mirror_status read contract', () => {
     expect(serialized).not.toContain('RAW_PROVIDER_SECRET');
   });
 
+  test('reports a completed v2 inventory as broken when its no-provider tail is stale', async () => {
+    await configureSource('default');
+    await engine.executeRaw(
+      `INSERT INTO context_mirror_reconciliation_state (
+         source_id,version,phase,cursor_page_id,scan_upper_page_id,
+         membership_count,ambiguous_count,head_count,last_complete_at,last_tail_at
+       ) VALUES ('default',2,'tailing',0,0,0,0,0,now(),now() - interval '16 minutes')`,
+    );
+
+    const stale = await status(context(), 'default');
+    expect(stale.overall).toEqual({
+      state: 'broken',
+      reason_codes: ['capture_tail_stale'],
+      next_action: 'run_context_mirror_bootstrap',
+    });
+
+    await engine.executeRaw(
+      `UPDATE context_mirror_reconciliation_state SET last_tail_at = now() WHERE source_id = 'default'`,
+    );
+    const fresh = await status(context(), 'default');
+    expect(fresh.overall).toEqual({ state: 'idle', reason_codes: ['no_eligible_work'], next_action: null });
+  });
+
   test('requires one allowed source and never returns an unlabeled federated aggregate', async () => {
     await configureSource('default');
     await engine.executeRaw(

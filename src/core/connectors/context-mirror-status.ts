@@ -201,6 +201,17 @@ const PROVIDER_ERROR_CODES = new Set([
   'config', 'budget', 'transient', 'validation', 'refusal', 'content_filter',
   'malformed_output', 'provider', 'authentication', 'billing', 'rate_limit', 'timeout',
 ]);
+const CONTEXT_MIRROR_TAIL_MAX_AGE_MS = 15 * 60_000;
+const CONTEXT_MIRROR_TAIL_FUTURE_SKEW_MS = 60_000;
+
+function contextMirrorTailIsFresh(value: string | null, now: Date): boolean {
+  if (!Number.isFinite(now.getTime()) || value == null) return false;
+  const observedAt = Date.parse(value);
+  if (!Number.isFinite(observedAt)) return false;
+  const ageMs = now.getTime() - observedAt;
+  return ageMs >= -CONTEXT_MIRROR_TAIL_FUTURE_SKEW_MS
+    && ageMs <= CONTEXT_MIRROR_TAIL_MAX_AGE_MS;
+}
 
 /** Collapse free-form provider text into a fixed, non-secret taxonomy. */
 function circuitReasonCode(value: unknown): string | null {
@@ -242,6 +253,8 @@ function classifyOverall(input: {
   consolidationEnabled: boolean;
   raw: number;
   bootstrapComplete: boolean | null;
+  tailRequired: boolean;
+  tailFresh: boolean;
   eligible: number;
   retryableOver24h: number;
   ambiguous: number;
@@ -269,6 +282,7 @@ function classifyOverall(input: {
   const broken: string[] = [];
   const degraded: string[] = [];
   if (input.ambiguous > 0) broken.push('ambiguous_provider_outcome');
+  if (input.tailRequired && !input.tailFresh) broken.push('capture_tail_stale');
   if (input.circuitOpen && input.eligible > 0) broken.push('provider_circuit_open');
   if (input.failedRunWithBacklog) broken.push('last_distill_failed_with_backlog');
   if (input.retryableOver24h > 0 || input.partitionOver24h > 0) broken.push('retryable_work_over_24h');
@@ -281,6 +295,8 @@ function classifyOverall(input: {
   if (broken.length > 0) {
     const next = broken.includes('ambiguous_provider_outcome')
       ? 'inspect_ambiguous_provider_outcomes'
+      : broken.includes('capture_tail_stale')
+        ? 'run_context_mirror_bootstrap'
       : broken.includes('provider_circuit_open')
         ? 'restore_provider_access_after_safety_gates'
         : broken.includes('generation_manifest_gap')
@@ -697,6 +713,8 @@ export async function readContextMirrorStatusSnapshot(
     consolidationEnabled,
     raw: numberValue(capture?.active_records),
     bootstrapComplete,
+    tailRequired: reconciliation?.phase === 'tailing',
+    tailFresh: contextMirrorTailIsFresh(iso(reconciliation?.last_tail_at), now),
     eligible: eligiblePending,
     retryableOver24h: numberValue(eligibility.retryable_over_24h),
     ambiguous: numberValue(eligibility.ambiguous),
@@ -954,6 +972,7 @@ export function buildContextMirrorRecoveryReadiness(
   status: ContextMirrorStatusV1,
   runtimeProof: VerifiedContextMirrorProof | null,
   replayLedgerProof: VerifiedContextMirrorProof | null,
+  now: Date = new Date(),
 ): ContextMirrorRecoveryReadiness {
   const runtimeProofFingerprint = runtimeProof?.receiptFingerprint ?? null;
   const replayLedgerFingerprint = replayLedgerProof?.receiptFingerprint ?? null;
@@ -963,6 +982,7 @@ export function buildContextMirrorRecoveryReadiness(
   if (!status.promotion.dispatch_frozen) blockers.push('promotion_dispatch_not_frozen');
   if (status.progress.bootstrap_complete !== true) blockers.push('capture_inventory_incomplete');
   if (status.progress.reconciliation_phase !== 'tailing') blockers.push('capture_inventory_not_tailing');
+  if (!contextMirrorTailIsFresh(status.progress.last_tail_at, now)) blockers.push('capture_tail_stale');
   if (
     status.progress.cursor_page_id !== status.progress.scan_upper_page_id
     || status.progress.membership_records !== status.capture.active_records
@@ -1009,6 +1029,7 @@ export function buildContextMirrorRecoveryReadiness(
       locator_ownership_conflicts: status.progress.locator_ownership_conflicts,
       bootstrap_complete: status.progress.bootstrap_complete,
       reconciliation_phase: status.progress.reconciliation_phase,
+      tail_fresh: contextMirrorTailIsFresh(status.progress.last_tail_at, now),
     },
     provider_ambiguous: status.distillation.provider.calls.ambiguous_provider_outcome,
     generation_manifest_gap: status.generations.manifest_gap,
