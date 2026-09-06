@@ -25,7 +25,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import type { BrainEngine } from '../core/engine.ts';
-import { operations, OperationError } from '../core/operations.ts';
+import { operations, OperationError, validatePageSlug } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
@@ -45,6 +45,10 @@ import {
   type IngestionContentType,
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
+import {
+  INGEST_QUEUE_AUTH_SECRET_ENV,
+  signIngestCaptureSourceAuthorization,
+} from '../core/minions/handlers/ingest-capture.ts';
 import { getConnector, readConnectorConfig, landRecords } from '../core/connectors/base.ts';
 import { getOAuthProvider, storeToken, safeStateEqual } from '../core/connectors/credentials.ts';
 import {
@@ -2042,6 +2046,44 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
       const agentName = authInfo.clientName ?? authInfo.clientId;
 
+      // Source authority comes from the verified token, never from a caller
+      // header. Fail closed on pre-v60 OAuth tokens that carry no binding;
+      // legacy bearer tokens are normalized to sourceId='default' by
+      // verifyAccessToken before they reach this handler.
+      const tokenSourceId = authInfo.sourceId;
+      const rawSourceHeader = req.headers['x-gbrain-source-id'];
+      const requestedSourceId = Array.isArray(rawSourceHeader)
+        ? rawSourceHeader.join(',')
+        : rawSourceHeader;
+      if (typeof tokenSourceId !== 'string' || tokenSourceId.length === 0) {
+        console.warn(`POST /ingest rejected unbound write token for client ${agentName}`);
+        res.status(403).json({
+          error: 'permission_denied',
+          message: 'POST /ingest requires an access token bound to one write source',
+        });
+        return;
+      }
+      if (requestedSourceId !== undefined && requestedSourceId !== tokenSourceId) {
+        console.warn(
+          `POST /ingest rejected source override for client ${agentName}: ` +
+          `requested_length=${requestedSourceId.length} bound=${JSON.stringify(tokenSourceId)}`,
+        );
+        res.status(403).json({
+          error: 'permission_denied',
+          message: 'X-Gbrain-Source-Id must exactly match the access token write source',
+        });
+        return;
+      }
+      const ingestQueueAuthorizationSecret = process.env[INGEST_QUEUE_AUTH_SECRET_ENV];
+      if (!ingestQueueAuthorizationSecret || ingestQueueAuthorizationSecret.length < 32) {
+        console.error(`POST /ingest unavailable: ${INGEST_QUEUE_AUTH_SECRET_ENV} is not configured`);
+        res.status(503).json({
+          error: 'ingest_unavailable',
+          message: 'Webhook ingestion is temporarily unavailable; retry later',
+        });
+        return;
+      }
+
       // v0.39.3.0 BUG-2: outer try/catch ensures any unexpected throw
       // returns a JSON envelope instead of leaking express's default HTML
       // error page. Mirrors the MCP handler's F14 pattern (serve-http.ts
@@ -2123,8 +2165,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const content = body.toString('utf8');
       const contentHash = computeContentHash(content);
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
-      const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
-      const callerSlug = req.header('x-gbrain-slug');
+      const sourceId = tokenSourceId;
+      const rawCallerSlug = req.header('x-gbrain-slug');
+      const callerSlug = rawCallerSlug && rawCallerSlug.length > 0
+        ? rawCallerSlug.toLowerCase()
+        : undefined;
+      if (callerSlug !== undefined) {
+        try {
+          validatePageSlug(callerSlug);
+        } catch {
+          res.status(400).json({
+            error: 'invalid_slug',
+            message: 'X-Gbrain-Slug must be a lowercase slash-separated page identifier',
+          });
+          return;
+        }
+      }
 
       const event: IngestionEvent = {
         source_id: sourceId,
@@ -2154,23 +2210,58 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       try {
+        const destinationHash = computeContentHash(callerSlug ?? '<generated-inbox-slug>');
+        const idempotencyKey =
+          `ingest:webhook:v2:${authInfo.clientId}:${sourceId}:${destinationHash}:${contentHash}`;
+        const sourceAuthorization = signIngestCaptureSourceAuthorization(
+          ingestQueueAuthorizationSecret,
+          {
+            version: 2,
+            transport: 'oauth',
+            client_id: authInfo.clientId,
+            source_id: sourceId,
+          },
+          { event, slug: callerSlug },
+        );
         const job = await ingestQueue.add(
           'ingest_capture',
           {
             event,
+            source_authorization: sourceAuthorization,
             ...(callerSlug ? { slug: callerSlug } : {}),
           },
           {
-            // Idempotency: same content from the same client within the
-            // queue's lifetime is a single job. Different content gets
-            // different jobs. Daemon-side dedup catches the 24h window;
-            // the queue-level idempotency catches simultaneous retries.
-            idempotency_key: `ingest:webhook:${authInfo.clientId}:${contentHash}`,
-            // Cap waiting jobs from a single client so a runaway integration
-            // can't fill the queue.
+            // Idempotency is scoped to client + authorized source + requested
+            // destination + content. The destination component prevents the
+            // same body sent to two explicit slugs from silently collapsing
+            // into the first page.
+            idempotency_key: idempotencyKey,
+            // This cap is global to (job name, queue), not per client. The
+            // returned row is verified below so coalescing can never masquerade
+            // as acceptance of a different client's payload.
             maxWaiting: 50,
           },
+          { allowProtectedSubmit: true },
         );
+
+        if (job.idempotency_key !== idempotencyKey) {
+          const latency = Date.now() - startTime;
+          try {
+            await executeRawJsonb(
+              engine,
+              `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
+               VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
+              [authInfo.clientId, agentName, 'webhook_ingest', latency, 'backpressure'],
+              [{ content_type: contentType, content_hash: contentHash, bytes: body.length }],
+            );
+          } catch { /* best effort */ }
+          res.setHeader('Retry-After', '10');
+          res.status(429).json({
+            error: 'ingest_queue_full',
+            message: 'Webhook ingestion queue is full; retry after 10 seconds',
+          });
+          return;
+        }
 
         const latency = Date.now() - startTime;
         try {

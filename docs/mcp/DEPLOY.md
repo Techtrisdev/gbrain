@@ -74,6 +74,16 @@ to the HTTP server, so no migration is required.
 gbrain serve --http --port 3131
 ```
 
+Deployments that use `POST /ingest` must also set
+`GBRAIN_INGEST_QUEUE_HMAC_SECRET` to a randomly generated value of at least 32
+characters. The HTTP route signs each queued page-write authorization with this
+secret and the worker verifies it before writing. Keep the value identical in
+the HTTP and worker processes, never commit it, and rotate it only after the
+ingestion queue is empty. If it is absent or too short, `/ingest` returns 503
+before enqueueing. A worker that is missing the secret fails safely without
+writing and retries under the normal queue policy; if those attempts are
+exhausted, configure the secret and retry the failed job manually.
+
 On first start, the server prints an **admin bootstrap token** to stderr:
 
 ```

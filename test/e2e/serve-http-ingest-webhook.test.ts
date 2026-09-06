@@ -19,8 +19,8 @@
  *   3. Content-type allowlist: image/png → 415 with paste-ready
  *      processor-skillpack hint
  *   4. Happy path: text/markdown → 200/202 with job_id in response
- *   5. Header overrides: X-Gbrain-Slug is forwarded; X-Gbrain-Source-Id
- *      tags the event
+ *   5. Header handling: X-Gbrain-Slug is forwarded; X-Gbrain-Source-Id
+ *      cannot override the OAuth client's bound write source
  *   6. Idempotency: same content + same client → job_id returned twice
  *      should match (queue dedup on (client_id, content_hash))
  *
@@ -42,14 +42,19 @@ if (skip) {
 
 const PORT = 19138; // Distinct from sibling E2Es to avoid collision
 const BASE = `http://localhost:${PORT}`;
+const TEST_AUTH_SECRET = 'test-http-ingest-queue-auth-secret-32-bytes';
+const AUTH_SECRET_ENV = 'GBRAIN_INGEST_QUEUE_HMAC_SECRET';
 
 describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
   let serverProcess: ReturnType<typeof import('child_process').spawn> | null = null;
   let clientId: string | undefined;
   let clientSecret: string | undefined;
+  let previousAuthSecret: string | undefined;
 
   beforeAll(async () => {
     const { execSync, spawn } = await import('child_process');
+    previousAuthSecret = process.env[AUTH_SECRET_ENV];
+    process.env[AUTH_SECRET_ENV] = TEST_AUTH_SECRET;
 
     // Register a confidential client with both read and write scopes.
     // The write scope is what POST /ingest gates on.
@@ -79,7 +84,7 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
       ],
       {
         cwd: process.cwd(),
-        env: process.env,
+        env: { ...process.env },
         stdio: ['ignore', 'pipe', 'pipe'],
       },
     );
@@ -127,6 +132,8 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
         console.error(`[afterAll] revoke-client cleanup failed: ${(e as Error).message}`);
       }
     }
+    if (previousAuthSecret === undefined) delete process.env[AUTH_SECRET_ENV];
+    else process.env[AUTH_SECRET_ENV] = previousAuthSecret;
   }, 30_000);
 
   // Helper — mint a token with a specific scope subset.
@@ -181,6 +188,68 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect(body).not.toMatch(/"job_id"\s*:\s*"?\d+/);
   });
 
+  test('missing or short queue-signing secret returns 503 before enqueueing', async () => {
+    const token = await mintToken('read write');
+    const { spawn } = await import('child_process');
+
+    for (const [offset, configuredSecret] of [[1, undefined], [2, 'too-short']] as const) {
+      const port = PORT + offset;
+      const base = `http://localhost:${port}`;
+      const env = { ...process.env };
+      if (configuredSecret === undefined) delete env[AUTH_SECRET_ENV];
+      else env[AUTH_SECRET_ENV] = configuredSecret;
+      const proc = spawn(
+        'bun',
+        ['run', 'src/cli.ts', 'serve', '--http', '--port', String(port), '--public-url', base],
+        { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stderr = '';
+      proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+      try {
+        let ready = false;
+        for (let i = 0; i < 40; i++) {
+          try {
+            const health = await fetch(`${base}/health`);
+            if (health.ok) {
+              ready = true;
+              break;
+            }
+          } catch { /* server is still starting */ }
+          await new Promise(r => setTimeout(r, 250));
+        }
+        if (!ready) throw new Error(`secret-config E2E server failed to start: ${stderr.slice(-500)}`);
+
+        const content = `# refused without valid queue secret ${offset}-${Date.now()}-${Math.random()}`;
+        const res = await fetch(`${base}/ingest`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/markdown' },
+          body: content,
+        });
+        expect(res.status).toBe(503);
+        const body = (await res.json()) as { error?: string; job_id?: number | string };
+        expect(body.error).toBe('ingest_unavailable');
+        expect(body.job_id).toBeUndefined();
+
+        const postgres = (await import('postgres')).default;
+        const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+        try {
+          const [row] = await sql<{ count: string }[]>`
+            SELECT count(*)::text AS count
+            FROM minion_jobs
+            WHERE data->'event'->>'content' = ${content}
+          `;
+          expect(row?.count).toBe('0');
+        } finally {
+          await sql.end();
+        }
+      } finally {
+        proc.kill('SIGTERM');
+        await new Promise(r => setTimeout(r, 250));
+        if (!proc.killed) proc.kill('SIGKILL');
+      }
+    }
+  }, 30_000);
+
   test('valid write-scope token accepts text/markdown → 200/202 with job_id', async () => {
     const token = await mintToken('read write');
     const res = await postIngest(
@@ -189,8 +258,30 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
       `# webhook happy path\n\nIngested at ${new Date().toISOString()}`,
     );
     expect([200, 202]).toContain(res.status);
-    const body = (await res.json()) as { job_id?: number | string; ok?: boolean };
+    const body = (await res.json()) as { job_id?: number | string; source_id?: string; ok?: boolean };
     expect(body.job_id).toBeDefined();
+    expect(body.source_id).toBe('default');
+
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const [job] = await sql`
+        SELECT data, idempotency_key
+        FROM minion_jobs
+        WHERE id = ${Number(body.job_id)}
+      `;
+      expect(job?.data?.source_authorization).toMatchObject({
+        version: 2,
+        transport: 'oauth',
+        client_id: clientId,
+        source_id: 'default',
+      });
+      expect(job?.data?.source_authorization?.signature).toMatch(/^[0-9a-f]{64}$/);
+      expect(job?.data?.event?.source_id).toBe('default');
+      expect(job?.idempotency_key).toMatch(/^ingest:webhook:v2:/);
+    } finally {
+      await sql.end();
+    }
   });
 
   // =========================================================================
@@ -332,15 +423,127 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     // test/ingestion/ingest-capture.test.ts).
   });
 
-  test('X-Gbrain-Source-Id header is accepted', async () => {
+  test('empty X-Gbrain-Slug is normalized to the generated destination before signing', async () => {
     const token = await mintToken('read write');
     const res = await postIngest(
       token,
       'text/markdown',
-      '# source-id header test',
-      { 'X-Gbrain-Source-Id': 'zapier-webhook' },
+      `# empty slug normalization ${Date.now()}-${Math.random()}`,
+      { 'X-Gbrain-Slug': '' },
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { job_id?: number | string };
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const [job] = await sql`SELECT data FROM minion_jobs WHERE id = ${Number(body.job_id)}`;
+      expect(job?.data?.slug).toBeUndefined();
+      expect(job?.data?.source_authorization?.signature).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test('uppercase X-Gbrain-Slug is normalized once before hashing, signing, and enqueueing', async () => {
+    const token = await mintToken('read write');
+    const res = await postIngest(
+      token,
+      'text/markdown',
+      `# uppercase slug normalization ${Date.now()}-${Math.random()}`,
+      { 'X-Gbrain-Slug': 'People/Upper' },
+    );
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { job_id?: number | string };
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const [job] = await sql`SELECT data FROM minion_jobs WHERE id = ${Number(body.job_id)}`;
+      expect(job?.data?.slug).toBe('people/upper');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test('malformed X-Gbrain-Slug values are rejected before queue insertion', async () => {
+    const token = await mintToken('read write');
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      for (const slug of ['../outside', '/leading-slash', 'people/has space', 'people\\backslash']) {
+        const content = `# invalid slug ${Date.now()}-${Math.random()}`;
+        const res = await postIngest(token, 'text/markdown', content, { 'X-Gbrain-Slug': slug });
+        expect(res.status).toBe(400);
+        const body = (await res.json()) as { error?: string; job_id?: number | string };
+        expect(body.error).toBe('invalid_slug');
+        expect(body.job_id).toBeUndefined();
+        const [row] = await sql<{ count: string }[]>`
+          SELECT count(*)::text AS count
+          FROM minion_jobs
+          WHERE data->'event'->>'content' = ${content}
+        `;
+        expect(row?.count).toBe('0');
+      }
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test('matching X-Gbrain-Source-Id header is accepted', async () => {
+    const token = await mintToken('read write');
+    const res = await postIngest(
+      token,
+      'text/markdown',
+      `# matching source-id header test ${Date.now()}`,
+      { 'X-Gbrain-Source-Id': 'default' },
     );
     expect([200, 202]).toContain(res.status);
+    const body = (await res.json()) as { job_id?: number | string; source_id?: string };
+    expect(body.job_id).toBeDefined();
+    expect(body.source_id).toBe('default');
+  });
+
+  test('mismatched X-Gbrain-Source-Id header is rejected before queue insertion', async () => {
+    const token = await mintToken('read write');
+    const rejectedContent = `# source-id escalation attempt ${Date.now()}-${Math.random()}`;
+    const res = await postIngest(
+      token,
+      'text/markdown',
+      rejectedContent,
+      { 'X-Gbrain-Source-Id': 'shared' },
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error?: string; job_id?: number | string };
+    expect(body.error).toBe('permission_denied');
+    expect(body.job_id).toBeUndefined();
+
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      const [row] = await sql<{ count: string }[]>`
+        SELECT count(*)::text AS count
+        FROM minion_jobs
+        WHERE data->'event'->>'content' = ${rejectedContent}
+      `;
+      expect(row?.count).toBe('0');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test('empty, oversized, and comma-combined source headers cannot change destination', async () => {
+    const token = await mintToken('read write');
+    for (const sourceHeader of ['', 'x'.repeat(300), 'default, shared']) {
+      const res = await postIngest(
+        token,
+        'text/markdown',
+        `# malformed source header ${sourceHeader.length}`,
+        { 'X-Gbrain-Source-Id': sourceHeader },
+      );
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { error?: string; job_id?: number | string };
+      expect(body.error).toBe('permission_denied');
+      expect(body.job_id).toBeUndefined();
+    }
   });
 
   test('X-Gbrain-Source-Uri header is accepted', async () => {
@@ -369,9 +572,27 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect([200, 202]).toContain(second.status);
     const secondBody = (await second.json()) as { job_id?: number | string };
 
-    // Queue idempotency_key: `ingest:webhook:${clientId}:${contentHash}` —
-    // same input, same key, MinionQueue.add returns the existing job.
+    // Queue idempotency key includes client, source, destination, and content;
+    // identical requests therefore return the existing job.
     expect(secondBody.job_id).toBe(firstBody.job_id!);
+  });
+
+  test('same content sent to two explicit slugs creates two jobs', async () => {
+    const token = await mintToken('read write');
+    const content = `# same body, distinct destinations ${Math.random()}`;
+    const first = await postIngest(token, 'text/markdown', content, {
+      'X-Gbrain-Slug': `inbox/destination-a-${Date.now()}`,
+    });
+    const second = await postIngest(token, 'text/markdown', content, {
+      'X-Gbrain-Slug': `inbox/destination-b-${Date.now()}`,
+    });
+    expect([200, 202]).toContain(first.status);
+    expect([200, 202]).toContain(second.status);
+    const firstBody = (await first.json()) as { job_id?: number | string };
+    const secondBody = (await second.json()) as { job_id?: number | string };
+    expect(firstBody.job_id).toBeDefined();
+    expect(secondBody.job_id).toBeDefined();
+    expect(secondBody.job_id).not.toBe(firstBody.job_id);
   });
 
   test('different content from same client → different job_id', async () => {
@@ -391,5 +612,42 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect(firstBody.job_id).toBeDefined();
     expect(secondBody.job_id).toBeDefined();
     expect(secondBody.job_id).not.toBe(firstBody.job_id);
+  });
+
+  test('full global ingestion queue returns retryable backpressure, never a false 202', async () => {
+    const token = await mintToken('read write');
+    const prefix = `e2e-ingest-cap-${Date.now()}-${Math.random()}`;
+    const attemptedContent = `# must not be falsely accepted ${prefix}`;
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.DATABASE_URL!, { max: 1 });
+    try {
+      await sql`
+        INSERT INTO minion_jobs (name, queue, status, data, idempotency_key)
+        SELECT
+          'ingest_capture',
+          'default',
+          'waiting',
+          '{}'::jsonb,
+          ${prefix} || ':' || n::text
+        FROM generate_series(1, 50) AS n
+      `;
+
+      const res = await postIngest(token, 'text/markdown', attemptedContent);
+      expect(res.status).toBe(429);
+      expect(res.headers.get('retry-after')).toBe('10');
+      const body = (await res.json()) as { error?: string; job_id?: number | string };
+      expect(body.error).toBe('ingest_queue_full');
+      expect(body.job_id).toBeUndefined();
+
+      const [row] = await sql<{ count: string }[]>`
+        SELECT count(*)::text AS count
+        FROM minion_jobs
+        WHERE data->'event'->>'content' = ${attemptedContent}
+      `;
+      expect(row?.count).toBe('0');
+    } finally {
+      await sql`DELETE FROM minion_jobs WHERE idempotency_key LIKE ${prefix + ':%'}`;
+      await sql.end();
+    }
   });
 });
