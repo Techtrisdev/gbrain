@@ -27,17 +27,35 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { IngestionDaemon } from '../../src/core/ingestion/daemon.ts';
 import { createInboxFolderSource } from '../../src/core/ingestion/sources/inbox-folder.ts';
-import { makeIngestCaptureHandler } from '../../src/core/minions/handlers/ingest-capture.ts';
+import {
+  makeIngestCaptureHandler,
+  signIngestCaptureSourceAuthorization,
+} from '../../src/core/minions/handlers/ingest-capture.ts';
 import type { IngestionEvent } from '../../src/core/ingestion/types.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
+
+const TEST_AUTH_SECRET = 'test-ingest-roundtrip-auth-secret-32-bytes';
 
 // Fake job-context constructor so we can drive the handler directly
 // from the dispatcher without spinning up a Minion worker.
 function makeFakeJobCtx(data: Record<string, unknown>): MinionJobContext {
+  const event = data.event as IngestionEvent;
   return {
     id: Math.floor(Math.random() * 1_000_000),
     name: 'ingest_capture',
-    data,
+    data: {
+      ...data,
+      source_authorization: signIngestCaptureSourceAuthorization(
+        TEST_AUTH_SECRET,
+        {
+          version: 2,
+          transport: 'daemon',
+          producer_id: event.source_kind,
+          source_id: event.source_id,
+        },
+        { event, slug: data.slug, noEmbed: data.noEmbed },
+      ),
+    },
     attempts_made: 1,
     signal: new AbortController().signal,
     shutdownSignal: new AbortController().signal,
@@ -66,6 +84,11 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name)
+     VALUES ('inbox-folder', 'inbox-folder'), ('inbox-a', 'inbox-a'), ('inbox-b', 'inbox-b')
+     ON CONFLICT DO NOTHING`,
+  );
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-e2e-roundtrip-'));
   inboxDir = path.join(tmpRoot, 'inbox');
   brainDir = path.join(tmpRoot, 'brain');
@@ -101,7 +124,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
 describe('ingestion roundtrip — inbox-folder → daemon → ingest_capture → DB', () => {
   test('full pipeline: file drop → page in DB', async () => {
     const { logger } = captureLogger();
-    const handler = makeIngestCaptureHandler(engine);
+    const handler = makeIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
     const dispatchedEvents: IngestionEvent[] = [];
 
     const daemon = new IngestionDaemon({
@@ -155,7 +178,7 @@ describe('ingestion roundtrip — inbox-folder → daemon → ingest_capture →
 
   test('repeat drop of same content dedups silently', async () => {
     const { logger } = captureLogger();
-    const handler = makeIngestCaptureHandler(engine);
+    const handler = makeIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
     const dispatchedEvents: IngestionEvent[] = [];
 
     const daemon = new IngestionDaemon({
@@ -204,7 +227,7 @@ describe('ingestion roundtrip — inbox-folder → daemon → ingest_capture →
 describe('ingestion roundtrip — multi-source coordination', () => {
   test('two sources see different content; daemon ingests both', async () => {
     const { logger } = captureLogger();
-    const handler = makeIngestCaptureHandler(engine);
+    const handler = makeIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
     const dispatchedEvents: IngestionEvent[] = [];
 
     const daemon = new IngestionDaemon({

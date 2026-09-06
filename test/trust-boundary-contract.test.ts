@@ -60,6 +60,16 @@ describe('F7b — trust-boundary contract fail-closed semantics', () => {
     ).rejects.toMatchObject({ code: 'permission_denied' });
   });
 
+  test('remote callers cannot bypass source binding by submitting ingest_capture directly', async () => {
+    const ctx = { ...castUndefinedRemoteCtx(), remote: true } as OperationContext;
+    await expect(
+      submit_job.handler(ctx, {
+        name: 'ingest_capture',
+        data: { event: { source_id: 'shared' } },
+      }),
+    ).rejects.toMatchObject({ code: 'permission_denied' });
+  });
+
   test('protected job submission ALLOWED only when remote is strictly false', async () => {
     const ctx = { ...castUndefinedRemoteCtx(), remote: false } as OperationContext;
     // The handler now passes the protected-name guard and continues into the

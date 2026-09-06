@@ -9,15 +9,18 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import {
   defaultSlugForEvent,
-  makeIngestCaptureHandler,
+  makeIngestCaptureHandler as makeRawIngestCaptureHandler,
+  signIngestCaptureSourceAuthorization,
 } from '../../src/core/minions/handlers/ingest-capture.ts';
 import {
   computeContentHash,
   type IngestionEvent,
 } from '../../src/core/ingestion/types.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
+import { UnrecoverableError } from '../../src/core/minions/types.ts';
 
 let engine: PGLiteEngine;
+const TEST_AUTH_SECRET = 'test-ingest-queue-auth-secret-32-bytes-minimum';
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -31,6 +34,9 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name) VALUES ('webhook-test', 'webhook-test') ON CONFLICT DO NOTHING`,
+  );
 });
 
 function makeEvent(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
@@ -48,10 +54,26 @@ function makeEvent(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
 }
 
 function makeJob(data: Record<string, unknown>): MinionJobContext {
+  const event = data.event as IngestionEvent | undefined;
+  const jobData = event && !Object.prototype.hasOwnProperty.call(data, 'source_authorization')
+    ? {
+        ...data,
+        source_authorization: signIngestCaptureSourceAuthorization(
+          TEST_AUTH_SECRET,
+          {
+            version: 2,
+            transport: 'daemon',
+            producer_id: event.source_kind,
+            source_id: event.source_id,
+          },
+          { event, slug: data.slug, noEmbed: data.noEmbed },
+        ),
+      }
+    : data;
   return {
     id: 1,
     name: 'ingest_capture',
-    data,
+    data: jobData,
     attempts_made: 1,
     signal: new AbortController().signal,
     shutdownSignal: new AbortController().signal,
@@ -61,6 +83,10 @@ function makeJob(data: Record<string, unknown>): MinionJobContext {
     isActive: async () => true,
     readInbox: async () => [],
   };
+}
+
+function makeIngestCaptureHandler(_engine: PGLiteEngine) {
+  return makeRawIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
 }
 
 describe('defaultSlugForEvent', () => {
@@ -110,13 +136,24 @@ describe('ingest_capture handler — slug resolution', () => {
 describe('ingest_capture handler — validation + routing', () => {
   test('throws when event missing', async () => {
     const handler = makeIngestCaptureHandler(engine);
-    await expect(handler(makeJob({}))).rejects.toThrow(/job.data.event is required/);
+    await expect(handler(makeJob({}))).rejects.toBeInstanceOf(UnrecoverableError);
   });
 
   test('throws on invalid event payload (caught at the handler boundary)', async () => {
     const handler = makeIngestCaptureHandler(engine);
     const ev = { ...makeEvent(), content_hash: 'short' };
-    await expect(handler(makeJob({ event: ev }))).rejects.toThrow(/invalid event payload/);
+    await expect(handler(makeJob({ event: ev }))).rejects.toBeInstanceOf(UnrecoverableError);
+  });
+
+  test('missing worker authorization secret fails retryably and writes nothing', async () => {
+    const handler = makeRawIngestCaptureHandler(engine, { authorizationSecret: '' });
+    const ev = makeEvent({ content: 'must not write without verifier secret' });
+    const slug = 'inbox/missing-verifier-secret';
+
+    await expect(handler(makeJob({ event: ev, slug }))).rejects.toThrow(
+      /GBRAIN_INGEST_QUEUE_HMAC_SECRET is not configured/,
+    );
+    expect(await engine.getPage(slug, { sourceId: 'webhook-test' })).toBeNull();
   });
 
   test('rejects binary content_type with helpful message', async () => {
@@ -156,6 +193,182 @@ describe('ingest_capture handler — validation + routing', () => {
     expect(result.source_kind).toBe('inbox-folder');
     expect(result.source_uri).toBe('/Users/test/.gbrain/inbox/note.md');
   });
+
+  test('rejects a pre-fix OAuth webhook job without server source authorization', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: 'legacy public webhook job',
+      metadata: { client_id: 'gbrain_cl_legacy' },
+    });
+
+    await expect(handler(makeJob({ event: ev, source_authorization: null }))).rejects.toThrow(
+      /missing signed source authorization/i,
+    );
+  });
+
+  test('rejects a pre-fix webhook with a caller-chosen URI and no signed authorization', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: 'legacy custom-uri public webhook job',
+      source_uri: 'https://example.invalid/attacker-chosen',
+      metadata: { client_id: 'gbrain_cl_legacy' },
+      untrusted_payload: true,
+    });
+
+    await expect(handler(makeJob({ event: ev, source_authorization: null }))).rejects.toThrow(
+      /missing signed source authorization/i,
+    );
+  });
+
+  test('rejects an OAuth webhook job whose authorization contradicts the event source', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: 'contradictory public webhook job',
+      metadata: { client_id: 'gbrain_cl_client_x' },
+    });
+
+    const source_authorization = signIngestCaptureSourceAuthorization(
+      TEST_AUTH_SECRET,
+      {
+        version: 2,
+        transport: 'oauth',
+        client_id: 'gbrain_cl_client_x',
+        source_id: 'shared',
+      },
+      { event: ev },
+    );
+    await expect(handler(makeJob({ event: ev, source_authorization }))).rejects.toThrow(
+      /authorized source 'shared'.*event source 'webhook-test'/i,
+    );
+  });
+
+  test('rejects malformed OAuth webhook source authorization', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: 'malformed public webhook job',
+      metadata: { client_id: 'gbrain_cl_client_x' },
+    });
+    const malformed = [
+      { version: 1, transport: 'oauth', client_id: 'gbrain_cl_client_x', source_id: 'webhook-test' },
+      { version: 2, transport: 'header', client_id: 'gbrain_cl_client_x', source_id: 'webhook-test' },
+      { version: 2, transport: 'oauth', client_id: '', source_id: 'webhook-test', signature: 'a'.repeat(64) },
+      { version: 2, transport: 'oauth', client_id: 'gbrain_cl_client_x', source_id: '', signature: 'a'.repeat(64) },
+    ];
+
+    for (const source_authorization of malformed) {
+      await expect(handler(makeJob({ event: ev, source_authorization }))).rejects.toThrow(
+        /invalid signed source authorization/i,
+      );
+    }
+  });
+
+  test('rejects a forged source authorization signature', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: 'forged signature attempt' });
+    const valid = signIngestCaptureSourceAuthorization(
+      TEST_AUTH_SECRET,
+      {
+        version: 2,
+        transport: 'daemon',
+        producer_id: ev.source_kind,
+        source_id: ev.source_id,
+      },
+      { event: ev },
+    );
+
+    await expect(handler(makeJob({
+      event: ev,
+      source_authorization: { ...valid, signature: '0'.repeat(64) },
+    }))).rejects.toThrow(/invalid source authorization signature/i);
+  });
+
+  test('rejects signed metadata whose content hash does not match its content', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: 'actual body',
+      content_hash: computeContentHash('different body'),
+    });
+
+    await expect(handler(makeJob({ event: ev }))).rejects.toThrow(
+      /content hash does not match signed event content/i,
+    );
+  });
+
+  test('rejects a destination changed through event metadata after signing', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const signedEvent = makeEvent({
+      content: 'metadata destination integrity',
+      metadata: { slug: 'inbox/original' },
+    });
+    const source_authorization = signIngestCaptureSourceAuthorization(
+      TEST_AUTH_SECRET,
+      {
+        version: 2,
+        transport: 'daemon',
+        producer_id: signedEvent.source_kind,
+        source_id: signedEvent.source_id,
+      },
+      { event: signedEvent },
+    );
+    const changedEvent = {
+      ...signedEvent,
+      metadata: { slug: 'inbox/changed-after-signing' },
+    };
+
+    await expect(handler(makeJob({ event: changedEvent, source_authorization }))).rejects.toThrow(
+      /invalid source authorization signature/i,
+    );
+  });
+
+  test('normalizes an empty explicit slug to the same signed default destination', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: 'empty slug normalization' });
+    const source_authorization = signIngestCaptureSourceAuthorization(
+      TEST_AUTH_SECRET,
+      {
+        version: 2,
+        transport: 'daemon',
+        producer_id: ev.source_kind,
+        source_id: ev.source_id,
+      },
+      { event: ev, slug: '' },
+    );
+
+    const result = await handler(makeJob({ event: ev, source_authorization }));
+    expect(result.status).toBe('imported');
+    expect(result.slug).toMatch(/^inbox\//);
+  });
+
+  test('normalizes an empty metadata slug to the same signed default destination', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: 'empty metadata slug normalization',
+      metadata: { slug: '' },
+    });
+
+    const result = await handler(makeJob({ event: ev }));
+    expect(result.status).toBe('imported');
+    expect(result.slug).toMatch(/^inbox\//);
+  });
+
+  test('uses the same lowercase destination for signing and processing', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: 'uppercase destination normalization' });
+
+    const result = await handler(makeJob({ event: ev, slug: 'Wiki/Upper-Page' }));
+    expect(result.status).toBe('imported');
+    expect(result.slug).toBe('wiki/upper-page');
+    expect(await engine.getPage('wiki/upper-page', { sourceId: 'webhook-test' })).not.toBeNull();
+  });
+
+  test('rejects a signed queued job with a malformed destination slug as unrecoverable', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: 'malformed destination' });
+
+    await expect(handler(makeJob({ event: ev, slug: '../outside' }))).rejects.toBeInstanceOf(
+      UnrecoverableError,
+    );
+  });
 });
 
 describe('ingest_capture handler — integration with importFromContent', () => {
@@ -188,5 +401,47 @@ describe('ingest_capture handler — integration with importFromContent', () => 
     const ev = makeEvent({ content: longContent });
     const result = await handler(makeJob({ event: ev, slug: 'wiki/long' }));
     expect(result.chunks).toBeGreaterThan(0);
+  });
+
+  test('OAuth webhook page and chunks land only in the server-authorized source', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const slug = 'wiki/source-bound';
+    await engine.putPage(slug, {
+      type: 'note',
+      title: 'Default sentinel',
+      compiled_truth: 'default source must remain unchanged',
+      timeline: '',
+      frontmatter: {},
+      content_hash: 'default-sentinel',
+    }, { sourceId: 'default' });
+    const ev = makeEvent({
+      content: '# source-bound content\n\nThis must stay in webhook-test.',
+      metadata: { client_id: 'gbrain_cl_client_x' },
+      untrusted_payload: true,
+    });
+
+    const source_authorization = signIngestCaptureSourceAuthorization(
+      TEST_AUTH_SECRET,
+      {
+        version: 2,
+        transport: 'oauth',
+        client_id: 'gbrain_cl_client_x',
+        source_id: 'webhook-test',
+      },
+      { event: ev, slug },
+    );
+
+    const result = await handler(makeJob({
+      event: ev,
+      slug,
+      source_authorization,
+    }));
+
+    expect(result.status).toBe('imported');
+    expect(await engine.getPage(slug, { sourceId: 'webhook-test' })).not.toBeNull();
+    expect(await engine.getChunks(slug, { sourceId: 'webhook-test' })).not.toHaveLength(0);
+    expect((await engine.getPage(slug, { sourceId: 'default' }))?.compiled_truth).toBe(
+      'default source must remain unchanged',
+    );
   });
 });

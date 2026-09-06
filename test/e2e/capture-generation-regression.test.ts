@@ -25,10 +25,15 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
-import { makeIngestCaptureHandler } from '../../src/core/minions/handlers/ingest-capture.ts';
+import {
+  makeIngestCaptureHandler,
+  signIngestCaptureSourceAuthorization,
+} from '../../src/core/minions/handlers/ingest-capture.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
 import type { IngestionEvent } from '../../src/core/ingestion/types.ts';
 import { createHash } from 'node:crypto';
+
+const TEST_AUTH_SECRET = 'test-capture-generation-auth-secret-32-bytes';
 
 function sha256Hex(content: string): string {
   return createHash('sha256').update(content).digest('hex');
@@ -51,8 +56,21 @@ function buildEvent(content: string, sourceUri: string): IngestionEvent {
  * `job.data`; other fields can be undefined/no-op for this test.
  */
 function buildJobCtx(data: Record<string, unknown>): MinionJobContext {
+  const event = data.event as IngestionEvent;
   return {
-    data,
+    data: {
+      ...data,
+      source_authorization: signIngestCaptureSourceAuthorization(
+        TEST_AUTH_SECRET,
+        {
+          version: 2,
+          transport: 'daemon',
+          producer_id: event.source_kind,
+          source_id: event.source_id,
+        },
+        { event, slug: data.slug, noEmbed: data.noEmbed },
+      ),
+    },
     job: { id: 1, name: 'ingest_capture', status: 'active' } as never,
     signal: new AbortController().signal,
     shutdownSignal: new AbortController().signal,
@@ -77,6 +95,9 @@ describe('capture-generation regression (D3 + codex #5)', () => {
 
   beforeEach(async () => {
     await resetPgliteState(engine);
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('test-src', 'test-src') ON CONFLICT DO NOTHING`,
+    );
   });
 
   async function readGeneration(slug: string): Promise<number | null> {
@@ -107,7 +128,7 @@ describe('capture-generation regression (D3 + codex #5)', () => {
     expect(baselineMax).toBeGreaterThan(0);
 
     // Capture creates a NEW page via ingest_capture (INSERT path).
-    const handler = makeIngestCaptureHandler(engine);
+    const handler = makeIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
     const event = buildEvent('# A new captured note\n\nbody.', 'mcp://capture/test-1');
     const newSlug = 'test/capture-new';
     const ctx = buildJobCtx({ event, slug: newSlug, noEmbed: true });
@@ -128,7 +149,7 @@ describe('capture-generation regression (D3 + codex #5)', () => {
 
   test('UPDATE path: ingest_capture on existing slug + new content bumps generation', async () => {
     // Seed via ingest_capture (initial INSERT).
-    const handler = makeIngestCaptureHandler(engine);
+    const handler = makeIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
     const v1Event = buildEvent('# Captured v1\n\noriginal body.', 'mcp://capture/u1');
     const slug = 'test/capture-update';
     await handler(buildJobCtx({ event: v1Event, slug, noEmbed: true }));
@@ -149,7 +170,7 @@ describe('capture-generation regression (D3 + codex #5)', () => {
   test('idempotent UPDATE: capture with same content does NOT bump generation', async () => {
     // Same-content re-capture should be a no-op (trigger short-circuits
     // on IS DISTINCT FROM). This protects cache freshness on re-runs.
-    const handler = makeIngestCaptureHandler(engine);
+    const handler = makeIngestCaptureHandler(engine, { authorizationSecret: TEST_AUTH_SECRET });
     const event = buildEvent('# Same content', 'mcp://capture/idem');
     const slug = 'test/capture-idem';
 

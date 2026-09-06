@@ -37,6 +37,11 @@ export const PROTECTED_JOB_NAMES: ReadonlySet<string> = new Set([
   // budget. Only trusted local callers (the mode-switch hook in
   // commands/config.ts, reindex sweep, doctor --remediate) can submit.
   'contextual_reindex_per_chunk',
+  // OAuth POST /ingest is the only remote submission path. It validates the
+  // token-bound source, stamps a server authorization record, and opts in to
+  // trusted submission explicitly. Generic remote submit_job must not bypass
+  // that boundary by queueing this page-writing handler directly.
+  'ingest_capture',
 ]);
 
 /** Check a job name against the protected set. Normalizes whitespace first. */
