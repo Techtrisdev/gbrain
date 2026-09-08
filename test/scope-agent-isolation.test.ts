@@ -2,7 +2,8 @@ import { describe, it, expect } from 'bun:test';
 import { hasScope, ALLOWED_SCOPES, ALLOWED_SCOPES_LIST } from '../src/core/scope.ts';
 
 /**
- * v0.38 D13 regression guard — `agent` is a SIBLING of admin, NOT implied.
+ * v0.38 D13 regression guard — dedicated capabilities are SIBLINGS of admin,
+ * not implied by it.
  *
  * The bug class this prevents:
  *
@@ -35,6 +36,7 @@ describe('v0.38 D13 — agent scope isolation (regression guard)', () => {
     // admin OAuth client would silently acquire submit_agent dispatch on
     // upgrade — security regression.
     expect(hasScope(['admin'], 'agent')).toBe(false);
+    expect(hasScope(['admin'], 'context_mirror_recovery')).toBe(false);
   });
 
   it('admin implies its siblings (the v0.31 contract still holds)', () => {
@@ -56,6 +58,16 @@ describe('v0.38 D13 — agent scope isolation (regression guard)', () => {
     expect(hasScope(['agent'], 'admin')).toBe(false);
     expect(hasScope(['agent'], 'sources_admin')).toBe(false);
     expect(hasScope(['agent'], 'users_admin')).toBe(false);
+    expect(hasScope(['agent'], 'context_mirror_recovery')).toBe(false);
+  });
+
+  it('context_mirror_recovery is self-contained and cannot administer other surfaces', () => {
+    expect(ALLOWED_SCOPES.has('context_mirror_recovery' as any)).toBe(true);
+    expect(hasScope(['context_mirror_recovery'], 'context_mirror_recovery')).toBe(true);
+    expect(hasScope(['context_mirror_recovery'], 'read')).toBe(false);
+    expect(hasScope(['context_mirror_recovery'], 'write')).toBe(false);
+    expect(hasScope(['context_mirror_recovery'], 'admin')).toBe(false);
+    expect(hasScope(['context_mirror_recovery'], 'sources_admin')).toBe(false);
   });
 
   it('agent satisfies a required agent scope (self-implies)', () => {

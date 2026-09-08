@@ -1,7 +1,7 @@
 /**
  * gbrain OAuth scope hierarchy + allowlist (v0.28).
  *
- * Single source of truth for the 5 scope strings. Used by:
+ * Single source of truth for the 7 scope strings. Used by:
  *  - src/commands/serve-http.ts (scopesSupported, request-time hasScope)
  *  - src/core/oauth-provider.ts (F3 refresh, token issuance, registration)
  *  - src/commands/auth.ts (CLI register-client validation)
@@ -10,7 +10,7 @@
  *
  * Hierarchy (see plan ASCII diagram):
  *
- *                    admin
+ *                    admin                  agent / context_mirror_recovery
  *                      │
  *      ┌──────────┬────┴────┬──────────┐
  *      ▼          ▼         ▼          ▼
@@ -22,7 +22,7 @@
  * vs user-account-mgmt — neither implies the other).
  */
 
-export type Scope = 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin' | 'agent';
+export type Scope = 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin' | 'agent' | 'context_mirror_recovery';
 
 export const ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'read',
@@ -31,6 +31,7 @@ export const ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
   'sources_admin',
   'users_admin',
   'agent',
+  'context_mirror_recovery',
 ]);
 
 /**
@@ -40,6 +41,7 @@ export const ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>([
 export const ALLOWED_SCOPES_LIST: ReadonlyArray<Scope> = Object.freeze([
   'admin',
   'agent',
+  'context_mirror_recovery',
   'read',
   'sources_admin',
   'users_admin',
@@ -47,14 +49,29 @@ export const ALLOWED_SCOPES_LIST: ReadonlyArray<Scope> = Object.freeze([
 ]);
 
 /**
+ * Public Dynamic Client Registration is intentionally narrower than operator
+ * registration. A DCR request arrives without an authenticated operator, so
+ * it can create only ordinary client capabilities. Administrative, agent, and
+ * recovery capabilities must be issued through the authenticated admin route
+ * or the local operator CLI.
+ */
+export const DCR_ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['read', 'write']);
+
+/**
  * Hierarchy table: which required scopes are implied by which granted scope.
- * `admin` implies all (escape hatch for legacy + super-admin tokens).
+ * `admin` implies the general management scopes. `agent` and
+ * `context_mirror_recovery` are separate least-privilege scopes: an existing
+ * super-admin client must be explicitly re-registered to receive either.
  * `write` implies `read`. The two `*_admin` siblings only imply themselves.
  *
  * v0.38 (D13): `agent` is a SIBLING, not implied by admin. A super-admin
  * token still needs to be re-registered with explicit bindings to submit
  * subagent jobs. This prevents existing admin clients from silently gaining
  * agent-dispatch capability on upgrade.
+ *
+ * Context Mirror recovery uses the same rule. Its narrowly-issued temporary
+ * credential can operate only in its authenticated source, while an ordinary
+ * admin credential cannot silently acquire backlog-recovery authority.
  */
 const IMPLIES: Record<Scope, ReadonlySet<Scope>> = {
   admin: new Set(['admin', 'sources_admin', 'users_admin', 'write', 'read']),
@@ -63,11 +80,13 @@ const IMPLIES: Record<Scope, ReadonlySet<Scope>> = {
   users_admin: new Set(['users_admin']),
   read: new Set(['read']),
   agent: new Set(['agent']),
+  context_mirror_recovery: new Set(['context_mirror_recovery']),
 };
 
 /**
  * Does the granted scope set include something that satisfies `required`?
- * - admin in granted → true for any required
+ * - admin in granted → true for general management scopes, but not agent or
+ *   context_mirror_recovery
  * - write in granted → true for {write, read}
  * - sources_admin in granted → true for {sources_admin}
  * - users_admin in granted → true for {users_admin}
@@ -110,7 +129,8 @@ export function resolveRequiredScope(op: { scope?: string; readScopeCallable?: b
 
 /**
  * Validate that every scope in the input is allowed. Throws on the first
- * unknown scope. Used at OAuth client registration time (CLI, DCR, manual).
+ * unknown scope. Used at OAuth client registration time; public DCR then
+ * applies the stricter `assertDcrAllowedScopes` policy below.
  */
 export class InvalidScopeError extends Error {
   constructor(public readonly invalidScope: string, public readonly allScopes: readonly string[]) {
@@ -121,9 +141,75 @@ export class InvalidScopeError extends Error {
   }
 }
 
+export class DcrScopeNotAllowedError extends Error {
+  constructor(public readonly deniedScope: string) {
+    super(
+      `Scope "${deniedScope}" is not available through public client registration. ` +
+      `Allowed: ${[...DCR_ALLOWED_SCOPES].join(', ')}.`,
+    );
+    this.name = 'DcrScopeNotAllowedError';
+  }
+}
+
+/**
+ * The Context Mirror recovery capability is deliberately non-composable. A
+ * recovery credential must not silently inherit ordinary read, write, or
+ * administrative access merely because an operator selected two checkboxes.
+ */
+export class RecoveryScopeCombinationError extends Error {
+  constructor(public readonly scopes: readonly string[]) {
+    super('context_mirror_recovery must be the only requested scope.');
+    this.name = 'RecoveryScopeCombinationError';
+  }
+}
+
+export class RecoverySourceRequiredError extends Error {
+  constructor() {
+    super('context_mirror_recovery requires an explicit source ID.');
+    this.name = 'RecoverySourceRequiredError';
+  }
+}
+
+export class RecoveryFederationError extends Error {
+  constructor() {
+    super('context_mirror_recovery may read only its own source.');
+    this.name = 'RecoveryFederationError';
+  }
+}
+
 export function assertAllowedScopes(scopes: readonly string[]): void {
   for (const s of scopes) {
     if (!isScope(s)) throw new InvalidScopeError(s, scopes);
+  }
+}
+
+/** Reject a recovery credential combined with any other capability. */
+export function assertRecoveryScopeExclusive(scopes: readonly string[]): void {
+  if (scopes.includes('context_mirror_recovery') && scopes.length !== 1) {
+    throw new RecoveryScopeCombinationError(scopes);
+  }
+}
+
+/** Enforce that recovery work is bound to one explicitly chosen source. */
+export function assertRecoverySourceBound(
+  scopes: readonly string[],
+  sourceId: string | undefined,
+  federatedRead: readonly string[] | undefined,
+): void {
+  if (!scopes.includes('context_mirror_recovery')) return;
+  if (sourceId === undefined) throw new RecoverySourceRequiredError();
+  if (federatedRead !== undefined && (federatedRead.length !== 1 || federatedRead[0] !== sourceId)) {
+    throw new RecoveryFederationError();
+  }
+}
+
+/** Reject an otherwise-valid scope that a public DCR caller must not self-issue. */
+export function assertDcrAllowedScopes(scopes: readonly string[]): void {
+  assertAllowedScopes(scopes);
+  for (const scope of scopes) {
+    if (!DCR_ALLOWED_SCOPES.has(scope as Scope)) {
+      throw new DcrScopeNotAllowedError(scope);
+    }
   }
 }
 

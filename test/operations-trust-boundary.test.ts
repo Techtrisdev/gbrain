@@ -85,6 +85,7 @@ describe('operations contract — every op has scope + correct mutability shape'
       'sources_admin',
       'users_admin',
       'agent',
+      'context_mirror_recovery',
     ]);
     for (const op of operations) {
       if (op.mutating === true) {
@@ -104,6 +105,7 @@ describe('operations contract — every op has scope + correct mutability shape'
       'sources_admin',
       'users_admin',
       'agent',
+      'context_mirror_recovery',
     ]);
     for (const op of operations) {
       expect(

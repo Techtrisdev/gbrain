@@ -24,6 +24,7 @@ import { loadConfig, toEngineConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { sqlQueryForEngine, executeRawJsonb, type SqlQuery } from '../core/sql-query.ts';
+import { parseScopeString } from '../core/scope.ts';
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -344,7 +345,7 @@ async function registerClient(name: string, args: string[]) {
   // v0.34.1 (#861, D2): --source flag scopes the OAuth client to a single
   // source. Defaults to 'default' to match migration v60's backfill so
   // operators upgrading without changing flags see no behavior change.
-  const sourceId = sourceIdx >= 0 && args[sourceIdx + 1] ? args[sourceIdx + 1] : 'default';
+  const sourceId = sourceIdx >= 0 && args[sourceIdx + 1] ? args[sourceIdx + 1] : undefined;
   // v0.34.1 (#876): --federated-read accepts a comma-separated source list
   // for federated read scope. When omitted, federated_read defaults to
   // [sourceId] (read scope == write scope, the v0.33 default).
@@ -354,18 +355,29 @@ async function registerClient(name: string, args: string[]) {
 
   try {
     await withConfiguredSql(async (sql) => {
+      const isRecoveryRegistration = parseScopeString(scopes).includes('context_mirror_recovery');
+      if (isRecoveryRegistration) {
+        if (!sourceId) {
+          throw new Error('context_mirror_recovery requires --source <source-id>.');
+        }
+        const source = await sql`SELECT id FROM sources WHERE id = ${sourceId} AND archived = false`;
+        if (!source[0]) {
+          throw new Error(`Unknown or archived source: ${sourceId}`);
+        }
+      }
       const { GBrainOAuthProvider } = await import('../core/oauth-provider.ts');
       const provider = new GBrainOAuthProvider({ sql });
       const { clientId, clientSecret } = await provider.registerClientManual(
         name, grantTypes, scopes, [], sourceId, federatedRead,
       );
-      const effectiveFederated = federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId];
+      const effectiveSourceId = sourceId ?? 'default';
+      const effectiveFederated = federatedRead && federatedRead.length > 0 ? federatedRead : [effectiveSourceId];
       console.log(`OAuth client registered: "${name}"\n`);
       console.log(`  Client ID:        ${clientId}`);
       console.log(`  Client Secret:    ${clientSecret}\n`);
       console.log(`  Grant types:      ${grantTypes.join(', ')}`);
       console.log(`  Scopes:           ${scopes}`);
-      console.log(`  Write source:     ${sourceId}`);
+      console.log(`  Write source:     ${effectiveSourceId}`);
       console.log(`  Federated reads:  ${effectiveFederated.join(', ')}\n`);
       console.log('Save the client secret — it will not be shown again.');
       console.log(`Revoke with: gbrain auth revoke-client "${clientId}"`);

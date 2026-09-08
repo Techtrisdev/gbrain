@@ -256,6 +256,7 @@ function RegisterModal({ onClose, onRegistered }: {
   const [scopes, setScopes] = useState<Record<Scope, boolean>>(() =>
     Object.fromEntries(ALLOWED_SCOPES_LIST.map(s => [s, s === 'read'])) as Record<Scope, boolean>,
   );
+  const [sourceId, setSourceId] = useState('');
   const [ttl, setTtl] = useState('86400'); // 24h default
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -272,6 +273,10 @@ function RegisterModal({ onClose, onRegistered }: {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) { setError('Name required'); return; }
+    if (scopes.context_mirror_recovery && !sourceId.trim()) {
+      setError('A recovery credential needs its source ID.');
+      return;
+    }
     setLoading(true);
     setError('');
     try {
@@ -281,7 +286,14 @@ function RegisterModal({ onClose, onRegistered }: {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name.trim(), scopes: selectedScopes, tokenTtl: ttl === '0' ? 315360000 : Number(ttl) }),
+        body: JSON.stringify({
+          name: name.trim(),
+          scopes: selectedScopes,
+          tokenTtl: ttl === '0' ? 315360000 : Number(ttl),
+          ...(scopes.context_mirror_recovery
+            ? { sourceId: sourceId.trim(), federatedRead: [sourceId.trim()] }
+            : {}),
+        }),
       });
       if (!res.ok) throw new Error('Registration failed');
       const data = await res.json();
@@ -306,12 +318,32 @@ function RegisterModal({ onClose, onRegistered }: {
           <div className="checkbox-group">
             {ALLOWED_SCOPES_LIST.map(s => (
               <label key={s} className="checkbox-label">
-                <input type="checkbox" checked={scopes[s]} onChange={e => setScopes(p => ({ ...p, [s]: e.target.checked }))} />
+                <input
+                  type="checkbox"
+                  checked={scopes[s]}
+                  onChange={e => setScopes(p => {
+                    if (s === 'context_mirror_recovery' && e.target.checked) {
+                      return Object.fromEntries(ALLOWED_SCOPES_LIST.map(scope => [scope, scope === s])) as Record<Scope, boolean>;
+                    }
+                    return { ...p, [s]: e.target.checked, ...(s !== 'context_mirror_recovery' ? { context_mirror_recovery: false } : {}) };
+                  })}
+                />
                 {s}
               </label>
             ))}
           </div>
         </div>
+        {scopes.context_mirror_recovery && (
+          <div style={{ marginBottom: 16 }}>
+            <label>Recovery Source ID</label>
+            <input
+              placeholder="e.g. capture-events"
+              value={sourceId}
+              onChange={e => setSourceId(e.target.value)}
+              required
+            />
+          </div>
+        )}
         <div style={{ marginBottom: 20 }}>
           <label>Token Lifetime</label>
           <select value={ttl} onChange={e => setTtl(e.target.value)}
