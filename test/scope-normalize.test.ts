@@ -131,8 +131,9 @@ describe('normalizeScopesInput — determinism', () => {
       .toBe(normalizeScopesInput('read admin write'));
   });
 
-  test('hierarchy-aware scopes (sources_admin, users_admin, agent) accepted', () => {
+  test('specialized scopes (sources_admin, users_admin, agent, context_mirror_recovery) accepted', () => {
     expect(normalizeScopesInput(['sources_admin', 'users_admin'])).toBe('sources_admin users_admin');
     expect(normalizeScopesInput('agent')).toBe('agent');
+    expect(normalizeScopesInput('context_mirror_recovery')).toBe('context_mirror_recovery');
   });
 });

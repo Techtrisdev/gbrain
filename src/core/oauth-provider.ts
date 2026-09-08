@@ -24,7 +24,7 @@ import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/serv
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
-import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
+import { hasScope, assertDcrAllowedScopes, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
 
@@ -170,11 +170,11 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
       validateRedirectUri(String(uri));
     }
 
-    // v0.28: ALLOWED_SCOPES allowlist. RFC 6749 §5.2 invalid_scope. The DCR
-    // path is reachable by any unauthenticated network caller when --enable-dcr
-    // is on, so this is the security-relevant gate (manual CLI registration
-    // is operator-trusted).
-    assertAllowedScopes(parseScopeString(client.scope));
+    // Public DCR is reachable by any unauthenticated network caller when
+    // --enable-dcr is on. It may issue only ordinary read/write scopes;
+    // operator-only capabilities (including Context Mirror recovery) must be
+    // created through the authenticated admin route or local CLI.
+    assertDcrAllowedScopes(parseScopeString(client.scope));
 
     const clientId = generateToken('gbrain_cl_');
     // v0.34.1 (#909): RFC 7591 §2 — clients that authenticate at the token

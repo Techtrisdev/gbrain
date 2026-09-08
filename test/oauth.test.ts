@@ -6,6 +6,7 @@ import { GBrainOAuthProvider, coerceTimestamp } from '../src/core/oauth-provider
 import { hashToken, generateToken } from '../src/core/utils.ts';
 import { PGLITE_SCHEMA_SQL } from '../src/core/pglite-schema.ts';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { DcrScopeNotAllowedError } from '../src/core/scope.ts';
 
 // ---------------------------------------------------------------------------
 // Test setup: in-memory PGLite with OAuth tables
@@ -603,14 +604,15 @@ describe('operation scope annotations', () => {
     for (const op of operations) {
       expect(op.scope, `${op.name} missing scope`).toBeDefined();
       // v0.28 added sources_admin and users_admin to the union.
-      // v0.38 added 'agent' for submit_agent (D13).
+      // v0.38 added 'agent' for submit_agent (D13); v0.40 adds the
+      // source-bound Context Mirror recovery capability.
       expect([
-        'read', 'write', 'admin', 'sources_admin', 'users_admin', 'agent',
+        'read', 'write', 'admin', 'sources_admin', 'users_admin', 'agent', 'context_mirror_recovery',
       ]).toContain(op.scope);
     }
   });
 
-  test('mutating operations are write/admin/sources_admin/users_admin/agent scoped', () => {
+  test('mutating operations are write-axis or dedicated recovery scoped', () => {
     const { operations } = require('../src/core/operations.ts');
     for (const op of operations) {
       if (op.mutating) {
@@ -618,8 +620,10 @@ describe('operation scope annotations', () => {
         // sources, not pages); read scope is the only thing too narrow for
         // any mutating op. v0.38: 'agent' is a mutating-axis scope for
         // submit_agent (creates jobs, spends money, but contained by bindings).
+        // Context Mirror recovery is a source-bound operational capability,
+        // not a general write grant.
         expect(
-          ['write', 'admin', 'sources_admin', 'users_admin', 'agent'],
+          ['write', 'admin', 'sources_admin', 'users_admin', 'agent', 'context_mirror_recovery'],
           `${op.name} is mutating but not a write-axis scope`,
         ).toContain(op.scope);
       }
@@ -985,6 +989,20 @@ describe('v0.28 ALLOWED_SCOPES allowlist', () => {
         token_endpoint_auth_method: 'client_secret_post',
       } as any),
     ).rejects.toThrow(/Unknown scope/);
+  });
+
+  test('registerClient (DCR) rejects operator-only scopes', async () => {
+    for (const scope of ['admin', 'sources_admin', 'users_admin', 'agent', 'context_mirror_recovery']) {
+      await expect(
+        provider.clientsStore.registerClient!({
+          client_name: `dcr-forbidden-${scope}`,
+          redirect_uris: ['https://example.com/cb'],
+          grant_types: ['client_credentials'],
+          scope,
+          token_endpoint_auth_method: 'client_secret_post',
+        } as any),
+      ).rejects.toBeInstanceOf(DcrScopeNotAllowedError);
+    }
   });
 });
 

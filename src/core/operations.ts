@@ -576,7 +576,7 @@ export interface Operation {
    * Local CLI callers (ctx.remote === false) bypass scope enforcement
    * because the trust boundary there is the OS, not OAuth scopes.
    */
-  scope?: 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin';
+  scope?: 'read' | 'write' | 'admin' | 'sources_admin' | 'users_admin' | 'agent' | 'context_mirror_recovery';
   /**
    * TECH-2742 — allow a caller holding only `read` scope to invoke this op over an
    * authenticated transport EVEN THOUGH `scope` is `write`. A trust-boundary carve-out
@@ -3921,7 +3921,7 @@ function contextMirrorOperationTimedOut(error: unknown): boolean {
 const list_context_mirror_actions: Operation = {
   name: 'list_context_mirror_actions',
   description:
-    'Admin-only, source-confined Context Mirror recovery action inventory. Returns bounded counts, ' +
+    'Dedicated-recovery-scope, source-confined Context Mirror recovery action inventory. Returns bounded counts, ' +
     'opaque references, blockers, and compare-and-set fingerprints without transcript bodies or provider calls.',
   params: {
     runtime_proof_attestation: { type: 'string', description: 'Signed, source-bound machine-runtime proof JSON' },
@@ -3929,7 +3929,7 @@ const list_context_mirror_actions: Operation = {
     replay_ledger_attestation: { type: 'string', description: 'Signed, source-bound outbox/replay proof JSON' },
     replay_ledger_signature: { type: 'string', description: 'HMAC-SHA256 of the exact replay proof JSON' },
   },
-  scope: 'admin',
+  scope: 'context_mirror_recovery',
   mutating: false,
   handler: async (ctx, p) => {
     const sourceId = contextMirrorAdminSource(ctx);
@@ -4052,7 +4052,7 @@ const list_context_mirror_actions: Operation = {
 const run_context_mirror_bootstrap: Operation = {
   name: 'run_context_mirror_bootstrap',
   description:
-    'Admin-only, source-confined, no-provider Context Mirror inventory reconciliation. ' +
+    'Dedicated-recovery-scope, source-confined, no-provider Context Mirror inventory reconciliation. ' +
     'Processes immutable raw-page metadata in bounded batches and returns counts and fingerprints only.',
   params: {
     batch_size: { type: 'number', description: 'Raw metadata rows per batch (1-5000; default 1000)' },
@@ -4060,7 +4060,7 @@ const run_context_mirror_bootstrap: Operation = {
     max_runtime_ms: { type: 'number', description: 'Request wall-clock ceiling (1000-45000; default 30000)' },
     reason: { type: 'string', required: true, description: 'Operator reason recorded in the append-only audit' },
   },
-  scope: 'admin',
+  scope: 'context_mirror_recovery',
   mutating: true,
   handler: async (ctx, p) => {
     const sourceId = contextMirrorAdminSource(ctx);
@@ -4108,14 +4108,14 @@ const run_context_mirror_bootstrap: Operation = {
 const retry_candidate_promotion: Operation = {
   name: 'retry_candidate_promotion',
   description:
-    'Admin-only, source-confined retry of an already-approved Context Mirror promotion. ' +
+    'Dedicated-recovery-scope, source-confined retry of an already-approved Context Mirror promotion. ' +
     'Reuses the durable promotion correlation/attempt ledger and only re-dispatches the governed PR path; ' +
     'it never approves, merges, indexes, or writes shared Brain content directly.',
   params: {
     candidate_id: { type: 'number', required: true, description: 'Accepted candidate id in the authenticated source' },
     reason: { type: 'string', required: true, description: 'Operator reason recorded with the retry audit' },
   },
-  scope: 'admin',
+  scope: 'context_mirror_recovery',
   mutating: true,
   handler: async (ctx, p) => {
     const sourceId = contextMirrorAdminSource(ctx);
@@ -4169,7 +4169,7 @@ const retry_candidate_promotion: Operation = {
 const rollback_context_generation: Operation = {
   name: 'rollback_context_generation',
   description:
-    'Admin-only, source-confined rollback to the immediately prior verified Context Mirror generation. ' +
+    'Dedicated-recovery-scope, source-confined rollback to the immediately prior verified Context Mirror generation. ' +
     'The transactional generation helper refuses accepted/promoted candidates and ambiguous provider work.',
   params: {
     session_id: { type: 'string', required: true, description: 'Context Mirror session id in the authenticated source' },
@@ -4177,7 +4177,7 @@ const rollback_context_generation: Operation = {
     rollback_generation: { type: 'number', required: true, description: 'Immediately prior generation to restore' },
     reason: { type: 'string', required: true, description: 'Operator reason recorded on affected candidate audit rows' },
   },
-  scope: 'admin',
+  scope: 'context_mirror_recovery',
   mutating: true,
   handler: async (ctx, p) => {
     const sourceId = contextMirrorAdminSource(ctx);
@@ -4213,7 +4213,7 @@ const rollback_context_generation: Operation = {
 const set_context_mirror_recovery_hold: Operation = {
   name: 'set_context_mirror_recovery_hold',
   description:
-    'Admin-only, source-confined recovery hold toggle. A hold stops destructive expiry while an operator ' +
+    'Dedicated-recovery-scope, source-confined recovery hold toggle. A hold stops destructive expiry while an operator ' +
     'repairs Context Mirror state; both activation and release require an explicit reason.',
   params: {
     active: { type: 'boolean', required: true, description: 'true to activate the hold; false to release it' },
@@ -4224,7 +4224,7 @@ const set_context_mirror_recovery_hold: Operation = {
     replay_ledger_attestation: { type: 'string', description: 'Required signed outbox/replay proof when releasing' },
     replay_ledger_signature: { type: 'string', description: 'HMAC-SHA256 of the exact replay proof JSON' },
   },
-  scope: 'admin',
+  scope: 'context_mirror_recovery',
   mutating: true,
   handler: async (ctx, p) => {
     const sourceId = contextMirrorAdminSource(ctx);

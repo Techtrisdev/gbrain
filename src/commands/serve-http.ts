@@ -30,6 +30,7 @@ import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, resolveRequiredScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { isValidSourceId } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
@@ -1507,8 +1508,38 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
       const grants = Array.isArray(grantTypes) && grantTypes.length > 0 ? grantTypes : ['client_credentials'];
       const uris = Array.isArray(redirectUris) ? redirectUris : [];
+      const sourceId = (req.body as Record<string, unknown>).sourceId
+        ?? (req.body as Record<string, unknown>).source_id
+        ?? 'default';
+      const rawFederatedRead = (req.body as Record<string, unknown>).federatedRead
+        ?? (req.body as Record<string, unknown>).federated_read;
+      if (!isValidSourceId(sourceId)) {
+        res.status(400).json({ error: 'invalid_source_id' });
+        return;
+      }
+      if (rawFederatedRead !== undefined && (
+        !Array.isArray(rawFederatedRead) || !rawFederatedRead.every(isValidSourceId)
+      )) {
+        res.status(400).json({ error: 'invalid_federated_read' });
+        return;
+      }
+      const federatedRead = rawFederatedRead as string[] | undefined;
+      const sourceIds = Array.from(new Set([sourceId, ...(federatedRead ?? [sourceId])]));
+      if (sourceIds.length > 32) {
+        res.status(400).json({ error: 'too_many_sources' });
+        return;
+      }
+      for (const id of sourceIds) {
+        const rows = await engine.executeRaw<{ id: string }>(
+          'SELECT id FROM sources WHERE id = $1 AND archived = false', [id],
+        );
+        if (!rows[0]) {
+          res.status(400).json({ error: 'unknown_or_archived_source' });
+          return;
+        }
+      }
       const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris,
+        name, grants, scopeString, uris, sourceId, federatedRead,
       );
       // Public client (PKCE-only, no secret): NULL out client_secret_hash and
       // set auth method so the SDK's clientAuth middleware skips the hash-vs-
@@ -1777,8 +1808,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       // Scope enforcement (v0.28: hasScope replaces exact-string-match so
-      // admin tokens satisfy any scope, write satisfies read, and the new
-      // sources_admin / users_admin scopes resolve through the same
+      // admin tokens satisfy the general management scopes, write satisfies
+      // read, and the sources_admin / users_admin scopes resolve through the same
       // hierarchy. Plain string includes() at this site would have made
       // sources_admin tokens look like they couldn't even read.)
       // TECH-2742 — readScopeCallable ops accept `read` despite scope: 'write'

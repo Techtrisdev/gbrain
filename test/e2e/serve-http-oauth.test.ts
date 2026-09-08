@@ -24,6 +24,7 @@ if (skip) {
 
 const PORT = 19131; // Avoid collision with production 3131
 const BASE = `http://localhost:${PORT}`;
+const ADMIN_TEST_TOKEN = 'a'.repeat(32);
 
 describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   let serverProcess: ReturnType<typeof import('child_process').spawn> | null = null;
@@ -71,7 +72,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       '--enable-dcr',
     ], {
       cwd: process.cwd(),
-      env: process.env,
+      env: { ...process.env, GBRAIN_ADMIN_BOOTSTRAP_TOKEN: ADMIN_TEST_TOKEN },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -465,6 +466,24 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     }
   }, 15_000);
 
+  test('unauthenticated DCR cannot mint a Context Mirror recovery client', async () => {
+    const res = await fetch(`${BASE}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_name: 'dcr-forbidden-recovery',
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['client_credentials'],
+        token_endpoint_auth_method: 'client_secret_post',
+        scope: 'context_mirror_recovery',
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json() as { client_id?: string; error?: string };
+    expect(body.client_id).toBeUndefined();
+    expect(body.error).toBeDefined();
+  }, 15_000);
+
   // =========================================================================
   // v0.26.2: revoke-client CLI subprocess test
   // =========================================================================
@@ -838,6 +857,86 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     });
     expect(res.status).toBe(401);
   });
+
+  test('admin registration preserves a source-bound client scope', async () => {
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    const sourceId = 'admin-source-test';
+    try {
+      await sql`
+        INSERT INTO sources (id, name, config)
+        VALUES (${sourceId}, ${sourceId}, '{}'::jsonb)
+        ON CONFLICT (id) DO NOTHING
+      `;
+      const login = await fetch(`${BASE}/admin/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: ADMIN_TEST_TOKEN }),
+      });
+      expect(login.ok).toBe(true);
+      const cookie = login.headers.get('set-cookie');
+      expect(cookie).toContain('gbrain_admin=');
+
+      for (const invalidRequest of [
+        { sourceId: 'future-source', federatedRead: ['future-source'] },
+        { sourceId, federatedRead: [sourceId, 'future-source'] },
+      ]) {
+        const rejected = await fetch(`${BASE}/admin/api/register-client`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: cookie! },
+          body: JSON.stringify({
+            name: `invalid-source-${invalidRequest.sourceId}`,
+            scopes: 'context_mirror_recovery',
+            ...invalidRequest,
+          }),
+        });
+        expect(rejected.status).toBe(400);
+        expect(await rejected.json()).toEqual({ error: 'unknown_or_archived_source' });
+      }
+
+      const registration = await fetch(`${BASE}/admin/api/register-client`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie! },
+        body: JSON.stringify({
+          name: 'source-bound-admin-test',
+          scopes: 'context_mirror_recovery',
+          sourceId,
+          federatedRead: [sourceId],
+        }),
+      });
+      expect(registration.ok).toBe(true);
+      const credentials = await registration.json() as { clientId: string; clientSecret: string };
+      dcrClientIds.push(credentials.clientId);
+
+      const token = await fetch(`${BASE}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'client_credentials',
+          client_id: credentials.clientId,
+          client_secret: credentials.clientSecret,
+          scope: 'context_mirror_recovery',
+        }),
+      });
+      expect(token.ok).toBe(true);
+      const { access_token } = await token.json() as { access_token: string };
+      const status = await mcpCall(access_token, 'tools/call', {
+        name: 'list_context_mirror_actions',
+        arguments: {},
+      });
+      const body = await status.text();
+      expect(body).not.toContain('permission_denied');
+      expect(body).not.toContain('insufficient_scope');
+
+      const sourceRemoval = await mcpCall(access_token, 'tools/call', {
+        name: 'sources_remove',
+        arguments: { id: 'default', confirm_destructive: true },
+      });
+      expect(await sourceRemoval.text()).toContain('insufficient_scope');
+    } finally {
+      await sql.end();
+    }
+  }, 30_000);
 
   // =========================================================================
   // F7 + F7b: HTTP MCP shell-job RCE regression

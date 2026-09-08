@@ -134,7 +134,7 @@ describe('Context Mirror admin MCP controls', () => {
     ]) {
       const operation = operationsByName[name];
       expect(operation).toBeDefined();
-      expect(operation.scope).toBe('admin');
+      expect(operation.scope).toBe('context_mirror_recovery');
       expect(operation.mutating).toBe(name !== 'list_context_mirror_actions');
       expect(operation.localOnly).not.toBe(true);
     }
@@ -952,13 +952,14 @@ describe('Context Mirror admin MCP controls', () => {
     expect(afterStatus.progress.head_projection_mismatch_records).toBe(0);
   });
 
-  test('HTTP scope resolution rejects read/write tokens and accepts admin', () => {
+  test('HTTP scope resolution rejects general tokens and accepts only the dedicated recovery scope', () => {
     const operation = operationsByName.set_context_mirror_recovery_hold!;
     const required = resolveRequiredScope(operation);
-    expect(required).toBe('admin');
+    expect(required).toBe('context_mirror_recovery');
     expect(hasScope(['read'], required)).toBe(false);
     expect(hasScope(['write'], required)).toBe(false);
-    expect(hasScope(['admin'], required)).toBe(true);
+    expect(hasScope(['admin'], required)).toBe(false);
+    expect(hasScope(['context_mirror_recovery'], required)).toBe(true);
   });
 
   test('fails closed when authenticated and routed sources disagree', async () => {
