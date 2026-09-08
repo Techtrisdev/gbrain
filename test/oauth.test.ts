@@ -6,7 +6,7 @@ import { GBrainOAuthProvider, coerceTimestamp } from '../src/core/oauth-provider
 import { hashToken, generateToken } from '../src/core/utils.ts';
 import { PGLITE_SCHEMA_SQL } from '../src/core/pglite-schema.ts';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import { DcrScopeNotAllowedError } from '../src/core/scope.ts';
+import { DcrScopeNotAllowedError, RecoveryScopeCombinationError, RecoverySourceRequiredError, RecoveryFederationError } from '../src/core/scope.ts';
 
 // ---------------------------------------------------------------------------
 // Test setup: in-memory PGLite with OAuth tables
@@ -970,9 +970,10 @@ describe('v0.28 ALLOWED_SCOPES allowlist', () => {
   });
 
   test('registerClientManual accepts every canonical scope', async () => {
-    for (const scope of ['read', 'write', 'admin', 'sources_admin', 'users_admin']) {
+    for (const scope of ['read', 'write', 'admin', 'sources_admin', 'users_admin', 'agent', 'context_mirror_recovery']) {
       const { clientId } = await provider.registerClientManual(
-        `accept-${scope}`, ['client_credentials'], scope,
+        `accept-${scope}`, ['client_credentials'], scope, [],
+        scope === 'context_mirror_recovery' ? 'default' : undefined,
       );
       const client = await provider.clientsStore.getClient(clientId);
       expect(client?.scope).toBe(scope);
@@ -989,6 +990,21 @@ describe('v0.28 ALLOWED_SCOPES allowlist', () => {
         token_endpoint_auth_method: 'client_secret_post',
       } as any),
     ).rejects.toThrow(/Unknown scope/);
+  });
+
+  test('registerClientManual rejects a recovery scope combined with another scope', async () => {
+    await expect(
+      provider.registerClientManual('mixed-recovery', ['client_credentials'], 'read context_mirror_recovery'),
+    ).rejects.toBeInstanceOf(RecoveryScopeCombinationError);
+  });
+
+  test('registerClientManual requires a source and rejects recovery federation', async () => {
+    await expect(
+      provider.registerClientManual('missing-recovery-source', ['client_credentials'], 'context_mirror_recovery'),
+    ).rejects.toBeInstanceOf(RecoverySourceRequiredError);
+    await expect(
+      provider.registerClientManual('federated-recovery', ['client_credentials'], 'context_mirror_recovery', [], 'default', ['default', 'shared']),
+    ).rejects.toBeInstanceOf(RecoveryFederationError);
   });
 
   test('registerClient (DCR) rejects operator-only scopes', async () => {

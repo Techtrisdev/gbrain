@@ -151,9 +151,55 @@ export class DcrScopeNotAllowedError extends Error {
   }
 }
 
+/**
+ * The Context Mirror recovery capability is deliberately non-composable. A
+ * recovery credential must not silently inherit ordinary read, write, or
+ * administrative access merely because an operator selected two checkboxes.
+ */
+export class RecoveryScopeCombinationError extends Error {
+  constructor(public readonly scopes: readonly string[]) {
+    super('context_mirror_recovery must be the only requested scope.');
+    this.name = 'RecoveryScopeCombinationError';
+  }
+}
+
+export class RecoverySourceRequiredError extends Error {
+  constructor() {
+    super('context_mirror_recovery requires an explicit source ID.');
+    this.name = 'RecoverySourceRequiredError';
+  }
+}
+
+export class RecoveryFederationError extends Error {
+  constructor() {
+    super('context_mirror_recovery may read only its own source.');
+    this.name = 'RecoveryFederationError';
+  }
+}
+
 export function assertAllowedScopes(scopes: readonly string[]): void {
   for (const s of scopes) {
     if (!isScope(s)) throw new InvalidScopeError(s, scopes);
+  }
+}
+
+/** Reject a recovery credential combined with any other capability. */
+export function assertRecoveryScopeExclusive(scopes: readonly string[]): void {
+  if (scopes.includes('context_mirror_recovery') && scopes.length !== 1) {
+    throw new RecoveryScopeCombinationError(scopes);
+  }
+}
+
+/** Enforce that recovery work is bound to one explicitly chosen source. */
+export function assertRecoverySourceBound(
+  scopes: readonly string[],
+  sourceId: string | undefined,
+  federatedRead: readonly string[] | undefined,
+): void {
+  if (!scopes.includes('context_mirror_recovery')) return;
+  if (sourceId === undefined) throw new RecoverySourceRequiredError();
+  if (federatedRead !== undefined && (federatedRead.length !== 1 || federatedRead[0] !== sourceId)) {
+    throw new RecoveryFederationError();
   }
 }
 

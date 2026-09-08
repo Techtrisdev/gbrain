@@ -29,7 +29,7 @@ import { operations, OperationError, validatePageSlug } from '../core/operations
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
-import { hasScope, resolveRequiredScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { hasScope, resolveRequiredScope, ALLOWED_SCOPES_LIST, normalizeScopesInput, parseScopeString, assertRecoveryScopeExclusive, assertRecoverySourceBound } from '../core/scope.ts';
 import { isValidSourceId } from '../core/source-id.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
@@ -1499,6 +1499,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       let scopeString: string;
       try {
         scopeString = normalizeScopesInput(rawScopes);
+        assertRecoveryScopeExclusive(parseScopeString(scopeString));
       } catch (e) {
         res.status(400).json({
           error: 'invalid_scopes',
@@ -1508,11 +1509,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
       const grants = Array.isArray(grantTypes) && grantTypes.length > 0 ? grantTypes : ['client_credentials'];
       const uris = Array.isArray(redirectUris) ? redirectUris : [];
-      const sourceId = (req.body as Record<string, unknown>).sourceId
-        ?? (req.body as Record<string, unknown>).source_id
-        ?? 'default';
-      const rawFederatedRead = (req.body as Record<string, unknown>).federatedRead
-        ?? (req.body as Record<string, unknown>).federated_read;
+      const requestBody = req.body as Record<string, unknown>;
+      const requestedSourceId = requestBody.sourceId ?? requestBody.source_id;
+      const rawFederatedRead = requestBody.federatedRead ?? requestBody.federated_read;
+      try {
+        assertRecoverySourceBound(
+          parseScopeString(scopeString),
+          typeof requestedSourceId === 'string' ? requestedSourceId : undefined,
+          Array.isArray(rawFederatedRead) ? rawFederatedRead as string[] : undefined,
+        );
+      } catch (e) {
+        const error = e instanceof Error && e.name === 'RecoverySourceRequiredError'
+          ? 'recovery_source_required'
+          : 'recovery_federation_forbidden';
+        res.status(400).json({ error });
+        return;
+      }
+      const sourceId = requestedSourceId ?? 'default';
       if (!isValidSourceId(sourceId)) {
         res.status(400).json({ error: 'invalid_source_id' });
         return;

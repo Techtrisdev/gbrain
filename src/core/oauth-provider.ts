@@ -24,7 +24,7 @@ import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/serv
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
-import { hasScope, assertDcrAllowedScopes, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
+import { hasScope, assertDcrAllowedScopes, assertAllowedScopes, assertRecoveryScopeExclusive, assertRecoverySourceBound, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
 
@@ -753,14 +753,18 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     grantTypes: string[],
     scopes: string,
     redirectUris: string[] = [],
-    sourceId: string = 'default',
+    sourceId?: string,
     federatedRead?: string[],
   ): Promise<{ clientId: string; clientSecret: string }> {
     // v0.28: ALLOWED_SCOPES allowlist. Reject `--scopes "read flying-unicorn"`
     // at registration so meaningless scope strings can't pile up in the DB.
     // Pre-allowlist clients keep working (allowlist is registration-time;
     // existing rows aren't re-validated).
-    assertAllowedScopes(parseScopeString(scopes));
+    const requestedScopes = parseScopeString(scopes);
+    assertAllowedScopes(requestedScopes);
+    assertRecoveryScopeExclusive(requestedScopes);
+    assertRecoverySourceBound(requestedScopes, sourceId, federatedRead);
+    const effectiveSourceId = sourceId ?? 'default';
 
     const clientId = generateToken('gbrain_cl_');
     const clientSecret = generateToken('gbrain_cs_');
@@ -772,7 +776,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     //   source_id = 'default' (matches v60 backfill)
     //   federated_read = [source_id] when omitted (a non-federated client
     //                    has read scope == write scope, the v0.33 default)
-    const federated = federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId];
+    const federated = federatedRead && federatedRead.length > 0 ? federatedRead : [effectiveSourceId];
     try {
       await this.sql`
         INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
@@ -780,7 +784,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                                     source_id, federated_read)
         VALUES (${clientId}, ${secretHash}, ${name},
                 ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${now},
-                ${sourceId}, ${pgArray(federated)})
+                ${effectiveSourceId}, ${pgArray(federated)})
       `;
     } catch (err) {
       // Pre-v60 / pre-v61 brain: column missing. Fall back through both
@@ -792,7 +796,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
             INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                         grant_types, scope, client_id_issued_at, source_id)
             VALUES (${clientId}, ${secretHash}, ${name},
-                    ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${now}, ${sourceId})
+                    ${pgArray(redirectUris)}, ${pgArray(grantTypes)}, ${scopes}, ${now}, ${effectiveSourceId})
           `;
         } catch (err2) {
           if (isUndefinedColumnError(err2, 'source_id')) {

@@ -877,6 +877,14 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       const cookie = login.headers.get('set-cookie');
       expect(cookie).toContain('gbrain_admin=');
 
+      const missingRecoverySource = await fetch(`${BASE}/admin/api/register-client`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie! },
+        body: JSON.stringify({ name: 'missing-recovery-source', scopes: 'context_mirror_recovery' }),
+      });
+      expect(missingRecoverySource.status).toBe(400);
+      expect(await missingRecoverySource.json()).toEqual({ error: 'recovery_source_required' });
+
       for (const invalidRequest of [
         { sourceId: 'future-source', federatedRead: ['future-source'] },
         { sourceId, federatedRead: [sourceId, 'future-source'] },
@@ -893,6 +901,19 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
         expect(rejected.status).toBe(400);
         expect(await rejected.json()).toEqual({ error: 'unknown_or_archived_source' });
       }
+
+      const federatedRecovery = await fetch(`${BASE}/admin/api/register-client`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie! },
+        body: JSON.stringify({
+          name: 'federated-recovery-source',
+          scopes: 'context_mirror_recovery',
+          sourceId,
+          federatedRead: [sourceId, 'default'],
+        }),
+      });
+      expect(federatedRecovery.status).toBe(400);
+      expect(await federatedRecovery.json()).toEqual({ error: 'recovery_federation_forbidden' });
 
       const registration = await fetch(`${BASE}/admin/api/register-client`, {
         method: 'POST',
